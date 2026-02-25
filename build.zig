@@ -42,19 +42,25 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // --- Tests ---
-    const test_mod = b.createModule(.{
+    const test_step = b.step("test", "Run all unit tests");
+
+    // Main server tests (needs httpz)
+    const main_test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    test_mod.addImport("httpz", httpz_dep.module("httpz"));
-    test_mod.addImport("clap", clap_dep.module("clap"));
+    main_test_mod.addImport("httpz", httpz_dep.module("httpz"));
+    main_test_mod.addImport("clap", clap_dep.module("clap"));
+    const main_tests = b.addTest(.{ .root_module = main_test_mod });
+    test_step.dependOn(&b.addRunArtifact(main_tests).step);
 
-    const unit_tests = b.addTest(.{
-        .root_module = test_mod,
+    // Library tests (all non-server modules)
+    const lib_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+    const lib_tests = b.addTest(.{ .root_module = lib_test_mod });
+    test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 }
