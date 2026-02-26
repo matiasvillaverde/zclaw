@@ -1,6 +1,7 @@
 const std = @import("std");
 const registry = @import("registry.zig");
 const ssrf = @import("../infra/ssrf.zig");
+const http_client = @import("../infra/http_client.zig");
 
 // --- Web Search Tool ---
 //
@@ -10,6 +11,29 @@ const ssrf = @import("../infra/ssrf.zig");
 pub const BRAVE_BASE_URL = "https://api.search.brave.com";
 pub const BRAVE_SEARCH_PATH = "/res/v1/web/search";
 pub const DEFAULT_COUNT: u8 = 5;
+
+var global_http_client: ?*http_client.HttpClient = null;
+var global_brave_api_key: ?[]const u8 = null;
+
+/// Set the HTTP client for web search operations.
+pub fn setHttpClient(client: *http_client.HttpClient) void {
+    global_http_client = client;
+}
+
+/// Clear the HTTP client reference.
+pub fn clearHttpClient() void {
+    global_http_client = null;
+}
+
+/// Set the Brave API key.
+pub fn setBraveApiKey(key: []const u8) void {
+    global_brave_api_key = key;
+}
+
+/// Clear the Brave API key.
+pub fn clearBraveApiKey() void {
+    global_brave_api_key = null;
+}
 
 fn extractParam(json: []const u8, key: []const u8) ?[]const u8 {
     var prefix_buf: [128]u8 = undefined;
@@ -115,15 +139,39 @@ pub fn webSearchHandler(input_json: []const u8, output_buf: []u8) registry.ToolR
     if (query.len == 0)
         return .{ .success = false, .output = "", .error_message = "empty query" };
 
-    // In a real implementation, this would call the Brave Search API.
-    // For now, return a placeholder.
-    var fbs = std.io.fixedBufferStream(output_buf);
-    std.fmt.format(fbs.writer(), "web_search: query={s}", .{query}) catch
-        return .{ .success = false, .output = "", .error_message = "output buffer overflow" };
+    const client = global_http_client orelse
+        return .{ .success = false, .output = "", .error_message = "HTTP client not initialized" };
+
+    const api_key = global_brave_api_key orelse
+        return .{ .success = false, .output = "", .error_message = "Brave API key not configured" };
+
+    // Build search URL
+    var url_buf: [2048]u8 = undefined;
+    const url = buildSearchUrl(&url_buf, query, DEFAULT_COUNT) catch
+        return .{ .success = false, .output = "", .error_message = "URL build failed" };
+
+    // Make the request with API key header
+    const headers = [_]http_client.Header{
+        .{ .name = "X-Subscription-Token", .value = api_key },
+        .{ .name = "Accept", .value = "application/json" },
+    };
+
+    var resp = client.get(url, &headers) catch
+        return .{ .success = false, .output = "", .error_message = "HTTP request failed" };
+    defer resp.deinit();
+
+    if (resp.status != 200) {
+        var fbs = std.io.fixedBufferStream(output_buf);
+        std.fmt.format(fbs.writer(), "Brave API error: status {d}", .{resp.status}) catch {};
+        return .{ .success = false, .output = "", .error_message = fbs.getWritten() };
+    }
+
+    // Parse results
+    const output = parseSearchResults(resp.body, output_buf);
 
     return .{
         .success = true,
-        .output = fbs.getWritten(),
+        .output = output,
     };
 }
 
@@ -191,11 +239,110 @@ test "webSearchHandler empty query" {
     try std.testing.expect(!result.success);
 }
 
-test "webSearchHandler valid query" {
+test "webSearchHandler no client" {
+    clearHttpClient();
+    clearBraveApiKey();
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"zig language\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("HTTP client not initialized", result.error_message.?);
+}
+
+test "webSearchHandler no API key" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    clearBraveApiKey();
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"test\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Brave API key not configured", result.error_message.?);
+}
+
+test "webSearchHandler successful search" {
+    const allocator = std.testing.allocator;
+    const brave_json =
+        \\{"web":{"results":[{"title":"Zig Language","url":"https://ziglang.org","description":"A systems language"},{"title":"Zig Guide","url":"https://zig.guide","description":"Learn Zig"}]}}
+    ;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = brave_json },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    setBraveApiKey("test-api-key");
+    defer clearHttpClient();
+    defer clearBraveApiKey();
+
     var buf: [4096]u8 = undefined;
     const result = webSearchHandler("{\"query\":\"zig language\"}", &buf);
     try std.testing.expect(result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "zig language") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "1. Zig Language") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "https://ziglang.org") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "2. Zig Guide") != null);
+    // Verify mock was called
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+}
+
+test "webSearchHandler API error" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 429, .body = "{\"error\":\"rate limited\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    setBraveApiKey("test-key");
+    defer clearHttpClient();
+    defer clearBraveApiKey();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"test\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_message.?, "429") != null);
+}
+
+test "webSearchHandler no results" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"web\":{\"results\":[]}}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    setBraveApiKey("test-key");
+    defer clearHttpClient();
+    defer clearBraveApiKey();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"xyznonexistent\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("No results found.", result.output);
+}
+
+test "webSearchHandler connection failure" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    setBraveApiKey("test-key");
+    defer clearHttpClient();
+    defer clearBraveApiKey();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"test\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("HTTP request failed", result.error_message.?);
 }
 
 test "BUILTIN_WEB_SEARCH definition" {

@@ -151,6 +151,14 @@ pub fn extractProfileName(json: []const u8) ?[]const u8 {
     return extractJsonString(json, "\"name\":\"");
 }
 
+// --- Group Detection ---
+
+/// Detect group messages by checking for the "participant" field.
+/// In WhatsApp Cloud API, group messages include a "participant" field.
+pub fn isGroupMessage(json: []const u8) bool {
+    return std.mem.indexOf(u8, json, "\"participant\":\"") != null;
+}
+
 // --- Incoming Message Parser ---
 
 pub fn parseIncomingMessage(json: []const u8) ?plugin.IncomingMessage {
@@ -164,7 +172,7 @@ pub fn parseIncomingMessage(json: []const u8) ?plugin.IncomingMessage {
         .sender_name = extractProfileName(json),
         .chat_id = from, // WhatsApp DMs use sender as chat ID
         .content = text,
-        .is_group = false, // Would need group detection
+        .is_group = isGroupMessage(json),
     };
 }
 
@@ -278,6 +286,23 @@ test "WaMessageType fromString and label" {
     try std.testing.expectEqual(WaMessageType.image, WaMessageType.fromString("image").?);
     try std.testing.expectEqualStrings("text", WaMessageType.text.label());
     try std.testing.expectEqual(@as(?WaMessageType, null), WaMessageType.fromString("unknown"));
+}
+
+test "isGroupMessage detects participant field" {
+    const json = "{\"from\":\"group-jid\",\"participant\":\"123\",\"text\":{\"body\":\"Hi\"}}";
+    try std.testing.expect(isGroupMessage(json));
+}
+
+test "isGroupMessage false for DM" {
+    const json = "{\"from\":\"1234567890\",\"text\":{\"body\":\"Hi\"}}";
+    try std.testing.expect(!isGroupMessage(json));
+}
+
+test "parseIncomingMessage group detection" {
+    const json = "{\"from\":\"group-jid\",\"participant\":\"123\",\"text\":{\"body\":\"Hello group\"},\"id\":\"wamid.xyz\",\"contacts\":[{\"profile\":{\"name\":\"Alice\"}}]}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expect(msg.is_group);
+    try std.testing.expectEqualStrings("Hello group", msg.content);
 }
 
 test "WhatsAppConfig defaults" {

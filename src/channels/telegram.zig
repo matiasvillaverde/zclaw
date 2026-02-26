@@ -110,6 +110,15 @@ pub fn isGroupChat(json: []const u8) bool {
 
 // --- Incoming Message Parser ---
 
+var update_id_buf: [32]u8 = undefined;
+
+fn formatUpdateId(json: []const u8) []const u8 {
+    const uid = extractUpdateId(json) orelse return "";
+    var fbs = std.io.fixedBufferStream(&update_id_buf);
+    std.fmt.format(fbs.writer(), "{d}", .{uid}) catch return "";
+    return fbs.getWritten();
+}
+
 pub fn parseIncomingMessage(json: []const u8) ?plugin.IncomingMessage {
     const text = extractMessageText(json) orelse return null;
     const chat_id = extractChatId(json) orelse return null;
@@ -117,7 +126,7 @@ pub fn parseIncomingMessage(json: []const u8) ?plugin.IncomingMessage {
 
     return .{
         .channel = .telegram,
-        .message_id = "", // Would need update_id
+        .message_id = formatUpdateId(json),
         .sender_id = sender_id,
         .sender_name = extractFirstName(json),
         .chat_id = chat_id,
@@ -271,6 +280,18 @@ test "parseIncomingMessage group" {
 test "parseIncomingMessage no text" {
     const json = "{\"message\":{\"sticker\":{},\"chat\":{\"id\":1}}}";
     try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "parseIncomingMessage includes update_id as message_id" {
+    const json = "{\"update_id\":12345,\"message\":{\"text\":\"Hi bot\",\"chat\":{\"id\":100,\"type\":\"private\"},\"from\":{\"id\":200,\"first_name\":\"Bob\"}}}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expectEqualStrings("12345", msg.message_id);
+}
+
+test "parseIncomingMessage missing update_id gives empty message_id" {
+    const json = "{\"message\":{\"text\":\"Hi bot\",\"chat\":{\"id\":100,\"type\":\"private\"},\"from\":{\"id\":200,\"first_name\":\"Bob\"}}}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expectEqualStrings("", msg.message_id);
 }
 
 test "TelegramConfig defaults" {
@@ -536,6 +557,37 @@ test "TelegramChannel pollUpdates empty" {
 
     const result = try channel.pollUpdates();
     try std.testing.expect(result == null);
+}
+
+// --- Integration Test: Telegram parse → route → session key ---
+
+test "integration: telegram parse to route to session key" {
+    const routing = @import("routing.zig");
+    const access = @import("access.zig");
+
+    // Real-ish Telegram webhook JSON
+    const json =
+        \\{"update_id":98765,"message":{"message_id":100,"from":{"id":42,"is_bot":false,"first_name":"Alice"},"chat":{"id":42,"type":"private"},"text":"Hello bot!"}}
+    ;
+
+    // Step 1: Parse incoming message
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expectEqual(plugin.ChannelType.telegram, msg.channel);
+    try std.testing.expectEqualStrings("Hello bot!", msg.content);
+    try std.testing.expectEqualStrings("42", msg.sender_id);
+    try std.testing.expectEqualStrings("42", msg.chat_id);
+    try std.testing.expectEqualStrings("98765", msg.message_id);
+    try std.testing.expect(!msg.is_group);
+
+    // Step 2: Check access policy
+    const policy = access.AccessPolicy{};
+    const decision = access.checkAccess(msg, policy);
+    try std.testing.expectEqual(access.AccessDecision.allow, decision);
+
+    // Step 3: Resolve session key
+    var key_buf: [256]u8 = undefined;
+    const session_key = try routing.resolveSessionKey(&key_buf, "main", msg);
+    try std.testing.expectEqualStrings("agent:main:telegram:direct:42", session_key);
 }
 
 test "TelegramChannel as PluginVTable" {

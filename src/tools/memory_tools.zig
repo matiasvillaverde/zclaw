@@ -5,9 +5,11 @@ const registry = @import("registry.zig");
 //
 // Bridges the MemoryManager to the tool registry via module-level state.
 
-const MemoryManager = @import("../memory/manager.zig").MemoryManager;
+const manager_mod = @import("../memory/manager.zig");
+const MemoryManager = manager_mod.MemoryManager;
 
 var global_manager: ?*MemoryManager = null;
+var global_allocator: ?std.mem.Allocator = null;
 
 /// Set the memory manager for tool handlers.
 pub fn setManager(mgr: *MemoryManager) void {
@@ -17,6 +19,16 @@ pub fn setManager(mgr: *MemoryManager) void {
 /// Clear the memory manager reference.
 pub fn clearManager() void {
     global_manager = null;
+}
+
+/// Set the allocator for search result allocation.
+pub fn setAllocator(alloc: std.mem.Allocator) void {
+    global_allocator = alloc;
+}
+
+/// Clear the allocator reference.
+pub fn clearAllocator() void {
+    global_allocator = null;
 }
 
 fn extractParam(json: []const u8, key: []const u8) ?[]const u8 {
@@ -49,13 +61,36 @@ pub fn memorySearchHandler(input_json: []const u8, output_buf: []u8) registry.To
     if (query.len == 0)
         return .{ .success = false, .output = "", .error_message = "empty query" };
 
-    if (global_manager == null)
+    const mgr = global_manager orelse
         return .{ .success = false, .output = "", .error_message = "memory manager not initialized" };
 
-    // Delegate to manager — in a real implementation, this would do vector search
+    const alloc = global_allocator orelse std.heap.page_allocator;
+
+    const results = mgr.keywordSearch(alloc, query, 5) catch
+        return .{ .success = false, .output = "", .error_message = "search failed" };
+    defer manager_mod.freeResults(alloc, results);
+
+    if (results.len == 0) {
+        const msg = "No matching memories found.";
+        if (msg.len <= output_buf.len) {
+            @memcpy(output_buf[0..msg.len], msg);
+            return .{ .success = true, .output = output_buf[0..msg.len] };
+        }
+        return .{ .success = true, .output = msg };
+    }
+
     var fbs = std.io.fixedBufferStream(output_buf);
-    std.fmt.format(fbs.writer(), "memory_search: query={s}", .{query}) catch
-        return .{ .success = false, .output = "", .error_message = "output buffer overflow" };
+    const writer = fbs.writer();
+    for (results, 0..) |result, idx| {
+        const num = idx + 1;
+        std.fmt.format(writer, "{d}. ", .{num}) catch break;
+        if (result.source_file) |sf| {
+            std.fmt.format(writer, "[{s}] ", .{sf}) catch break;
+        }
+        std.fmt.format(writer, "(score: {d:.2})\n", .{result.score}) catch break;
+        writer.writeAll(result.text) catch break;
+        writer.writeAll("\n\n") catch break;
+    }
 
     return .{ .success = true, .output = fbs.getWritten() };
 }
@@ -69,17 +104,20 @@ pub fn memoryIndexHandler(input_json: []const u8, output_buf: []u8) registry.Too
     if (content.len == 0)
         return .{ .success = false, .output = "", .error_message = "empty content" };
 
-    if (global_manager == null)
+    const mgr = global_manager orelse
         return .{ .success = false, .output = "", .error_message = "memory manager not initialized" };
 
-    const tag = extractParam(input_json, "tag");
+    const tag = extractParam(input_json, "tag") orelse "memory";
 
-    _ = tag;
+    const doc_id = mgr.indexDocument(tag, content) catch
+        return .{ .success = false, .output = "", .error_message = "indexing failed" };
 
-    // Delegate to manager — in a real implementation, this would chunk and index
+    const chunk_count = mgr.chunkCount();
+
     var fbs = std.io.fixedBufferStream(output_buf);
-    std.fmt.format(fbs.writer(), "memory_index: stored {d} chars", .{content.len}) catch
-        return .{ .success = false, .output = "", .error_message = "output buffer overflow" };
+    std.fmt.format(fbs.writer(), "Indexed {d} chars as document {d} (tag: {s}), {d} chunks stored", .{
+        content.len, doc_id, tag, chunk_count,
+    }) catch return .{ .success = false, .output = "", .error_message = "output buffer overflow" };
 
     return .{ .success = true, .output = fbs.getWritten() };
 }
@@ -173,6 +211,113 @@ test "BUILTIN_MEMORY_INDEX definition" {
 test "setManager and clearManager" {
     clearManager();
     try std.testing.expect(global_manager == null);
-    // We can't easily test setManager without a real MemoryManager instance
-    // but we verify the null state is correct
+}
+
+test "memorySearchHandler with real manager - found" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("notes.md", "Zig is a systems programming language designed for safety.");
+
+    setManager(&mgr);
+    setAllocator(allocator);
+    defer clearManager();
+    defer clearAllocator();
+
+    var buf: [4096]u8 = undefined;
+    const result = memorySearchHandler("{\"query\":\"zig\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "score:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Zig") != null);
+}
+
+test "memorySearchHandler with real manager - not found" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("notes.md", "Hello world content.");
+
+    setManager(&mgr);
+    setAllocator(allocator);
+    defer clearManager();
+    defer clearAllocator();
+
+    var buf: [4096]u8 = undefined;
+    const result = memorySearchHandler("{\"query\":\"xyznonexistent\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("No matching memories found.", result.output);
+}
+
+test "memorySearchHandler multiple results" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("a.md", "Zig is great for low-level work.");
+    _ = try mgr.indexDocument("b.md", "Learning Zig after C is natural.");
+
+    setManager(&mgr);
+    setAllocator(allocator);
+    defer clearManager();
+    defer clearAllocator();
+
+    var buf: [4096]u8 = undefined;
+    const result = memorySearchHandler("{\"query\":\"zig\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "1.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "2.") != null);
+}
+
+test "memoryIndexHandler with real manager" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    defer clearManager();
+
+    var buf: [4096]u8 = undefined;
+    const result = memoryIndexHandler("{\"content\":\"Remember this important fact.\",\"tag\":\"notes\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Indexed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "tag: notes") != null);
+}
+
+test "memoryIndexHandler default tag" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    defer clearManager();
+
+    var buf: [4096]u8 = undefined;
+    const result = memoryIndexHandler("{\"content\":\"Some content here.\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "tag: memory") != null);
+}
+
+test "memoryIndexHandler then search roundtrip" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    setAllocator(allocator);
+    defer clearManager();
+    defer clearAllocator();
+
+    // Index via handler
+    var idx_buf: [4096]u8 = undefined;
+    const idx_result = memoryIndexHandler("{\"content\":\"Zig comptime is powerful.\"}", &idx_buf);
+    try std.testing.expect(idx_result.success);
+
+    // Search via handler
+    var search_buf: [4096]u8 = undefined;
+    const search_result = memorySearchHandler("{\"query\":\"comptime\"}", &search_buf);
+    try std.testing.expect(search_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, search_result.output, "comptime") != null);
 }

@@ -362,15 +362,25 @@ pub const DiscordChannel = struct {
     status: plugin.ChannelStatus = .disconnected,
     sequence: ?i64 = null,
     allocator: std.mem.Allocator,
+    auth_value_buf: [520]u8 = undefined,
+    auth_value_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: DiscordConfig, client: *http_client.HttpClient) DiscordChannel {
-        return .{
+        var channel = DiscordChannel{
             .config = config,
             .client = client,
             .status = .disconnected,
             .sequence = null,
             .allocator = allocator,
         };
+        // Compute "Bot <token>" once
+        const prefix = "Bot ";
+        @memcpy(channel.auth_value_buf[0..prefix.len], prefix);
+        const token = config.bot_token;
+        const token_len = @min(token.len, channel.auth_value_buf.len - prefix.len);
+        @memcpy(channel.auth_value_buf[prefix.len..][0..token_len], token[0..token_len]);
+        channel.auth_value_len = prefix.len + token_len;
+        return channel;
     }
 
     pub fn asPlugin(self: *DiscordChannel) plugin.ChannelPlugin {
@@ -439,9 +449,7 @@ pub const DiscordChannel = struct {
     }
 
     fn authValue(self: *const DiscordChannel) []const u8 {
-        // In real use, this would be "Bot <token>" but we store just the token
-        // The caller should format it. For mock tests, just return the token.
-        return self.config.bot_token;
+        return self.auth_value_buf[0..self.auth_value_len];
     }
 
     fn stopImpl(ctx: *anyopaque) void {
@@ -488,7 +496,7 @@ test "DiscordChannel init" {
     var mock = http_client.MockTransport.init(&responses);
     var client = http_client.HttpClient.init(allocator, mock.transport());
 
-    const channel = DiscordChannel.init(allocator, .{ .bot_token = "Bot test-token" }, &client);
+    const channel = DiscordChannel.init(allocator, .{ .bot_token = "test-token" }, &client);
     try std.testing.expectEqual(plugin.ChannelStatus.disconnected, channel.status);
 }
 
@@ -499,7 +507,7 @@ test "DiscordChannel start success" {
     };
     var mock = http_client.MockTransport.init(&responses);
     var client = http_client.HttpClient.init(allocator, mock.transport());
-    var channel = DiscordChannel.init(allocator, .{ .bot_token = "Bot test-token" }, &client);
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "test-token" }, &client);
 
     try channel.start();
     try std.testing.expectEqual(plugin.ChannelStatus.connected, channel.status);
@@ -526,7 +534,7 @@ test "DiscordChannel sendText" {
     };
     var mock = http_client.MockTransport.init(&responses);
     var client = http_client.HttpClient.init(allocator, mock.transport());
-    var channel = DiscordChannel.init(allocator, .{ .bot_token = "Bot tok" }, &client);
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
     channel.status = .connected;
 
     try channel.sendText(.{ .chat_id = "ch-123", .content = "Hello Discord!" });
@@ -542,10 +550,20 @@ test "DiscordChannel sendText failure" {
     };
     var mock = http_client.MockTransport.init(&responses);
     var client = http_client.HttpClient.init(allocator, mock.transport());
-    var channel = DiscordChannel.init(allocator, .{ .bot_token = "Bot tok" }, &client);
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
 
     const result = channel.sendText(.{ .chat_id = "ch-1", .content = "hi" });
     try std.testing.expectError(DiscordChannel.SendError.SendFailed, result);
+}
+
+test "DiscordChannel authValue prefixes Bot" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    const channel = DiscordChannel.init(allocator, .{ .bot_token = "my-token" }, &client);
+    try std.testing.expectEqualStrings("Bot my-token", channel.authValue());
 }
 
 test "DiscordChannel as PluginVTable" {
@@ -555,7 +573,7 @@ test "DiscordChannel as PluginVTable" {
     };
     var mock = http_client.MockTransport.init(&responses);
     var client = http_client.HttpClient.init(allocator, mock.transport());
-    var channel = DiscordChannel.init(allocator, .{ .bot_token = "Bot tok" }, &client);
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
 
     var p = channel.asPlugin();
     try std.testing.expectEqual(plugin.ChannelType.discord, p.getType());

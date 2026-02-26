@@ -1,6 +1,7 @@
 const std = @import("std");
 const registry = @import("registry.zig");
 const ssrf = @import("../infra/ssrf.zig");
+const http_client = @import("../infra/http_client.zig");
 
 // --- Web Fetch Tool ---
 //
@@ -8,6 +9,18 @@ const ssrf = @import("../infra/ssrf.zig");
 
 pub const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB
 pub const MAX_OUTPUT_SIZE: usize = 64 * 1024; // 64KB output limit
+
+var global_http_client: ?*http_client.HttpClient = null;
+
+/// Set the HTTP client for web fetch operations.
+pub fn setHttpClient(client: *http_client.HttpClient) void {
+    global_http_client = client;
+}
+
+/// Clear the HTTP client reference.
+pub fn clearHttpClient() void {
+    global_http_client = null;
+}
 
 /// Extract a JSON string value for a given key from simple JSON.
 fn extractParam(json: []const u8, key: []const u8) ?[]const u8 {
@@ -42,10 +55,6 @@ pub fn stripHtml(html: []const u8, output: []u8) []const u8 {
         const c = html[i];
         if (c == '<') {
             in_tag = true;
-            // Check for block-level tags that should emit newlines
-            if (i + 1 < html.len and !in_tag) {
-                // Already set in_tag
-            }
             i += 1;
             continue;
         }
@@ -107,15 +116,31 @@ pub fn webFetchHandler(input_json: []const u8, output_buf: []u8) registry.ToolRe
     if (!ssrf.validateUrl(url))
         return .{ .success = false, .output = "", .error_message = "URL blocked: private/internal address" };
 
-    // In a real implementation, this would do an HTTP GET.
-    // For now, return a placeholder indicating the URL was validated.
-    var fbs = std.io.fixedBufferStream(output_buf);
-    std.fmt.format(fbs.writer(), "web_fetch: validated URL {s}", .{url}) catch
-        return .{ .success = false, .output = "", .error_message = "output buffer overflow" };
+    const client = global_http_client orelse
+        return .{ .success = false, .output = "", .error_message = "HTTP client not initialized" };
+
+    var resp = client.get(url, &.{}) catch
+        return .{ .success = false, .output = "", .error_message = "HTTP request failed" };
+    defer resp.deinit();
+
+    if (resp.status < 200 or resp.status >= 300) {
+        var fbs = std.io.fixedBufferStream(output_buf);
+        std.fmt.format(fbs.writer(), "HTTP error: non-success status {d}", .{resp.status}) catch {};
+        return .{ .success = false, .output = "", .error_message = fbs.getWritten() };
+    }
+
+    // Truncate body to MAX_RESPONSE_SIZE
+    const body = if (resp.body.len > MAX_RESPONSE_SIZE) resp.body[0..MAX_RESPONSE_SIZE] else resp.body;
+
+    // Strip HTML and copy to output buffer
+    const stripped = stripHtml(body, output_buf);
+
+    // Truncate to MAX_OUTPUT_SIZE
+    const output = if (stripped.len > MAX_OUTPUT_SIZE) stripped[0..MAX_OUTPUT_SIZE] else stripped;
 
     return .{
         .success = true,
-        .output = fbs.getWritten(),
+        .output = output,
     };
 }
 
@@ -185,11 +210,120 @@ test "webFetchHandler blocks private IP" {
     try std.testing.expectEqualStrings("URL blocked: private/internal address", result.error_message.?);
 }
 
-test "webFetchHandler validates public URL" {
+test "webFetchHandler no client" {
+    clearHttpClient();
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("HTTP client not initialized", result.error_message.?);
+}
+
+test "webFetchHandler successful fetch returns stripped HTML" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "<html><body><h1>Hello</h1><p>World</p></body></html>" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
     var buf: [4096]u8 = undefined;
     const result = webFetchHandler("{\"url\":\"https://example.com\"}", &buf);
     try std.testing.expect(result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "example.com") != null);
+    try std.testing.expectEqualStrings("HelloWorld", result.output);
+}
+
+test "webFetchHandler plain text passthrough" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "Just plain text content" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com/text\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("Just plain text content", result.output);
+}
+
+test "webFetchHandler HTTP error status" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 404, .body = "Not Found" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com/missing\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_message.?, "non-success") != null);
+}
+
+test "webFetchHandler connection failure" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("HTTP request failed", result.error_message.?);
+}
+
+test "webFetchHandler SSRF still blocks" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "should not get here" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"http://10.0.0.1/admin\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("URL blocked: private/internal address", result.error_message.?);
+    // Mock should not have been called
+    try std.testing.expectEqual(@as(usize, 0), mock.call_count);
+}
+
+test "webFetchHandler full HTML page end-to-end" {
+    const allocator = std.testing.allocator;
+    const html = "<html><head><title>Test</title></head><body><h1>Welcome</h1><p>This is a &amp; test page with &lt;special&gt; chars.</p></body></html>";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = html },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Welcome") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "& test page") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "<special>") != null);
+    // No HTML tags in output
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "<html>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "<h1>") == null);
 }
 
 test "BUILTIN_WEB_FETCH definition" {

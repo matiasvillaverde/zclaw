@@ -140,6 +140,15 @@ pub fn isJsonRpcError(json: []const u8) bool {
 
 // --- Incoming Message Parser ---
 
+var timestamp_buf: [32]u8 = undefined;
+
+fn formatTimestamp(json: []const u8) []const u8 {
+    const ts = extractTimestamp(json) orelse return "";
+    var fbs = std.io.fixedBufferStream(&timestamp_buf);
+    std.fmt.format(fbs.writer(), "{d}", .{ts}) catch return "";
+    return fbs.getWritten();
+}
+
 pub fn parseIncomingMessage(json: []const u8) ?plugin.IncomingMessage {
     const body = extractMessageBody(json) orelse return null;
     const source = extractSourceNumber(json) orelse return null;
@@ -149,7 +158,7 @@ pub fn parseIncomingMessage(json: []const u8) ?plugin.IncomingMessage {
 
     return .{
         .channel = .signal,
-        .message_id = "", // Signal uses timestamp as ID
+        .message_id = formatTimestamp(json),
         .sender_id = source,
         .sender_name = extractSourceName(json),
         .chat_id = chat_id,
@@ -306,6 +315,18 @@ test "parseIncomingMessage group" {
 test "parseIncomingMessage no body" {
     const json = "{\"envelope\":{\"sourceNumber\":\"+1234\"}}";
     try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "parseIncomingMessage includes timestamp as message_id" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+1234\",\"timestamp\":1700000000,\"dataMessage\":{\"message\":\"Hey\"}}}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expectEqualStrings("1700000000", msg.message_id);
+}
+
+test "parseIncomingMessage missing timestamp gives empty" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+1234\",\"dataMessage\":{\"message\":\"Hey\"}}}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expectEqualStrings("", msg.message_id);
 }
 
 test "SignalMessageType fromString and label" {
