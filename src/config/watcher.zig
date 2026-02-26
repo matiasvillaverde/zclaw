@@ -83,7 +83,34 @@ pub const Watcher = struct {
     }
 };
 
+// --- Debounce Calculation ---
+
+pub fn debounceMs(ms: u32) u64 {
+    return @as(u64, ms) * std.time.ns_per_ms;
+}
+
 // --- Tests ---
+
+test "WatchEvent values" {
+    try std.testing.expectEqual(WatchEvent.modified, WatchEvent.modified);
+    try std.testing.expectEqual(WatchEvent.deleted, WatchEvent.deleted);
+    try std.testing.expectEqual(WatchEvent.created, WatchEvent.created);
+    // All three are distinct
+    try std.testing.expect(WatchEvent.modified != WatchEvent.deleted);
+    try std.testing.expect(WatchEvent.deleted != WatchEvent.created);
+}
+
+test "debounceMs conversion" {
+    try std.testing.expectEqual(@as(u64, 300_000_000), debounceMs(300));
+    try std.testing.expectEqual(@as(u64, 1_500_000_000), debounceMs(1500));
+    try std.testing.expectEqual(@as(u64, 0), debounceMs(0));
+}
+
+test "Watcher stop without start is safe" {
+    var watcher = Watcher.init("/tmp/nonexistent.json", 100, testCallback);
+    watcher.stop(); // Should not panic
+    try std.testing.expect(!watcher.isRunning());
+}
 
 var test_events: [16]WatchEvent = undefined;
 var test_event_count: usize = 0;
