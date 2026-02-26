@@ -285,3 +285,51 @@ test "case insensitive matching" {
     try std.testing.expectEqual(FailoverReason.rate_limit, classifyFailoverReason("RATE LIMIT exceeded").?);
     try std.testing.expectEqual(FailoverReason.auth, classifyFailoverReason("UNAUTHORIZED access").?);
 }
+
+test "ErrorContext defaults" {
+    const ctx = ErrorContext{};
+    try std.testing.expect(ctx.provider == null);
+    try std.testing.expect(ctx.model == null);
+    try std.testing.expect(ctx.status == null);
+    try std.testing.expectEqualStrings("", ctx.message);
+}
+
+test "ErrorContext with values" {
+    const ctx = ErrorContext{
+        .provider = "anthropic",
+        .model = "claude-3",
+        .status = 429,
+        .message = "rate limited",
+    };
+    try std.testing.expectEqualStrings("anthropic", ctx.provider.?);
+    try std.testing.expectEqual(@as(u16, 429), ctx.status.?);
+}
+
+test "GatewayErrorCode all labels" {
+    try std.testing.expectEqualStrings("NOT_PAIRED", GatewayErrorCode.not_paired.label());
+    try std.testing.expectEqualStrings("UNAVAILABLE", GatewayErrorCode.unavailable.label());
+}
+
+test "FailoverReason all labels" {
+    try std.testing.expectEqualStrings("timeout", FailoverReason.timeout.label());
+    try std.testing.expectEqualStrings("format", FailoverReason.format.label());
+    try std.testing.expectEqualStrings("model_not_found", FailoverReason.model_not_found.label());
+    try std.testing.expectEqualStrings("overloaded", FailoverReason.overloaded.label());
+}
+
+test "classifyFailoverReason priority" {
+    // "model not found" should be detected even with extra context
+    try std.testing.expectEqual(FailoverReason.model_not_found, classifyFailoverReason("The requested model does not exist in our catalog").?);
+    // "quota exceeded" maps to rate_limit
+    try std.testing.expectEqual(FailoverReason.rate_limit, classifyFailoverReason("quota exceeded for this month").?);
+    // "service unavailable" maps to overloaded
+    try std.testing.expectEqual(FailoverReason.overloaded, classifyFailoverReason("Service Unavailable - high demand").?);
+    // "ETIMEDOUT" maps to timeout
+    try std.testing.expectEqual(FailoverReason.timeout, classifyFailoverReason("connect ETIMEDOUT").?);
+}
+
+test "isContextOverflowError additional" {
+    try std.testing.expect(isContextOverflowError("maximum context length is 200000 tokens"));
+    try std.testing.expect(isContextOverflowError("tokens exceed the limit"));
+    try std.testing.expect(!isContextOverflowError(""));
+}
