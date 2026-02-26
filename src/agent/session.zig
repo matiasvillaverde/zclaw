@@ -61,12 +61,14 @@ pub const SessionLineType = enum {
     session,
     message,
     compaction,
+    usage,
 
     pub fn label(self: SessionLineType) []const u8 {
         return switch (self) {
             .session => "session",
             .message => "message",
             .compaction => "compaction",
+            .usage => "usage",
         };
     }
 };
@@ -109,6 +111,15 @@ pub const JsonlWriter = struct {
         const timestamp = std.time.milliTimestamp();
         const line = std.fmt.bufPrint(&buf, "{{\"type\":\"message\",\"message\":{{\"role\":\"{s}\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"timestamp\":{d}}}}}\n", .{
             role.label(), content, timestamp,
+        }) catch return;
+        try self.file.writeAll(line);
+    }
+
+    /// Writes a usage line
+    pub fn writeUsage(self: *JsonlWriter, usage: SessionUsage) !void {
+        var buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{{\"type\":\"usage\",\"input_tokens\":{d},\"output_tokens\":{d}}}\n", .{
+            usage.input_tokens, usage.output_tokens,
         }) catch return;
         try self.file.writeAll(line);
     }
@@ -177,9 +188,42 @@ pub const JsonlReader = struct {
         return count;
     }
 
+    /// Compute total token usage from usage lines.
+    pub fn totalTokens(self: *const JsonlReader) SessionUsage {
+        var usage = SessionUsage{};
+        for (self.lines.items) |line| {
+            // Parse usage lines: {"type":"usage","input_tokens":N,"output_tokens":M}
+            if (std.mem.indexOf(u8, line.raw, "\"type\":\"usage\"") != null) {
+                if (extractJsonNumber(line.raw, "\"input_tokens\":")) |it| {
+                    usage.input_tokens += @intCast(@as(u64, @bitCast(it)));
+                }
+                if (extractJsonNumber(line.raw, "\"output_tokens\":")) |ot| {
+                    usage.output_tokens += @intCast(@as(u64, @bitCast(ot)));
+                }
+            }
+        }
+        return usage;
+    }
+
     pub fn hasHeader(self: *const JsonlReader) bool {
         if (self.lines.items.len == 0) return false;
         return self.lines.items[0].line_type == .session;
+    }
+};
+
+// --- Session Usage ---
+
+pub const SessionUsage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+
+    pub fn totalTokens(self: SessionUsage) u64 {
+        return self.input_tokens + self.output_tokens;
+    }
+
+    pub fn add(self: *SessionUsage, other: SessionUsage) void {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
     }
 };
 
@@ -188,7 +232,20 @@ fn detectLineType(line: []const u8) ?SessionLineType {
     if (std.mem.indexOf(u8, line, "\"type\":\"session\"") != null) return .session;
     if (std.mem.indexOf(u8, line, "\"type\":\"message\"") != null) return .message;
     if (std.mem.indexOf(u8, line, "\"type\":\"compaction\"") != null) return .compaction;
+    if (std.mem.indexOf(u8, line, "\"type\":\"usage\"") != null) return .usage;
     return null;
+}
+
+fn extractJsonNumber(json: []const u8, prefix: []const u8) ?i64 {
+    const start_idx = std.mem.indexOf(u8, json, prefix) orelse return null;
+    const value_start = start_idx + prefix.len;
+    if (value_start >= json.len) return null;
+
+    var end = value_start;
+    while (end < json.len and (json[end] >= '0' and json[end] <= '9')) : (end += 1) {}
+    if (end == value_start) return null;
+
+    return std.fmt.parseInt(i64, json[value_start..end], 10) catch null;
 }
 
 // --- Tests ---
@@ -280,6 +337,72 @@ test "JsonlReader with empty file" {
 
     try std.testing.expect(!reader.hasHeader());
     try std.testing.expectEqual(@as(usize, 0), reader.messageCount());
+}
+
+test "SessionUsage tracking" {
+    var usage = SessionUsage{};
+    try std.testing.expectEqual(@as(u64, 0), usage.totalTokens());
+
+    usage.add(.{ .input_tokens = 100, .output_tokens = 50 });
+    try std.testing.expectEqual(@as(u64, 150), usage.totalTokens());
+    try std.testing.expectEqual(@as(u64, 100), usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 50), usage.output_tokens);
+}
+
+test "SessionUsage add multiple" {
+    var usage = SessionUsage{};
+    usage.add(.{ .input_tokens = 10, .output_tokens = 5 });
+    usage.add(.{ .input_tokens = 20, .output_tokens = 15 });
+    try std.testing.expectEqual(@as(u64, 30), usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 20), usage.output_tokens);
+    try std.testing.expectEqual(@as(u64, 50), usage.totalTokens());
+}
+
+test "JsonlWriter writes usage" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/zclaw_session_usage.jsonl";
+
+    {
+        var writer = try JsonlWriter.init(tmp_path);
+        defer writer.close();
+        try writer.writeHeader("usage-test");
+        try writer.writeUsage(.{ .input_tokens = 100, .output_tokens = 50 });
+        try writer.writeUsage(.{ .input_tokens = 200, .output_tokens = 100 });
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Verify file content
+    const file = try std.fs.cwd().openFile(tmp_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"input_tokens\":100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"output_tokens\":50") != null);
+}
+
+test "JsonlReader totalTokens" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/zclaw_session_tokens.jsonl";
+
+    {
+        var writer = try JsonlWriter.init(tmp_path);
+        defer writer.close();
+        try writer.writeHeader("token-test");
+        try writer.writeUsage(.{ .input_tokens = 100, .output_tokens = 50 });
+        try writer.writeMessage(.user, "hello");
+        try writer.writeUsage(.{ .input_tokens = 200, .output_tokens = 75 });
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var reader = JsonlReader.init(allocator);
+    defer reader.deinit();
+    try reader.readFromPath(tmp_path);
+
+    const usage = reader.totalTokens();
+    try std.testing.expectEqual(@as(u64, 300), usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 125), usage.output_tokens);
+    try std.testing.expectEqual(@as(u64, 425), usage.totalTokens());
 }
 
 test "JsonlWriter writes compaction marker" {
