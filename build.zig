@@ -15,6 +15,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const zqlite_dep = b.dependency("zqlite", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // --- Main module ---
     const main_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -23,6 +28,7 @@ pub fn build(b: *std.Build) void {
     });
     main_mod.addImport("httpz", httpz_dep.module("httpz"));
     main_mod.addImport("clap", clap_dep.module("clap"));
+    main_mod.addImport("zqlite", zqlite_dep.module("zqlite"));
 
     // --- Main executable ---
     const exe = b.addExecutable(.{
@@ -52,6 +58,7 @@ pub fn build(b: *std.Build) void {
     });
     main_test_mod.addImport("httpz", httpz_dep.module("httpz"));
     main_test_mod.addImport("clap", clap_dep.module("clap"));
+    main_test_mod.addImport("zqlite", zqlite_dep.module("zqlite"));
     const main_tests = b.addTest(.{ .root_module = main_test_mod });
     test_step.dependOn(&b.addRunArtifact(main_tests).step);
 
@@ -61,6 +68,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_test_mod.addImport("zqlite", zqlite_dep.module("zqlite"));
     const lib_tests = b.addTest(.{ .root_module = lib_test_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 }
