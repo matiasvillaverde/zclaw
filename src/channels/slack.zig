@@ -154,6 +154,125 @@ pub fn parseIncomingMessage(json: []const u8) ?plugin.IncomingMessage {
     };
 }
 
+// --- Slack Channel ---
+
+const http_client = @import("../infra/http_client.zig");
+
+pub const SlackChannel = struct {
+    config: SlackConfig,
+    client: *http_client.HttpClient,
+    status: plugin.ChannelStatus = .disconnected,
+    allocator: std.mem.Allocator,
+
+    pub const MessageHandler = *const fn (channel_id: []const u8, user_id: []const u8, text: []const u8) ?[]const u8;
+
+    pub fn init(allocator: std.mem.Allocator, config: SlackConfig, client: *http_client.HttpClient) SlackChannel {
+        return .{
+            .config = config,
+            .client = client,
+            .status = .disconnected,
+            .allocator = allocator,
+        };
+    }
+
+    /// Verify bot token by calling auth.test.
+    pub fn start(self: *SlackChannel) !void {
+        self.status = .connecting;
+
+        var url_buf: [256]u8 = undefined;
+        const url = try buildApiUrl(&url_buf, "auth.test");
+
+        var auth_buf: [256]u8 = undefined;
+        const auth = try buildAuthHeader(&auth_buf, self.config.bot_token);
+        const headers = [_]http_client.Header{
+            .{ .name = "authorization", .value = auth },
+        };
+
+        var resp = self.client.get(url, &headers) catch {
+            self.status = .error_state;
+            return;
+        };
+        defer resp.deinit();
+
+        if (resp.status == 200) {
+            self.status = .connected;
+        } else {
+            self.status = .error_state;
+        }
+    }
+
+    /// Post a message to a channel via chat.postMessage.
+    pub fn postMessage(self: *SlackChannel, channel_id: []const u8, text: []const u8) !void {
+        var url_buf: [256]u8 = undefined;
+        const url = try buildApiUrl(&url_buf, "chat.postMessage");
+
+        var body_buf: [8192]u8 = undefined;
+        const body = try buildPostMessageBody(&body_buf, channel_id, text);
+
+        var auth_buf: [256]u8 = undefined;
+        const auth = try buildAuthHeader(&auth_buf, self.config.bot_token);
+        const headers = [_]http_client.Header{
+            .{ .name = "authorization", .value = auth },
+            .{ .name = "content-type", .value = "application/json" },
+        };
+
+        var resp = try self.client.post(url, &headers, body);
+        defer resp.deinit();
+
+        if (resp.status != 200) {
+            return error.SendFailed;
+        }
+    }
+
+    /// Handle an incoming Slack event (from Events API webhook).
+    /// Returns a response for url_verification challenges, or routes messages to handler.
+    pub fn handleEvent(
+        self: *SlackChannel,
+        event_json: []const u8,
+        handler: ?MessageHandler,
+        response_buf: []u8,
+    ) HandleResult {
+        // Check for url_verification challenge
+        const event_type = extractEventType(event_json);
+        if (event_type) |et| {
+            if (std.mem.eql(u8, et, "url_verification")) {
+                const challenge = extractJsonString(event_json, "\"challenge\":\"");
+                if (challenge) |ch| {
+                    var fbs = std.io.fixedBufferStream(response_buf);
+                    std.fmt.format(fbs.writer(), "{{\"challenge\":\"{s}\"}}", .{ch}) catch
+                        return .{ .handled = true, .response = null };
+                    return .{ .handled = true, .response = fbs.getWritten() };
+                }
+            }
+        }
+
+        // Parse as message
+        const msg = parseIncomingMessage(event_json) orelse
+            return .{ .handled = false, .response = null };
+
+        // Skip bot messages
+        if (isBot(event_json))
+            return .{ .handled = true, .response = null };
+
+        // Route to handler
+        if (handler) |h| {
+            const response = h(msg.chat_id, msg.sender_id, msg.content);
+            if (response) |resp_text| {
+                self.postMessage(msg.chat_id, resp_text) catch {};
+            }
+        }
+
+        return .{ .handled = true, .response = null };
+    }
+
+    pub const HandleResult = struct {
+        handled: bool,
+        response: ?[]const u8,
+    };
+
+    pub const SendError = error{SendFailed};
+};
+
 // --- Helpers ---
 
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
@@ -592,4 +711,171 @@ test "SlackConfig with all fields" {
     try std.testing.expectEqualStrings("xapp-1-A123-456", config.app_token.?);
     try std.testing.expectEqualStrings("abc123def456", config.signing_secret.?);
     try std.testing.expectEqualStrings("C0123456789", config.default_channel.?);
+}
+
+// --- SlackChannel Tests ---
+
+test "SlackChannel init" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    const channel = SlackChannel.init(allocator, .{ .bot_token = "xoxb-test" }, &client);
+    try std.testing.expectEqual(plugin.ChannelStatus.disconnected, channel.status);
+}
+
+test "SlackChannel start success" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true,\"user_id\":\"U123\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = SlackChannel.init(allocator, .{ .bot_token = "xoxb-test" }, &client);
+
+    try channel.start();
+    try std.testing.expectEqual(plugin.ChannelStatus.connected, channel.status);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_url.?, "auth.test") != null);
+}
+
+test "SlackChannel start failure" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 401, .body = "{\"ok\":false,\"error\":\"invalid_auth\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = SlackChannel.init(allocator, .{ .bot_token = "bad" }, &client);
+
+    try channel.start();
+    try std.testing.expectEqual(plugin.ChannelStatus.error_state, channel.status);
+}
+
+test "SlackChannel postMessage success" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true,\"ts\":\"1234.5678\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = SlackChannel.init(allocator, .{ .bot_token = "xoxb-test" }, &client);
+
+    try channel.postMessage("C123", "Hello Slack!");
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_url.?, "chat.postMessage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "Hello Slack!") != null);
+}
+
+test "SlackChannel postMessage failure" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 403, .body = "{\"ok\":false,\"error\":\"channel_not_found\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = SlackChannel.init(allocator, .{ .bot_token = "xoxb-test" }, &client);
+
+    const result = channel.postMessage("C999", "hi");
+    try std.testing.expectError(SlackChannel.SendError.SendFailed, result);
+}
+
+test "SlackChannel handleEvent url_verification" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = SlackChannel.init(allocator, .{ .bot_token = "xoxb-test" }, &client);
+
+    var buf: [512]u8 = undefined;
+    const result = channel.handleEvent(
+        "{\"type\":\"url_verification\",\"challenge\":\"abc123\"}",
+        null,
+        &buf,
+    );
+    try std.testing.expect(result.handled);
+    try std.testing.expect(result.response != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.response.?, "abc123") != null);
+}
+
+test "SlackChannel handleEvent message" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = SlackChannel.init(allocator, .{ .bot_token = "xoxb-test" }, &client);
+
+    var buf: [512]u8 = undefined;
+    const result = channel.handleEvent(
+        "{\"text\":\"Hello\",\"channel\":\"C123\",\"user\":\"U456\"}",
+        null,
+        &buf,
+    );
+    try std.testing.expect(result.handled);
+    try std.testing.expect(result.response == null);
+}
+
+test "SlackChannel handleEvent skips bot" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = SlackChannel.init(allocator, .{ .bot_token = "xoxb-test" }, &client);
+
+    var buf: [512]u8 = undefined;
+    const result = channel.handleEvent(
+        "{\"text\":\"Bot msg\",\"channel\":\"C1\",\"user\":\"U1\",\"bot_id\":\"B123\"}",
+        null,
+        &buf,
+    );
+    try std.testing.expect(result.handled);
+}
+
+test "SlackChannel handleEvent unrecognized" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = SlackChannel.init(allocator, .{ .bot_token = "xoxb-test" }, &client);
+
+    var buf: [512]u8 = undefined;
+    const result = channel.handleEvent("{\"type\":\"reaction_added\"}", null, &buf);
+    try std.testing.expect(!result.handled);
+}
+
+test "SlackChannel handleEvent with handler" {
+    const allocator = std.testing.allocator;
+    // handler returns a response → postMessage will be called
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = SlackChannel.init(allocator, .{ .bot_token = "xoxb-test" }, &client);
+
+    const handler = struct {
+        fn handle(_: []const u8, _: []const u8, _: []const u8) ?[]const u8 {
+            return "Reply!";
+        }
+    }.handle;
+
+    var buf: [512]u8 = undefined;
+    const result = channel.handleEvent(
+        "{\"text\":\"Hello\",\"channel\":\"C123\",\"user\":\"U456\"}",
+        handler,
+        &buf,
+    );
+    try std.testing.expect(result.handled);
+    // postMessage was called
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+}
+
+test "SlackChannel.HandleResult struct" {
+    const result = SlackChannel.HandleResult{ .handled = true, .response = "test" };
+    try std.testing.expect(result.handled);
+    try std.testing.expectEqualStrings("test", result.response.?);
+}
+
+test "SlackChannel.MessageHandler type exists" {
+    const handler: ?SlackChannel.MessageHandler = null;
+    try std.testing.expect(handler == null);
 }
