@@ -7,12 +7,14 @@ pub const infra = struct {
     pub const retry = @import("infra/retry.zig");
     pub const ssrf = @import("infra/ssrf.zig");
     pub const scrub = @import("infra/scrub.zig");
+    pub const validate = @import("infra/validate.zig");
 };
 
 pub const config = struct {
     pub const schema = @import("config/schema.zig");
     pub const loader = @import("config/loader.zig");
     pub const watcher = @import("config/watcher.zig");
+    pub const validator = @import("config/validator.zig");
 };
 
 pub const agent = struct {
@@ -32,6 +34,7 @@ pub const gateway = struct {
     pub const state = @import("gateway/state.zig");
     pub const server = @import("gateway/server.zig");
     pub const methods = @import("gateway/methods.zig");
+    pub const rate_limit = @import("gateway/rate_limit.zig");
 };
 
 pub const channels = struct {
@@ -54,6 +57,7 @@ pub const tools = struct {
     pub const web_search = @import("tools/web_search.zig");
     pub const memory_tools = @import("tools/memory_tools.zig");
     pub const message = @import("tools/message.zig");
+    pub const workspace_guard = @import("tools/workspace_guard.zig");
 };
 
 pub const cli = struct {
@@ -113,6 +117,11 @@ pub const hooks = struct {
 
 pub const security = struct {
     pub const audit = @import("security/audit.zig");
+    pub const secrets = @import("security/secrets.zig");
+};
+
+pub const testing_helpers = struct {
+    pub const helpers = @import("testing/helpers.zig");
 };
 
 test {
@@ -198,4 +207,11 @@ test {
     _ = @import("hooks/registry.zig");
     // security
     _ = @import("security/audit.zig");
+    _ = @import("security/secrets.zig");
+    // new modules
+    _ = @import("infra/validate.zig");
+    _ = @import("config/validator.zig");
+    _ = @import("gateway/rate_limit.zig");
+    _ = @import("tools/workspace_guard.zig");
+    _ = @import("testing/helpers.zig");
 }
