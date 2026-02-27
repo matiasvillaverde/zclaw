@@ -7,6 +7,8 @@ const cli_output = @import("cli/output.zig");
 const config_loader = @import("config/loader.zig");
 const config_schema = @import("config/schema.zig");
 const telegram = @import("channels/telegram.zig");
+const discord = @import("channels/discord.zig");
+const slack = @import("channels/slack.zig");
 const http_client = @import("infra/http_client.zig");
 const runtime = @import("agent/runtime.zig");
 
@@ -88,6 +90,7 @@ fn handleWsUpgrade(_: Handler, req: *httpz.Request, res: *httpz.Response) !void 
 pub const ServerType = httpz.Server(Handler);
 
 var server_instance: ?*ServerType = null;
+var slack_channel_instance: ?*slack.SlackChannel = null;
 
 pub fn createServer(allocator: std.mem.Allocator, port: u16) !*ServerType {
     const server = try allocator.create(ServerType);
@@ -99,8 +102,31 @@ pub fn createServer(allocator: std.mem.Allocator, port: u16) !*ServerType {
     router.get("/", handleIndex, .{});
     router.get("/health", handleHealth, .{});
     router.get("/ws", handleWsUpgrade, .{});
+    router.post("/slack/events", handleSlackEvent, .{});
 
     return server;
+}
+
+fn handleSlackEvent(_: Handler, req: *httpz.Request, res: *httpz.Response) !void {
+    res.content_type = .JSON;
+    const body = req.body() orelse {
+        res.status = 400;
+        res.body = "{\"error\":\"no body\"}";
+        return;
+    };
+
+    if (slack_channel_instance) |channel| {
+        var resp_buf: [4096]u8 = undefined;
+        const result = channel.handleEvent(body, &agentMessageHandler, &resp_buf);
+        if (result.response) |resp| {
+            res.body = resp;
+        } else {
+            res.body = "{\"ok\":true}";
+        }
+    } else {
+        res.status = 503;
+        res.body = "{\"error\":\"slack not configured\"}";
+    }
 }
 
 pub fn stopServer() void {
@@ -267,13 +293,89 @@ fn runGatewayServer(allocator: std.mem.Allocator, args: []const []const u8, mode
         }
     }
 
+    // --- Start Discord polling if DISCORD_BOT_TOKEN is set ---
+    var dc_stop = std.atomic.Value(bool).init(false);
+    var dc_transport = http_client.StdHttpTransport.init(allocator);
+    var dc_http = http_client.HttpClient.init(allocator, dc_transport.transport());
+    defer dc_http.deinit();
+
+    var dc_channel = discord.DiscordChannel.init(allocator, .{
+        .bot_token = std.posix.getenv("DISCORD_BOT_TOKEN") orelse "",
+    }, &dc_http);
+
+    const has_discord = std.posix.getenv("DISCORD_BOT_TOKEN") != null;
+    const discord_channel_id = std.posix.getenv("DISCORD_CHANNEL_ID") orelse "";
+    var dc_thread: ?std.Thread = null;
+
+    if (has_discord and discord_channel_id.len > 0) {
+        dc_thread = dc_channel.startPollingThread(
+            discord_channel_id,
+            makeAgentHandler(allocator),
+            &dc_stop,
+            2000,
+        ) catch null;
+
+        if (mode != .json) {
+            std.debug.print("discord: polling started (channel: {s})\n", .{discord_channel_id});
+        }
+    }
+
+    defer {
+        if (dc_thread) |thread| {
+            dc_stop.store(true, .release);
+            thread.join();
+        }
+    }
+
+    // --- Configure Slack webhook (handled via /slack/events HTTP route) ---
+    var slack_transport = http_client.StdHttpTransport.init(allocator);
+    var slack_http = http_client.HttpClient.init(allocator, slack_transport.transport());
+    defer slack_http.deinit();
+
+    var slack_ch = slack.SlackChannel.init(allocator, .{
+        .bot_token = std.posix.getenv("SLACK_BOT_TOKEN") orelse "",
+    }, &slack_http);
+
+    const has_slack = std.posix.getenv("SLACK_BOT_TOKEN") != null;
+    if (has_slack) {
+        slack_channel_instance = &slack_ch;
+    }
+    defer {
+        slack_channel_instance = null;
+    }
+
     if (mode != .json) {
         std.debug.print("zclaw gateway listening on http://localhost:{d}/\n", .{port});
         if (config_result.source_path) |path| {
             std.debug.print("config: {s}\n", .{path});
         }
+        var channel_list_buf: [128]u8 = undefined;
+        var channel_list_len: usize = 0;
         if (has_telegram) {
-            std.debug.print("channels: telegram\n", .{});
+            const label = "telegram";
+            @memcpy(channel_list_buf[channel_list_len..][0..label.len], label);
+            channel_list_len += label.len;
+        }
+        if (has_discord) {
+            if (channel_list_len > 0) {
+                @memcpy(channel_list_buf[channel_list_len..][0..2], ", ");
+                channel_list_len += 2;
+            }
+            const label = "discord";
+            @memcpy(channel_list_buf[channel_list_len..][0..label.len], label);
+            channel_list_len += label.len;
+        }
+        if (has_slack) {
+            if (channel_list_len > 0) {
+                @memcpy(channel_list_buf[channel_list_len..][0..2], ", ");
+                channel_list_len += 2;
+            }
+            const label = "slack";
+            @memcpy(channel_list_buf[channel_list_len..][0..label.len], label);
+            channel_list_len += label.len;
+        }
+        if (channel_list_len > 0) {
+            std.debug.print("channels: {s}\n", .{channel_list_buf[0..channel_list_len]});
         }
     } else {
         std.debug.print("{{\"event\":\"started\",\"port\":{d}}}\n", .{port});
