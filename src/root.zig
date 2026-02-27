@@ -99,6 +99,7 @@ pub const providers = struct {
     pub const openai = @import("providers/openai.zig");
     pub const openai_compat = @import("providers/openai_compat.zig");
     pub const reliable = @import("providers/reliable.zig");
+    pub const gemini = @import("providers/gemini.zig");
 };
 
 pub const media = struct {
@@ -181,6 +182,7 @@ test {
     _ = @import("providers/openai.zig");
     _ = @import("providers/openai_compat.zig");
     _ = @import("providers/reliable.zig");
+    _ = @import("providers/gemini.zig");
     // cli
     _ = @import("cli/main.zig");
     _ = @import("cli/output.zig");
