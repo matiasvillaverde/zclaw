@@ -647,3 +647,520 @@ test "ProviderResponse.isSuccess" {
     const r500 = ProviderResponse{ .status = 500, .body = "" };
     try std.testing.expect(!r500.isSuccess());
 }
+
+// =====================================================
+// Additional comprehensive tests
+// =====================================================
+
+// --- Content block type parsing in stream events ---
+
+test "parseStreamEvent content_block_start text type" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_start",
+        .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.start, result.event_type);
+    // Not a tool_use block, so no tool fields
+    try std.testing.expect(result.tool_call_id == null);
+    try std.testing.expect(result.tool_name == null);
+}
+
+test "parseStreamEvent content_block_start thinking type" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_start",
+        .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.start, result.event_type);
+}
+
+test "parseStreamEvent content_block_start tool_use with complex id" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_start",
+        .data = "{\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01A109YZZXB1pZD74XjFVsJd\",\"name\":\"web_search\",\"input\":{}}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.tool_call_start, result.event_type);
+    try std.testing.expectEqualStrings("toolu_01A109YZZXB1pZD74XjFVsJd", result.tool_call_id.?);
+    try std.testing.expectEqualStrings("web_search", result.tool_name.?);
+}
+
+// --- Tool input delta parsing ---
+
+test "parseStreamEvent tool_call_delta with partial_json" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_delta",
+        .data = "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\"\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.tool_call_delta, result.event_type);
+    try std.testing.expect(result.tool_input_delta != null);
+}
+
+test "parseStreamEvent content_block_delta with empty text" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_delta",
+        .data = "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.text_delta, result.event_type);
+    try std.testing.expectEqualStrings("", result.text.?);
+}
+
+// --- Message delta with various stop reasons ---
+
+test "parseStreamEvent message_delta stop_reason tool_use" {
+    const event = sse.SseEvent{
+        .event_type = "message_delta",
+        .data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":15}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.stop, result.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, result.stop_reason.?);
+    try std.testing.expectEqual(@as(u64, 15), result.usage.?.output_tokens);
+}
+
+test "parseStreamEvent message_delta stop_reason max_tokens" {
+    const event = sse.SseEvent{
+        .event_type = "message_delta",
+        .data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4096}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StopReason.max_tokens, result.stop_reason.?);
+    try std.testing.expectEqual(@as(u64, 4096), result.usage.?.output_tokens);
+}
+
+test "parseStreamEvent message_delta stop_reason stop_sequence" {
+    const event = sse.SseEvent{
+        .event_type = "message_delta",
+        .data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"stop_sequence\"},\"usage\":{\"output_tokens\":10}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StopReason.stop_sequence, result.stop_reason.?);
+}
+
+test "parseStreamEvent message_delta without usage" {
+    const event = sse.SseEvent{
+        .event_type = "message_delta",
+        .data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.stop, result.event_type);
+    try std.testing.expectEqual(types.StopReason.end_turn, result.stop_reason.?);
+    try std.testing.expect(result.usage == null);
+}
+
+// --- Message start with usage tracking ---
+
+test "parseStreamEvent message_start with large usage" {
+    const event = sse.SseEvent{
+        .event_type = "message_start",
+        .data = "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_abc\",\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":12500}}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.start, result.event_type);
+    try std.testing.expectEqual(@as(u64, 12500), result.usage.?.input_tokens);
+}
+
+test "parseStreamEvent message_start without usage" {
+    const event = sse.SseEvent{
+        .event_type = "message_start",
+        .data = "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_abc\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.start, result.event_type);
+    try std.testing.expect(result.usage == null);
+}
+
+// --- Error event parsing ---
+
+test "parseStreamEvent error with overloaded message" {
+    const event = sse.SseEvent{
+        .event_type = "error",
+        .data = "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.@"error", result.event_type);
+    try std.testing.expectEqualStrings("Overloaded", result.error_message.?);
+}
+
+test "parseStreamEvent error with invalid_request_error" {
+    const event = sse.SseEvent{
+        .event_type = "error",
+        .data = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"max_tokens must be positive\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.@"error", result.event_type);
+    try std.testing.expectEqualStrings("max_tokens must be positive", result.error_message.?);
+}
+
+test "parseStreamEvent error without message field" {
+    const event = sse.SseEvent{
+        .event_type = "error",
+        .data = "{\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.@"error", result.event_type);
+    try std.testing.expect(result.error_message == null);
+}
+
+// --- content_block_stop ---
+
+test "parseStreamEvent content_block_stop returns null" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_stop",
+        .data = "{\"type\":\"content_block_stop\",\"index\":0}",
+    };
+    const result = parseStreamEvent(&event);
+    try std.testing.expect(result == null);
+}
+
+// --- Null/missing event_type ---
+
+test "parseStreamEvent null event_type with non-DONE data returns null" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"some\":\"data\"}",
+    };
+    const result = parseStreamEvent(&event);
+    try std.testing.expect(result == null);
+}
+
+// --- Request body building edge cases ---
+
+test "buildRequestBody with no system prompt" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "claude-3-haiku",
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"system\"") == null);
+}
+
+test "buildRequestBody with all fields" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "claude-3-5-sonnet-20241022",
+        .max_tokens = 8192,
+        .stream = true,
+        .temperature = 0.3,
+        .system_prompt = "Be concise.",
+        .api_key = "sk-ant-key",
+    }, "[{\"role\":\"user\",\"content\":\"hi\"}]", "[{\"name\":\"bash\"}]");
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"claude-3-5-sonnet-20241022\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":8192") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Be concise.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"name\":\"bash\"}]") != null);
+}
+
+test "buildRequestBody temperature zero" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "claude-3-5-sonnet",
+        .temperature = 0.0,
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.0") != null);
+}
+
+test "buildRequestBody temperature max" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "claude-3-5-sonnet",
+        .temperature = 1.0,
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":1.0") != null);
+}
+
+test "buildRequestBody system prompt with special characters" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "claude-3-5-sonnet",
+        .system_prompt = "Handle \"quotes\" and \\backslashes\\ and\nnewlines",
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"quotes\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\\backslashes\\\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\n") != null);
+}
+
+test "buildRequestBody with empty messages array" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "claude-3-5-sonnet",
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"messages\":[]") != null);
+}
+
+// --- Tool JSON building ---
+
+test "buildToolJson with no description" {
+    var buf: [1024]u8 = undefined;
+    const json = try buildToolJson(&buf, .{
+        .name = "simple_tool",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"simple_tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\"") == null);
+}
+
+test "buildToolJson with no parameters" {
+    var buf: [1024]u8 = undefined;
+    const json = try buildToolJson(&buf, .{
+        .name = "no_params",
+        .description = "A tool without parameters",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"no_params\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\":\"A tool without parameters\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input_schema\"") == null);
+}
+
+test "buildToolJson with complex parameters" {
+    var buf: [2048]u8 = undefined;
+    const params = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"},\"method\":{\"type\":\"string\",\"enum\":[\"GET\",\"POST\"]}},\"required\":[\"url\"]}";
+    const json = try buildToolJson(&buf, .{
+        .name = "http_request",
+        .description = "Make HTTP request",
+        .parameters_json = params,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input_schema\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\"") != null);
+}
+
+test "buildToolJson description with special characters" {
+    var buf: [1024]u8 = undefined;
+    const json = try buildToolJson(&buf, .{
+        .name = "test",
+        .description = "Handles \"special\" chars\nand newlines",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\\"special\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\n") != null);
+}
+
+// --- Message building ---
+
+test "buildUserMessage with special characters" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildUserMessage(&buf, "Say \"hello\" and use \\path\\to\\file");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\\\"hello\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\\\\path\\\\to\\\\file") != null);
+}
+
+test "buildUserMessage empty text" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildUserMessage(&buf, "");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"text\":\"\"") != null);
+}
+
+test "buildAssistantMessage with special characters" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildAssistantMessage(&buf, "Line 1\nLine 2\tTabbed");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\\t") != null);
+}
+
+test "buildToolResultMessage with JSON content" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildToolResultMessage(&buf, "call_abc", "{\"result\":\"ok\"}");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"tool_use_id\":\"call_abc\"") != null);
+}
+
+// --- writeJsonEscaped edge cases ---
+
+test "writeJsonEscaped empty string" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "");
+    try std.testing.expectEqualStrings("", fbs.getWritten());
+}
+
+test "writeJsonEscaped no special characters" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "plain text");
+    try std.testing.expectEqualStrings("plain text", fbs.getWritten());
+}
+
+test "writeJsonEscaped control characters" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const input = [_]u8{ 0x00, 0x01, 0x1F };
+    try writeJsonEscaped(fbs.writer(), &input);
+    const result = fbs.getWritten();
+    // Control characters should be escaped as \uXXXX
+    try std.testing.expect(result.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\\u") != null);
+}
+
+test "writeJsonEscaped carriage return" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "line1\rline2");
+    try std.testing.expectEqualStrings("line1\\rline2", fbs.getWritten());
+}
+
+// --- extractJsonString edge cases ---
+
+test "extractJsonString at end of string" {
+    const json = "{\"key\":\"value\"}";
+    try std.testing.expectEqualStrings("value", extractJsonString(json, "\"key\":\"").?);
+}
+
+test "extractJsonString empty value" {
+    const json = "{\"key\":\"\"}";
+    try std.testing.expectEqualStrings("", extractJsonString(json, "\"key\":\"").?);
+}
+
+test "extractJsonString with escaped quotes in value" {
+    const json = "{\"text\":\"say \\\"hello\\\"\"}";
+    // The extractor should stop at the first unescaped quote
+    const result = extractJsonString(json, "\"text\":\"");
+    try std.testing.expect(result != null);
+}
+
+test "extractJsonString multiple matches returns first" {
+    const json = "{\"a\":\"first\",\"b\":\"second\",\"a\":\"third\"}";
+    try std.testing.expectEqualStrings("first", extractJsonString(json, "\"a\":\"").?);
+}
+
+test "extractJsonString with prefix at very end" {
+    // Prefix found but no content after
+    try std.testing.expect(extractJsonString("\"key\":\"", "\"key\":\"") == null);
+}
+
+// --- extractJsonNumber edge cases ---
+
+test "extractJsonNumber zero value" {
+    const json = "{\"count\":0}";
+    try std.testing.expectEqual(@as(i64, 0), extractJsonNumber(json, "\"count\":").?);
+}
+
+test "extractJsonNumber large value" {
+    const json = "{\"tokens\":999999999}";
+    try std.testing.expectEqual(@as(i64, 999999999), extractJsonNumber(json, "\"tokens\":").?);
+}
+
+test "extractJsonNumber with trailing comma" {
+    const json = "{\"a\":42,\"b\":7}";
+    try std.testing.expectEqual(@as(i64, 42), extractJsonNumber(json, "\"a\":").?);
+    try std.testing.expectEqual(@as(i64, 7), extractJsonNumber(json, "\"b\":").?);
+}
+
+test "extractJsonNumber with non-digit after prefix" {
+    const json = "{\"val\":null}";
+    try std.testing.expect(extractJsonNumber(json, "\"val\":") == null);
+}
+
+// --- Headers ---
+
+test "buildHeaders contains all required Anthropic headers" {
+    var buf: [4][2][]const u8 = undefined;
+    const headers = buildHeaders(&buf, "sk-ant-api03-test");
+    try std.testing.expectEqual(@as(usize, 4), headers.len);
+    try std.testing.expectEqualStrings("content-type", headers[0][0]);
+    try std.testing.expectEqualStrings("x-api-key", headers[1][0]);
+    try std.testing.expectEqualStrings("anthropic-version", headers[2][0]);
+    try std.testing.expectEqualStrings("accept", headers[3][0]);
+    try std.testing.expectEqualStrings("text/event-stream", headers[3][1]);
+}
+
+// --- ProviderResponse edge cases ---
+
+test "ProviderResponse.isSuccess boundary values" {
+    const r199 = ProviderResponse{ .status = 199, .body = "" };
+    try std.testing.expect(!r199.isSuccess());
+
+    const r299 = ProviderResponse{ .status = 299, .body = "" };
+    try std.testing.expect(r299.isSuccess());
+
+    const r300 = ProviderResponse{ .status = 300, .body = "" };
+    try std.testing.expect(!r300.isSuccess());
+}
+
+test "ProviderResponse.isSuccess common error codes" {
+    const codes = [_]u16{ 400, 401, 403, 404, 408, 429, 500, 502, 503, 504 };
+    for (codes) |code| {
+        const r = ProviderResponse{ .status = code, .body = "" };
+        try std.testing.expect(!r.isSuccess());
+    }
+}
+
+test "ProviderResponse.deinit with allocator frees body" {
+    const allocator = std.testing.allocator;
+    const body = try allocator.dupe(u8, "test response body");
+    var resp = ProviderResponse{
+        .status = 200,
+        .body = body,
+        .allocator = allocator,
+    };
+    resp.deinit();
+    // If we get here without crash, the deallocation was successful
+}
+
+test "ProviderResponse.deinit without allocator is no-op" {
+    var resp = ProviderResponse{
+        .status = 200,
+        .body = "static body",
+    };
+    resp.deinit();
+}
+
+// --- Full stream simulation ---
+
+test "parseStreamEvent full conversation stream" {
+    // Simulate a complete Anthropic stream
+    const events_data = [_]struct { event_type: []const u8, data: []const u8 }{
+        .{ .event_type = "message_start", .data = "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50}}}" },
+        .{ .event_type = "content_block_start", .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}" },
+        .{ .event_type = "content_block_delta", .data = "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}" },
+        .{ .event_type = "content_block_delta", .data = "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}" },
+        .{ .event_type = "content_block_stop", .data = "{\"type\":\"content_block_stop\",\"index\":0}" },
+        .{ .event_type = "message_delta", .data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}" },
+        .{ .event_type = "message_stop", .data = "{\"type\":\"message_stop\"}" },
+    };
+
+    var total_usage = types.Usage{};
+    var text_parts: [10][]const u8 = undefined;
+    var text_count: usize = 0;
+
+    for (events_data) |ed| {
+        const sse_event = sse.SseEvent{ .event_type = ed.event_type, .data = ed.data };
+        if (parseStreamEvent(&sse_event)) |stream_event| {
+            switch (stream_event.event_type) {
+                .start => {
+                    if (stream_event.usage) |u| total_usage.add(u);
+                },
+                .text_delta => {
+                    if (stream_event.text) |t| {
+                        text_parts[text_count] = t;
+                        text_count += 1;
+                    }
+                },
+                .stop => {
+                    if (stream_event.usage) |u| total_usage.add(u);
+                },
+                else => {},
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), text_count);
+    try std.testing.expectEqualStrings("Hello", text_parts[0]);
+    try std.testing.expectEqualStrings(" world", text_parts[1]);
+    try std.testing.expectEqual(@as(u64, 50), total_usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 10), total_usage.output_tokens);
+}
+
+// --- API Constants ---
+
+test "API constants are correct" {
+    try std.testing.expectEqualStrings("https://api.anthropic.com", DEFAULT_BASE_URL);
+    try std.testing.expectEqualStrings("/v1/messages", MESSAGES_PATH);
+    try std.testing.expectEqualStrings("2023-06-01", API_VERSION);
+}

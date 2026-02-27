@@ -604,3 +604,376 @@ test "ProviderResponse.isSuccess" {
     const r429 = ProviderResponse{ .status = 429, .body = "" };
     try std.testing.expect(!r429.isSuccess());
 }
+
+// =====================================================
+// Additional comprehensive tests
+// =====================================================
+
+// --- finish_reason parsing for all OpenAI values ---
+
+test "parseStreamEvent finish_reason length maps to max_tokens" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.stop, result.event_type);
+    try std.testing.expectEqual(types.StopReason.max_tokens, result.stop_reason.?);
+}
+
+test "parseStreamEvent finish_reason content_filter" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.stop, result.event_type);
+    try std.testing.expectEqual(types.StopReason.content_filter, result.stop_reason.?);
+}
+
+test "parseStreamEvent finish_reason with usage data" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.stop, result.event_type);
+    try std.testing.expectEqual(types.StopReason.end_turn, result.stop_reason.?);
+    try std.testing.expectEqual(@as(u64, 100), result.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u64, 50), result.usage.?.output_tokens);
+}
+
+test "parseStreamEvent finish_reason without usage" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.stop, result.event_type);
+    try std.testing.expect(result.usage == null);
+}
+
+// --- Streaming chunks ---
+
+test "parseStreamEvent content delta with long text" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"This is a longer piece of text that spans multiple words and sentences.\"}}]}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.text_delta, result.event_type);
+    try std.testing.expectEqualStrings("This is a longer piece of text that spans multiple words and sentences.", result.text.?);
+}
+
+test "parseStreamEvent content delta with empty string" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"}}]}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.text_delta, result.event_type);
+    try std.testing.expectEqualStrings("", result.text.?);
+}
+
+test "parseStreamEvent empty delta no content no role" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"index\":0,\"delta\":{}}]}",
+    };
+    const result = parseStreamEvent(&event);
+    // Empty delta without content, role, or tool_calls should return null
+    try std.testing.expect(result == null);
+}
+
+// --- Tool call parsing ---
+
+test "parseStreamEvent tool call with arguments delta" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"query\\\"\"}}]}}]}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.tool_call_delta, result.event_type);
+    try std.testing.expect(result.tool_input_delta != null);
+}
+
+test "parseStreamEvent tool call start with function name and id" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_xyz789\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"\"}}]}}]}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.tool_call_start, result.event_type);
+    try std.testing.expectEqualStrings("call_xyz789", result.tool_call_id.?);
+    try std.testing.expectEqualStrings("web_search", result.tool_name.?);
+}
+
+test "parseStreamEvent tool_calls without id or name is delta" {
+    const event = sse.SseEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\": \\\"hello\\\"\"}}]}}]}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.tool_call_delta, result.event_type);
+}
+
+// --- Request body building ---
+
+test "buildRequestBody no stream" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-4",
+        .stream = false,
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\"") == null);
+}
+
+test "buildRequestBody with system prompt injects system message" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-4",
+        .system_prompt = "You are a coding assistant.",
+        .api_key = "sk-test",
+    }, "[{\"role\":\"user\",\"content\":\"help\"}]", null);
+
+    // System message should come first
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "You are a coding assistant.") != null);
+}
+
+test "buildRequestBody with tools adds tool_choice auto" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-4",
+        .api_key = "sk-test",
+    }, "[]", "[{\"type\":\"function\",\"function\":{\"name\":\"bash\"}}]");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
+}
+
+test "buildRequestBody without tools has no tool_choice" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-4",
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\"") == null);
+}
+
+test "buildRequestBody system prompt with special chars" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-4",
+        .system_prompt = "Use \"quotes\" and\nnewlines",
+        .api_key = "sk-test",
+    }, "[{\"role\":\"user\",\"content\":\"hi\"}]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"quotes\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\n") != null);
+}
+
+test "buildRequestBody temperature 0.0" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-4",
+        .temperature = 0.0,
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.0") != null);
+}
+
+test "buildRequestBody temperature 2.0" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-4",
+        .temperature = 2.0,
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":2.0") != null);
+}
+
+test "buildRequestBody max_tokens 0 omits field" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-4",
+        .max_tokens = 0,
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\"") == null);
+}
+
+// --- Tool JSON building ---
+
+test "buildToolJson wraps in function type" {
+    var buf: [1024]u8 = undefined;
+    const json = try buildToolJson(&buf, .{
+        .name = "calculator",
+        .description = "Do math",
+        .parameters_json = "{\"type\":\"object\"}",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"function\":{") != null);
+}
+
+test "buildToolJson no description" {
+    var buf: [1024]u8 = undefined;
+    const json = try buildToolJson(&buf, .{
+        .name = "tool",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\"") == null);
+}
+
+test "buildToolJson no parameters" {
+    var buf: [1024]u8 = undefined;
+    const json = try buildToolJson(&buf, .{
+        .name = "no_params_tool",
+        .description = "Does nothing",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"parameters\"") == null);
+}
+
+// --- Message building ---
+
+test "buildUserMessage with newlines and tabs" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildUserMessage(&buf, "line1\nline2\ttab");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\\t") != null);
+}
+
+test "buildAssistantMessage empty" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildAssistantMessage(&buf, "");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"content\":\"\"") != null);
+}
+
+test "buildToolResultMessage with empty content" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildToolResultMessage(&buf, "call_id", "");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"content\":\"\"") != null);
+}
+
+test "buildToolResultMessage uses tool role not user" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildToolResultMessage(&buf, "c1", "result");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"user\"") == null);
+}
+
+// --- formatBearerToken ---
+
+test "formatBearerToken with long key" {
+    var buf: [256]u8 = undefined;
+    const token = try formatBearerToken(&buf, "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789");
+    try std.testing.expect(std.mem.startsWith(u8, token, "Bearer "));
+    try std.testing.expect(std.mem.endsWith(u8, token, "0123456789"));
+}
+
+test "formatBearerToken with empty key" {
+    var buf: [256]u8 = undefined;
+    const token = try formatBearerToken(&buf, "");
+    try std.testing.expectEqualStrings("Bearer ", token);
+}
+
+// --- Headers ---
+
+test "buildHeaders structure" {
+    var buf: [3][2][]const u8 = undefined;
+    const headers = buildHeaders(&buf, "Bearer test-key");
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqualStrings("content-type", headers[0][0]);
+    try std.testing.expectEqualStrings("application/json", headers[0][1]);
+    try std.testing.expectEqualStrings("authorization", headers[1][0]);
+    try std.testing.expectEqualStrings("accept", headers[2][0]);
+    try std.testing.expectEqualStrings("text/event-stream", headers[2][1]);
+}
+
+// --- extractJsonString ---
+
+test "extractJsonString from OpenAI response" {
+    const json = "{\"choices\":[{\"delta\":{\"content\":\"Hello world\"}}]}";
+    try std.testing.expectEqualStrings("Hello world", extractJsonString(json, "\"content\":\"").?);
+}
+
+test "extractJsonString finish_reason" {
+    const json = "{\"choices\":[{\"finish_reason\":\"stop\"}]}";
+    try std.testing.expectEqualStrings("stop", extractJsonString(json, "\"finish_reason\":\"").?);
+}
+
+test "extractJsonString returns null for missing" {
+    try std.testing.expect(extractJsonString("{}", "\"missing\":\"") == null);
+}
+
+test "extractJsonString empty json" {
+    try std.testing.expect(extractJsonString("", "\"key\":\"") == null);
+}
+
+// --- extractJsonNumber ---
+
+test "extractJsonNumber prompt_tokens" {
+    const json = "{\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":10}}";
+    try std.testing.expectEqual(@as(i64, 42), extractJsonNumber(json, "\"prompt_tokens\":").?);
+    try std.testing.expectEqual(@as(i64, 10), extractJsonNumber(json, "\"completion_tokens\":").?);
+}
+
+test "extractJsonNumber missing field" {
+    try std.testing.expect(extractJsonNumber("{}", "\"tokens\":") == null);
+}
+
+// --- ProviderResponse ---
+
+test "ProviderResponse.isSuccess boundary 200" {
+    const r = ProviderResponse{ .status = 200, .body = "" };
+    try std.testing.expect(r.isSuccess());
+}
+
+test "ProviderResponse.isSuccess boundary 299" {
+    const r = ProviderResponse{ .status = 299, .body = "" };
+    try std.testing.expect(r.isSuccess());
+}
+
+test "ProviderResponse.isSuccess boundary 300 fails" {
+    const r = ProviderResponse{ .status = 300, .body = "" };
+    try std.testing.expect(!r.isSuccess());
+}
+
+test "ProviderResponse.isSuccess boundary 199 fails" {
+    const r = ProviderResponse{ .status = 199, .body = "" };
+    try std.testing.expect(!r.isSuccess());
+}
+
+test "ProviderResponse deinit frees allocated body" {
+    const allocator = std.testing.allocator;
+    const body = try allocator.dupe(u8, "response body to free");
+    var resp = ProviderResponse{
+        .status = 200,
+        .body = body,
+        .allocator = allocator,
+    };
+    resp.deinit();
+}
+
+// --- API Constants ---
+
+test "OpenAI API constants" {
+    try std.testing.expectEqualStrings("https://api.openai.com", DEFAULT_BASE_URL);
+    try std.testing.expectEqualStrings("/v1/chat/completions", COMPLETIONS_PATH);
+}
+
+// --- writeJsonEscaped ---
+
+test "writeJsonEscaped all special chars" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "\"\\\n\r\t");
+    try std.testing.expectEqualStrings("\\\"\\\\\\n\\r\\t", fbs.getWritten());
+}
+
+test "writeJsonEscaped plain ascii" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "abcABC123!@#$%^&*()");
+    try std.testing.expectEqualStrings("abcABC123!@#$%^&*()", fbs.getWritten());
+}
