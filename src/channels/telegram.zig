@@ -1120,3 +1120,177 @@ test "MessageHandler type is correct" {
     const null_result = null_handler("chat", "sender", "hello");
     try std.testing.expect(null_result == null);
 }
+
+// ======================================================================
+// New meaningful tests
+// ======================================================================
+
+test "pollUpdates returns null on empty response body" {
+    // When the API returns an empty result array, pollUpdates should return null
+    // and leave last_update_id unchanged.
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true,\"result\":[]}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    const result = try channel.pollUpdates();
+    try std.testing.expect(result == null);
+    // last_update_id should remain null since no update was processed
+    try std.testing.expect(channel.last_update_id == null);
+}
+
+test "pollUpdates with network error returns null for non-200 status" {
+    // When the Telegram API returns a non-200 status (e.g. 502), pollUpdates
+    // should return null rather than crashing.
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 502, .body = "Bad Gateway" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    const result = try channel.pollUpdates();
+    try std.testing.expect(result == null);
+    // Verify no state was mutated
+    try std.testing.expect(channel.last_update_id == null);
+}
+
+test "TelegramChannel sendText with HTML parse_mode verifies body content" {
+    // When sending a message with HTML parse_mode, the body must include the
+    // parse_mode field set to "HTML".
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+    channel.status = .connected;
+
+    try channel.sendText(.{
+        .chat_id = "12345",
+        .content = "<b>bold</b> and <i>italic</i>",
+        .parse_mode = "HTML",
+    });
+    try std.testing.expect(mock.last_body != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "\"parse_mode\":\"HTML\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "<b>bold</b>") != null);
+}
+
+test "parseIncomingMessage with group chat type" {
+    // A message from a group chat should have is_group = true.
+    const json =
+        \\{"update_id":500,"message":{"text":"group msg","chat":{"id":-1009876,"type":"group","title":"Dev Chat"},"from":{"id":42,"first_name":"Eve"}}}
+    ;
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expect(msg.is_group);
+    try std.testing.expectEqualStrings("group msg", msg.content);
+    try std.testing.expectEqualStrings("-1009876", msg.chat_id);
+    try std.testing.expectEqualStrings("42", msg.sender_id);
+    try std.testing.expectEqual(plugin.ChannelType.telegram, msg.channel);
+}
+
+test "parseIncomingMessage with missing text field returns null" {
+    // A message without a text field (e.g. sticker, photo) should return null.
+    const json =
+        \\{"update_id":600,"message":{"sticker":{"file_id":"sticker123"},"chat":{"id":1,"type":"private"},"from":{"id":2,"first_name":"Bob"}}}
+    ;
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "buildGetUpdatesBody with large offset near i64 max" {
+    // Verify that large offset values are serialized correctly without overflow.
+    var buf: [512]u8 = undefined;
+    const large_offset: i64 = 9_223_372_036_854_775_000; // near i64 max
+    const body = try buildGetUpdatesBody(&buf, large_offset, 30);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"offset\":9223372036854775000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"timeout\":30") != null);
+}
+
+test "TelegramChannel start failure sets error_state on auth failure" {
+    // When getMe returns 401 (unauthorized), the channel status should be
+    // set to error_state and no further requests should be made.
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 401, .body = "{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "invalid-token-123" }, &client);
+
+    try channel.start();
+    try std.testing.expectEqual(plugin.ChannelStatus.error_state, channel.status);
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+}
+
+test "multiple sequential pollUpdates track offset correctly" {
+    // After processing updates sequentially, last_update_id should reflect
+    // the most recent update_id.
+    const allocator = std.testing.allocator;
+    const resp1 = "{\"ok\":true,\"result\":[{\"update_id\":1000,\"message\":{\"text\":\"first\",\"chat\":{\"id\":1,\"type\":\"private\"},\"from\":{\"id\":2}}}]}";
+    const resp2 = "{\"ok\":true,\"result\":[{\"update_id\":1001,\"message\":{\"text\":\"second\",\"chat\":{\"id\":1,\"type\":\"private\"},\"from\":{\"id\":2}}}]}";
+    const resp3 = "{\"ok\":true,\"result\":[{\"update_id\":1002,\"message\":{\"text\":\"third\",\"chat\":{\"id\":1,\"type\":\"private\"},\"from\":{\"id\":2}}}]}";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = resp1 },
+        .{ .status = 200, .body = resp2 },
+        .{ .status = 200, .body = resp3 },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    // First poll
+    const r1 = try channel.pollUpdates();
+    try std.testing.expect(r1 != null);
+    try std.testing.expectEqualStrings("first", r1.?.content);
+    try std.testing.expectEqual(@as(i64, 1000), channel.last_update_id.?);
+
+    // Second poll: offset tracking
+    const r2 = try channel.pollUpdates();
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqualStrings("second", r2.?.content);
+    try std.testing.expectEqual(@as(i64, 1001), channel.last_update_id.?);
+
+    // Third poll: offset tracking
+    const r3 = try channel.pollUpdates();
+    try std.testing.expect(r3 != null);
+    try std.testing.expectEqualStrings("third", r3.?.content);
+    try std.testing.expectEqual(@as(i64, 1002), channel.last_update_id.?);
+
+    // Verify all 3 requests were made
+    try std.testing.expectEqual(@as(usize, 3), mock.call_count);
+}
+
+test "parseIncomingMessage extracts first_name into sender_name" {
+    // The parser should correctly extract the from.first_name field
+    // and set it as sender_name on the IncomingMessage.
+    const json =
+        \\{"update_id":700,"message":{"text":"hello","chat":{"id":55,"type":"private"},"from":{"id":99,"first_name":"Zara"}}}
+    ;
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expect(msg.sender_name != null);
+    try std.testing.expectEqualStrings("Zara", msg.sender_name.?);
+}
+
+test "buildApiUrl for sendPhoto and editMessageText endpoints" {
+    // Verify that buildApiUrl correctly generates URLs for various Telegram
+    // API endpoints beyond sendMessage/getUpdates.
+    var buf: [512]u8 = undefined;
+    const config = TelegramConfig{ .bot_token = "123:ABCDEF" };
+
+    const photo_url = try buildApiUrl(&buf, config, "sendPhoto");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABCDEF/sendPhoto", photo_url);
+
+    const edit_url = try buildApiUrl(&buf, config, "editMessageText");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABCDEF/editMessageText", edit_url);
+
+    const del_url = try buildApiUrl(&buf, config, "deleteWebhook");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABCDEF/deleteWebhook", del_url);
+
+    const info_url = try buildApiUrl(&buf, config, "getWebhookInfo");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABCDEF/getWebhookInfo", info_url);
+}
