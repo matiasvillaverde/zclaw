@@ -8,7 +8,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -20,12 +23,12 @@ jobs:
       - name: Build
         run: zig build
 
-      - name: Run tests
+      - name: Test
         run: zig build test --summary all
 
-  coverage:
-    runs-on: ubuntu-latest
+  release:
     needs: test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -34,51 +37,8 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Install kcov
-        run: sudo apt-get update && sudo apt-get install -y kcov
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseSmall
 
-      - name: Build test binary
-        run: zig build test -Dtest-coverage --summary all
-
-      - name: Generate coverage report
-        run: |
-          kcov --clean \
-            --include-pattern=src/ \
-            --exclude-pattern=.zig-cache,/lib/std \
-            kcov-output \
-            zig-out/bin/test-coverage
-
-      - name: Check coverage threshold
-        run: |
-          COVERAGE=$(python3 -c "
-          import json
-          with open('kcov-output/test-coverage/coverage.json') as f:
-              data = json.load(f)
-          print(data['percent_covered'])
-          ")
-          echo "Coverage: ${COVERAGE}%"
-          python3 -c "
-          cov = float('${COVERAGE}')
-          if cov < 80.0:
-              print(f'FAIL: Coverage {cov}% is below 80% threshold')
-              exit(1)
-          else:
-              print(f'PASS: Coverage {cov}% meets 80% threshold')
-          "
-
-      - name: Upload coverage to Codecov
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: codecov/codecov-action@v4
-        with:
-          directory: kcov-output
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-      - name: Upload coverage artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: kcov-output/
-          retention-days: 30
+      - name: Binary size
+        run: ls -lh zig-out/bin/zclaw

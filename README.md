@@ -1,5 +1,7 @@
 # zclaw
 
+[![CI](https://github.com/matiasvillaverde/zclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/matiasvillaverde/zclaw/actions/workflows/ci.yml)
+
 Personal AI assistant gateway. Connects your AI providers to Telegram, Discord, and Slack from a single 769 KB binary.
 
 Zig port of [OpenClaw](https://github.com/openclaw/openclaw).

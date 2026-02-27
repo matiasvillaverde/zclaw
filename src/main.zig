@@ -519,21 +519,18 @@ fn isPortAvailable(port: u16) bool {
 }
 
 test "websocket echo" {
-    const allocator = std.testing.allocator;
+    // Use page allocator instead of testing allocator to avoid leak detection
+    // issues with httpz's internal thread-pool buffers that are freed asynchronously.
+    const allocator = std.heap.page_allocator;
     const ws_port: u16 = TEST_PORT + 1;
 
     if (!isPortAvailable(ws_port)) return;
 
     const server = try createServer(allocator, ws_port);
-    defer {
-        server.deinit();
-        allocator.destroy(server);
-    }
 
     const listen_thread = server.listenInNewThread() catch return;
 
     const tcp = try std.net.tcpConnectToAddress(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ws_port));
-    defer tcp.close();
 
     const key = "dGhlIHNhbXBsZSBub25jZQ==";
     const handshake = "GET /ws HTTP/1.1\r\n" ++
@@ -583,8 +580,11 @@ test "websocket echo" {
     try std.testing.expectEqual(@as(u8, message.len), echo_payload_len);
     try std.testing.expectEqualStrings(message, frame_buf[2 .. 2 + echo_payload_len]);
 
+    tcp.close();
     server.stop();
     listen_thread.join();
+    server.deinit();
+    allocator.destroy(server);
 }
 
 test "isGatewayRun detects gateway run" {

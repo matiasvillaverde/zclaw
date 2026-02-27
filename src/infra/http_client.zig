@@ -214,6 +214,9 @@ pub const MockTransport = struct {
     last_url: ?[]const u8 = null,
     last_body: ?[]const u8 = null,
     last_method: ?HttpMethod = null,
+    // Internal buffers to own copies of url/body (avoids dangling borrowed slices)
+    url_buf: [2048]u8 = undefined,
+    body_buf: [8192]u8 = undefined,
 
     pub const MockResponse = struct {
         status: u16 = 200,
@@ -233,8 +236,19 @@ pub const MockTransport = struct {
 
     fn requestImpl(ptr: *anyopaque, allocator: std.mem.Allocator, options: RequestOptions) anyerror!HttpResponse {
         const self: *MockTransport = @ptrCast(@alignCast(ptr));
-        self.last_url = options.url;
-        self.last_body = options.body;
+        // Copy url/body into owned buffers so they survive after caller's stack frame exits
+        {
+            const len = @min(options.url.len, self.url_buf.len);
+            @memcpy(self.url_buf[0..len], options.url[0..len]);
+            self.last_url = self.url_buf[0..len];
+        }
+        if (options.body) |body| {
+            const len = @min(body.len, self.body_buf.len);
+            @memcpy(self.body_buf[0..len], body[0..len]);
+            self.last_body = self.body_buf[0..len];
+        } else {
+            self.last_body = null;
+        }
         self.last_method = options.method;
 
         if (self.call_count >= self.responses.len) {
