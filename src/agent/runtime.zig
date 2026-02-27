@@ -6,6 +6,7 @@ const types = @import("../providers/types.zig");
 const anthropic = @import("../providers/anthropic.zig");
 const openai = @import("../providers/openai.zig");
 const openai_compat = @import("../providers/openai_compat.zig");
+const gemini = @import("../providers/gemini.zig");
 const sse = @import("../providers/sse.zig");
 const http_client = @import("../infra/http_client.zig");
 const tool_registry = @import("../tools/registry.zig");
@@ -135,6 +136,7 @@ pub const ProviderDispatch = struct {
     anthropic_client: ?anthropic.Client,
     openai_client: ?openai.Client,
     compat_client: ?openai_compat.Client = null,
+    gemini_client: ?gemini.Client = null,
 
     pub fn initAnthropic(http: *http_client.HttpClient, api_key: []const u8, base_url: ?[]const u8) ProviderDispatch {
         return .{
@@ -162,6 +164,16 @@ pub const ProviderDispatch = struct {
         };
     }
 
+    /// Initialize with Google Gemini provider
+    pub fn initGemini(http: *http_client.HttpClient, api_key: []const u8, base_url: ?[]const u8) ProviderDispatch {
+        return .{
+            .api_type = .google_genai,
+            .anthropic_client = null,
+            .openai_client = null,
+            .gemini_client = gemini.Client.init(http, api_key, base_url),
+        };
+    }
+
     /// Send a message through the appropriate provider.
     pub fn sendMessage(
         self: *ProviderDispatch,
@@ -178,6 +190,18 @@ pub const ProviderDispatch = struct {
                 .body = resp.body,
                 .allocator = resp.allocator,
                 .api_type = .openai_completions,
+            };
+        }
+
+        // Check gemini client
+        if (self.gemini_client != null) {
+            var client = &self.gemini_client.?;
+            const resp = try client.sendMessage(config, messages_json, tools_json);
+            return .{
+                .status = resp.status,
+                .body = resp.body,
+                .allocator = resp.allocator,
+                .api_type = .google_genai,
             };
         }
 
@@ -248,6 +272,7 @@ pub const ProviderResult = struct {
             const stream_event = switch (self.api_type) {
                 .anthropic_messages => anthropic.parseStreamEvent(&raw_event),
                 .openai_completions => openai.parseStreamEvent(&raw_event),
+                .google_genai => gemini.parseStreamEvent(&raw_event),
                 else => null,
             };
 
@@ -372,6 +397,36 @@ pub fn buildMessagesJson(
                         var msg_buf: [32 * 1024]u8 = undefined;
                         const json = try openai.buildToolResultMessage(&msg_buf, msg.tool_call_id orelse "", msg.content);
                         try buf.appendSlice(allocator, json);
+                    },
+                }
+            },
+            .google_genai => {
+                switch (msg.role) {
+                    .user => {
+                        var msg_buf: [32 * 1024]u8 = undefined;
+                        // buildUserMessage returns array, strip [ and ]
+                        const json = try gemini.buildUserMessage(&msg_buf, msg.content);
+                        // Strip wrapping [ ]
+                        if (json.len > 2 and json[0] == '[') {
+                            try buf.appendSlice(allocator, json[1 .. json.len - 1]);
+                        } else {
+                            try buf.appendSlice(allocator, json);
+                        }
+                    },
+                    .assistant => {
+                        var msg_buf: [32 * 1024]u8 = undefined;
+                        const json = try gemini.buildModelMessage(&msg_buf, msg.content);
+                        try buf.appendSlice(allocator, json);
+                    },
+                    .tool_result => {
+                        // Gemini tool results not yet supported, send as user message
+                        var msg_buf: [32 * 1024]u8 = undefined;
+                        const json = try gemini.buildUserMessage(&msg_buf, msg.content);
+                        if (json.len > 2 and json[0] == '[') {
+                            try buf.appendSlice(allocator, json[1 .. json.len - 1]);
+                        } else {
+                            try buf.appendSlice(allocator, json);
+                        }
                     },
                 }
             },
