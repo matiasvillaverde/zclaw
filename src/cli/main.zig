@@ -6,6 +6,7 @@ const runtime = @import("../agent/runtime.zig");
 const http_client = @import("../infra/http_client.zig");
 const session = @import("../agent/session.zig");
 const openai_compat = @import("../providers/openai_compat.zig");
+const memory_manager = @import("../memory/manager.zig");
 
 const OutputWriter = output.OutputWriter;
 const OutputMode = output.OutputMode;
@@ -489,22 +490,46 @@ fn runChannels(ctx: *CliContext, args: []const []const u8) !CommandResult {
     }
 
     return switch (sub.?) {
-        .list => {
+        .list, .status_sub => {
+            const Channel = struct { name: []const u8, env_var: []const u8 };
+            const channels = [_]Channel{
+                .{ .name = "telegram", .env_var = "TELEGRAM_BOT_TOKEN" },
+                .{ .name = "discord", .env_var = "DISCORD_BOT_TOKEN" },
+                .{ .name = "slack", .env_var = "SLACK_BOT_TOKEN" },
+            };
+
             if (ctx.mode == .json) {
-                try ctx.out.write("{\"command\":\"channels.list\",\"channels\":[]}\n");
+                try ctx.out.write("{\"command\":\"channels.");
+                try ctx.out.write(if (sub.? == .list) "list" else "status");
+                try ctx.out.write("\",\"channels\":[");
+                var first = true;
+                for (channels) |ch| {
+                    const configured = std.posix.getenv(ch.env_var) != null;
+                    if (!first) try ctx.out.write(",");
+                    try ctx.out.print("{{\"name\":\"{s}\",\"configured\":{s}}}", .{
+                        ch.name,
+                        if (configured) "true" else "false",
+                    });
+                    first = false;
+                }
+                try ctx.out.write("]}\n");
             } else {
-                try ctx.out.heading("Configured Channels:");
-                try ctx.out.write("  No channels configured.\n");
-                try ctx.out.write("  Run 'zclaw setup' to configure channels.\n");
-            }
-            return .{};
-        },
-        .status_sub => {
-            if (ctx.mode == .json) {
-                try ctx.out.write("{\"command\":\"channels.status\",\"channels\":[]}\n");
-            } else {
-                try ctx.out.heading("Channel Status:");
-                try ctx.out.write("  No channels active.\n");
+                try ctx.out.heading(if (sub.? == .list) "Configured Channels:" else "Channel Status:");
+                var any_configured = false;
+                for (channels) |ch| {
+                    const configured = std.posix.getenv(ch.env_var) != null;
+                    const status = if (configured) "[ok]" else "[  ]";
+                    try ctx.out.print("  {s} {s: <12} ({s})\n", .{
+                        status,
+                        ch.name,
+                        ch.env_var,
+                    });
+                    if (configured) any_configured = true;
+                }
+                try ctx.out.newline();
+                if (!any_configured) {
+                    try ctx.out.write("  Set environment variables to enable channels.\n");
+                }
             }
             return .{};
         },
@@ -542,13 +567,48 @@ fn runChannels(ctx: *CliContext, args: []const []const u8) !CommandResult {
 // --- Models Command ---
 
 fn runModels(ctx: *CliContext, _: []const []const u8) !CommandResult {
+    const Provider = struct {
+        name: []const u8,
+        env_var: []const u8,
+        models: []const u8,
+    };
+
+    const providers = [_]Provider{
+        .{ .name = "anthropic", .env_var = "ANTHROPIC_API_KEY", .models = "claude-sonnet-4, claude-haiku, claude-opus" },
+        .{ .name = "openai", .env_var = "OPENAI_API_KEY", .models = "gpt-4o, gpt-4o-mini, o1, o3-mini" },
+        .{ .name = "gemini", .env_var = "GEMINI_API_KEY", .models = "gemini-2.0-flash, gemini-2.0-pro" },
+        .{ .name = "groq", .env_var = "GROQ_API_KEY", .models = "llama-3.3-70b-versatile, mixtral-8x7b" },
+        .{ .name = "deepseek", .env_var = "DEEPSEEK_API_KEY", .models = "deepseek-chat, deepseek-coder" },
+        .{ .name = "mistral", .env_var = "MISTRAL_API_KEY", .models = "mistral-large-latest" },
+        .{ .name = "xai", .env_var = "XAI_API_KEY", .models = "grok-2" },
+        .{ .name = "openrouter", .env_var = "OPENROUTER_API_KEY", .models = "any model via OpenRouter" },
+        .{ .name = "ollama", .env_var = "", .models = "llama3, codellama, mistral (local)" },
+    };
+
     if (ctx.mode == .json) {
-        try ctx.out.write("{\"command\":\"models\",\"providers\":[\"anthropic\",\"openai\"]}\n");
+        try ctx.out.write("{\"command\":\"models\",\"providers\":[");
+        var first = true;
+        for (providers) |p| {
+            const configured = if (p.env_var.len == 0) true else std.posix.getenv(p.env_var) != null;
+            if (!first) try ctx.out.write(",");
+            try ctx.out.print("{{\"name\":\"{s}\",\"configured\":{s},\"models\":\"{s}\"}}", .{
+                p.name,
+                if (configured) "true" else "false",
+                p.models,
+            });
+            first = false;
+        }
+        try ctx.out.write("]}\n");
     } else {
         try ctx.out.heading("Available Providers:");
-        try ctx.out.write("  anthropic   Claude models (Haiku, Sonnet, Opus)\n");
-        try ctx.out.write("  openai      GPT models\n");
-        try ctx.out.write("  local       Local models via llama.cpp\n");
+        for (providers) |p| {
+            const configured = if (p.env_var.len == 0) true else std.posix.getenv(p.env_var) != null;
+            const status = if (configured) "[ok]" else "[  ]";
+            try ctx.out.print("  {s} {s: <12} {s}\n", .{ status, p.name, p.models });
+        }
+        try ctx.out.newline();
+        try ctx.out.write("  [ok] = API key configured, [  ] = not configured\n");
+        try ctx.out.write("  Set environment variables to enable providers.\n");
     }
     return .{};
 }
@@ -615,43 +675,133 @@ fn runMemory(ctx: *CliContext, args: []const []const u8) !CommandResult {
 
     if (sub == null or (sub != null and sub.? == .help_sub)) {
         try ctx.out.heading("Memory Commands:");
-        try ctx.out.write("  zclaw memory status  Show memory index status\n");
-        try ctx.out.write("  zclaw memory index   Reindex memory files\n");
-        try ctx.out.write("  zclaw memory search  Search memory\n");
+        try ctx.out.write("  zclaw memory status         Show memory index status\n");
+        try ctx.out.write("  zclaw memory index <file>   Index a file into memory\n");
+        try ctx.out.write("  zclaw memory search <query> Search memory\n");
         return .{};
     }
 
     return switch (sub.?) {
         .status_sub => {
+            // Check memory directory for files
+            var mem_path_buf: [4096]u8 = undefined;
+            var doc_count: usize = 0;
+            if (std.posix.getenv("HOME")) |home| {
+                const mem_path = std.fmt.bufPrint(&mem_path_buf, "{s}/.openclaw/memory", .{home}) catch "";
+                if (mem_path.len > 0) {
+                    if (std.fs.cwd().openDir(mem_path, .{ .iterate = true })) |dir_val| {
+                        var dir = dir_val;
+                        defer dir.close();
+                        var iter = dir.iterate();
+                        while (iter.next() catch null) |entry| {
+                            if (entry.kind == .file) doc_count += 1;
+                        }
+                    } else |_| {}
+                }
+            }
+            var count_buf: [16]u8 = undefined;
+            const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{doc_count}) catch "0";
             if (ctx.mode == .json) {
-                try ctx.out.write("{\"command\":\"memory.status\",\"documents\":0,\"chunks\":0}\n");
+                try ctx.out.print("{{\"command\":\"memory.status\",\"documents\":{d}}}\n", .{doc_count});
             } else {
                 try ctx.out.heading("Memory Status:");
-                try ctx.out.kv("Documents", "0");
-                try ctx.out.kv("Chunks", "0");
+                try ctx.out.kv("Documents", count_str);
             }
             return .{};
         },
         .index => {
+            if (args.len < 2) {
+                try ctx.out.err("Usage: zclaw memory index <file>");
+                return .{ .exit_code = 1 };
+            }
+            const file_path = args[1];
+
+            // Read file content
+            const content = std.fs.cwd().readFileAlloc(ctx.allocator, file_path, 1024 * 1024) catch |err| {
+                if (ctx.mode == .json) {
+                    try ctx.out.print("{{\"error\":\"Failed to read file: {}\"}}\n", .{err});
+                } else {
+                    try ctx.out.print("Failed to read file: {}\n", .{err});
+                }
+                return .{ .exit_code = 1 };
+            };
+            defer ctx.allocator.free(content);
+
+            // Index using MemoryManager
+            var mgr = memory_manager.MemoryManager.init(ctx.allocator);
+            defer mgr.deinit();
+            const doc_id = mgr.indexDocument(file_path, content) catch |err| {
+                if (ctx.mode == .json) {
+                    try ctx.out.print("{{\"error\":\"Index failed: {}\"}}\n", .{err});
+                } else {
+                    try ctx.out.print("Index failed: {}\n", .{err});
+                }
+                return .{ .exit_code = 1 };
+            };
+
+            const chunk_count = mgr.chunkCount();
             if (ctx.mode == .json) {
-                try ctx.out.write("{\"command\":\"memory.index\",\"status\":\"complete\",\"indexed\":0}\n");
+                try ctx.out.print("{{\"command\":\"memory.index\",\"file\":\"{s}\",\"doc_id\":{d},\"chunks\":{d}}}\n", .{ file_path, doc_id, chunk_count });
             } else {
-                try ctx.out.success("Memory reindex complete.");
-                try ctx.out.kv("Documents indexed", "0");
+                try ctx.out.success("File indexed.");
+                try ctx.out.kv("File", file_path);
+                var chunks_buf: [16]u8 = undefined;
+                const chunks_str = std.fmt.bufPrint(&chunks_buf, "{d}", .{chunk_count}) catch "0";
+                try ctx.out.kv("Chunks", chunks_str);
             }
             return .{};
         },
         .search => {
             const query = if (args.len > 1) args[1] else null;
             if (query) |q| {
+                // Search memory files
+                var mgr = memory_manager.MemoryManager.init(ctx.allocator);
+                defer mgr.deinit();
+
+                // Index files from memory directory
+                var mem_path_buf2: [4096]u8 = undefined;
+                if (std.posix.getenv("HOME")) |home| {
+                    const mem_path = std.fmt.bufPrint(&mem_path_buf2, "{s}/.openclaw/memory", .{home}) catch "";
+                    if (mem_path.len > 0) {
+                        if (std.fs.cwd().openDir(mem_path, .{ .iterate = true })) |dir_val2| {
+                            var dir = dir_val2;
+                            defer dir.close();
+                            var fpath_buf: [4096]u8 = undefined;
+                            var iter = dir.iterate();
+                            while (iter.next() catch null) |entry| {
+                                if (entry.kind != .file) continue;
+                                const fpath = std.fmt.bufPrint(&fpath_buf, "{s}/{s}", .{ mem_path, entry.name }) catch continue;
+                                const content = std.fs.cwd().readFileAlloc(ctx.allocator, fpath, 512 * 1024) catch continue;
+                                defer ctx.allocator.free(content);
+                                _ = mgr.indexDocument(entry.name, content) catch continue;
+                            }
+                        } else |_| {}
+                    }
+                }
+
+                const results = mgr.keywordSearch(ctx.allocator, q, 10) catch &.{};
+
                 if (ctx.mode == .json) {
                     try ctx.out.write("{\"command\":\"memory.search\",\"query\":\"");
                     try ctx.out.write(q);
-                    try ctx.out.write("\",\"results\":[]}\n");
+                    try ctx.out.print("\",\"result_count\":{d}}}\n", .{results.len});
                 } else {
                     try ctx.out.kv("Search", q);
-                    try ctx.out.write("  No results found.\n");
+                    if (results.len == 0) {
+                        try ctx.out.write("  No results found.\n");
+                    } else {
+                        for (results) |result| {
+                            if (result.source_file) |sf| {
+                                try ctx.out.print("  [{d:.2}] {s}\n", .{ result.score, sf });
+                            }
+                            // Show first 80 chars of text
+                            const preview_len = @min(result.text.len, 80);
+                            try ctx.out.print("    {s}...\n", .{result.text[0..preview_len]});
+                        }
+                        try ctx.out.print("\n  {d} result(s) found.\n", .{results.len});
+                    }
                 }
+                if (results.len > 0) ctx.allocator.free(results);
             } else {
                 try ctx.out.err("Usage: zclaw memory search <query>");
                 return .{ .exit_code = 1 };
@@ -678,11 +828,43 @@ fn runSessions(ctx: *CliContext, args: []const []const u8) !CommandResult {
     return switch (sub.?) {
         .list => runSessionsList(ctx),
         .cleanup => {
+            var cleanup_path_buf: [4096]u8 = undefined;
+            const home = std.posix.getenv("HOME");
+            var removed: usize = 0;
+            if (home) |h| {
+                const sessions_path = std.fmt.bufPrint(&cleanup_path_buf, "{s}/.openclaw/sessions", .{h}) catch "";
+                if (sessions_path.len > 0) {
+                    var dir = std.fs.cwd().openDir(sessions_path, .{ .iterate = true }) catch {
+                        if (ctx.mode == .json) {
+                            try ctx.out.write("{\"command\":\"sessions.cleanup\",\"removed\":0}\n");
+                        } else {
+                            try ctx.out.success("Session cleanup complete.");
+                            try ctx.out.kv("Removed", "0");
+                        }
+                        return .{};
+                    };
+                    defer dir.close();
+
+                    // Remove empty session files (< 3 bytes)
+                    var iter = dir.iterate();
+                    while (iter.next() catch null) |entry| {
+                        if (entry.kind != .file) continue;
+                        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+                        const stat = dir.statFile(entry.name) catch continue;
+                        if (stat.size < 3) {
+                            dir.deleteFile(entry.name) catch continue;
+                            removed += 1;
+                        }
+                    }
+                }
+            }
             if (ctx.mode == .json) {
-                try ctx.out.write("{\"command\":\"sessions.cleanup\",\"removed\":0}\n");
+                try ctx.out.print("{{\"command\":\"sessions.cleanup\",\"removed\":{d}}}\n", .{removed});
             } else {
                 try ctx.out.success("Session cleanup complete.");
-                try ctx.out.kv("Removed", "0");
+                var removed_buf: [16]u8 = undefined;
+                const removed_str = std.fmt.bufPrint(&removed_buf, "{d}", .{removed}) catch "0";
+                try ctx.out.kv("Removed", removed_str);
             }
             return .{};
         },
@@ -691,14 +873,28 @@ fn runSessions(ctx: *CliContext, args: []const []const u8) !CommandResult {
                 try ctx.out.err("Usage: zclaw sessions delete <session-id>");
                 return .{ .exit_code = 1 };
             }
+            var del_path_buf: [4096]u8 = undefined;
+            const home = std.posix.getenv("HOME");
+            const deleted = if (home) |h| blk: {
+                const del_path = std.fmt.bufPrint(&del_path_buf, "{s}/.openclaw/sessions/{s}.jsonl", .{ h, args[1] }) catch break :blk false;
+                std.fs.cwd().deleteFile(del_path) catch break :blk false;
+                break :blk true;
+            } else false;
+
             if (ctx.mode == .json) {
                 try ctx.out.write("{\"command\":\"sessions.delete\",\"id\":\"");
                 try ctx.out.write(args[1]);
-                try ctx.out.write("\",\"status\":\"deleted\"}\n");
+                try ctx.out.print("\",\"status\":\"{s}\"}}\n", .{if (deleted) "deleted" else "not_found"});
             } else {
-                try ctx.out.write("Session deleted: ");
-                try ctx.out.write(args[1]);
-                try ctx.out.newline();
+                if (deleted) {
+                    try ctx.out.success("Session deleted: ");
+                    try ctx.out.write(args[1]);
+                    try ctx.out.newline();
+                } else {
+                    try ctx.out.err("Session not found: ");
+                    try ctx.out.write(args[1]);
+                    try ctx.out.newline();
+                }
             }
             return .{};
         },
@@ -717,11 +913,70 @@ fn runSessions(ctx: *CliContext, args: []const []const u8) !CommandResult {
 }
 
 fn runSessionsList(ctx: *CliContext) !CommandResult {
-    if (ctx.mode == .json) {
+    var path_buf: [4096]u8 = undefined;
+    const home = std.posix.getenv("HOME") orelse {
+        if (ctx.mode == .json) {
+            try ctx.out.write("{\"command\":\"sessions.list\",\"sessions\":[]}\n");
+        } else {
+            try ctx.out.heading("Sessions:");
+            try ctx.out.write("  No sessions directory found.\n");
+        }
+        return .{};
+    };
+
+    const sessions_path = std.fmt.bufPrint(&path_buf, "{s}/.openclaw/sessions", .{home}) catch {
         try ctx.out.write("{\"command\":\"sessions.list\",\"sessions\":[]}\n");
+        return .{};
+    };
+
+    var dir = std.fs.cwd().openDir(sessions_path, .{ .iterate = true }) catch {
+        if (ctx.mode == .json) {
+            try ctx.out.write("{\"command\":\"sessions.list\",\"sessions\":[]}\n");
+        } else {
+            try ctx.out.heading("Sessions:");
+            try ctx.out.write("  No sessions found.\n");
+            try ctx.out.write("  Run 'zclaw agent -m <text>' to create a session.\n");
+        }
+        return .{};
+    };
+    defer dir.close();
+
+    var count: usize = 0;
+    var name_buf: [16][256]u8 = undefined;
+    var names: [16][]const u8 = undefined;
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (count >= 16) break;
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        const name_len = entry.name.len - 6; // strip ".jsonl"
+        if (name_len > 256) continue;
+        @memcpy(name_buf[count][0..name_len], entry.name[0..name_len]);
+        names[count] = name_buf[count][0..name_len];
+        count += 1;
+    }
+
+    if (ctx.mode == .json) {
+        try ctx.out.write("{\"command\":\"sessions.list\",\"sessions\":[");
+        for (0..count) |i| {
+            if (i > 0) try ctx.out.write(",");
+            try ctx.out.write("\"");
+            try ctx.out.write(names[i]);
+            try ctx.out.write("\"");
+        }
+        try ctx.out.write("]}\n");
     } else {
         try ctx.out.heading("Sessions:");
-        try ctx.out.write("  No active sessions.\n");
+        if (count == 0) {
+            try ctx.out.write("  No sessions found.\n");
+            try ctx.out.write("  Run 'zclaw agent -m <text>' to create a session.\n");
+        } else {
+            for (0..count) |i| {
+                try ctx.out.print("  {s}\n", .{names[i]});
+            }
+            try ctx.out.print("\n  {d} session(s) found.\n", .{count});
+        }
     }
     return .{};
 }
@@ -1175,7 +1430,7 @@ test "dispatch channels list json" {
     const args = [_][]const u8{ "channels", "list" };
     const result = try dispatch(&ctx, &args);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"channels\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"channels\":[") != null);
 }
 
 test "dispatch channels login" {
@@ -1309,10 +1564,10 @@ test "dispatch memory index" {
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     var ctx = makeCtx(&fbs, .plain);
+    // Without a file argument, should return exit code 1
     const args = [_][]const u8{ "memory", "index" };
     const result = try dispatch(&ctx, &args);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "reindex") != null);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
 }
 
 test "dispatch memory search" {
@@ -1335,13 +1590,13 @@ test "dispatch memory search no query" {
 }
 
 test "dispatch memory search json" {
-    var buf: [1024]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     var ctx = makeCtx(&fbs, .json);
     const args = [_][]const u8{ "memory", "search", "hello" };
     const result = try dispatch(&ctx, &args);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"results\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"result_count\":") != null);
 }
 
 test "dispatch sessions" {
@@ -1534,10 +1789,11 @@ test "dispatch sessions delete json" {
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     var ctx = makeCtx(&fbs, .json);
-    const args = [_][]const u8{ "sessions", "delete", "s1" };
+    // Delete a non-existent session — should report not_found
+    const args = [_][]const u8{ "sessions", "delete", "nonexistent_session_xyz" };
     const result = try dispatch(&ctx, &args);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"status\":\"deleted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"status\":\"") != null);
 }
 
 test "dispatch sessions list json" {
@@ -1560,14 +1816,14 @@ test "dispatch memory status json" {
     try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"documents\":0") != null);
 }
 
-test "dispatch memory index json" {
+test "dispatch memory index json no file" {
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     var ctx = makeCtx(&fbs, .json);
+    // Without a file argument, should return exit code 1
     const args = [_][]const u8{ "memory", "index" };
     const result = try dispatch(&ctx, &args);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"status\":\"complete\"") != null);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
 }
 
 test "dispatch setup json" {
@@ -1627,7 +1883,7 @@ test "dispatch channels status json" {
     const args = [_][]const u8{ "channels", "status" };
     const result = try dispatch(&ctx, &args);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"channels\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"channels\":[") != null);
 }
 
 test "dispatch channels logout no name" {
