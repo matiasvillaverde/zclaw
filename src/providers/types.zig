@@ -754,3 +754,113 @@ test "ToolDefinition with complex parameters" {
     try std.testing.expectEqualStrings("http_request", tool.name);
     try std.testing.expect(tool.parameters_json != null);
 }
+
+// --- Additional types tests ---
+
+test "StopReason all variants have distinct values" {
+    const variants = [_]StopReason{ .end_turn, .tool_use, .max_tokens, .content_filter };
+    for (variants, 0..) |a, i| {
+        for (variants[i + 1 ..]) |b| {
+            try std.testing.expect(a != b);
+        }
+    }
+}
+
+test "ApiType all variants" {
+    const variants = [_]ApiType{ .anthropic_messages, .openai_completions, .google_genai, .ollama };
+    try std.testing.expectEqual(@as(usize, 4), variants.len);
+}
+
+test "ApiType anthropic is not openai" {
+    try std.testing.expect(ApiType.anthropic_messages != ApiType.openai_completions);
+    try std.testing.expect(ApiType.anthropic_messages != ApiType.google_genai);
+}
+
+test "Usage default is zero" {
+    const usage = Usage{};
+    try std.testing.expectEqual(@as(u64, 0), usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), usage.output_tokens);
+}
+
+test "Usage with values" {
+    const usage = Usage{ .input_tokens = 500, .output_tokens = 200 };
+    try std.testing.expectEqual(@as(u64, 500), usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 200), usage.output_tokens);
+}
+
+test "StreamEventType all variants" {
+    const types_list = [_]StreamEventType{
+        .start,
+        .text_delta,
+        .tool_call_start,
+        .tool_call_delta,
+        .tool_call_end,
+        .stop,
+        .usage,
+        .@"error",
+    };
+    try std.testing.expectEqual(@as(usize, 8), types_list.len);
+}
+
+test "StreamEvent with text delta" {
+    const event = StreamEvent{
+        .event_type = .text_delta,
+        .text = "Hello",
+    };
+    try std.testing.expectEqual(StreamEventType.text_delta, event.event_type);
+    try std.testing.expectEqualStrings("Hello", event.text.?);
+    try std.testing.expect(event.stop_reason == null);
+}
+
+test "StreamEvent with stop reason" {
+    const event = StreamEvent{
+        .event_type = .stop,
+        .stop_reason = .end_turn,
+    };
+    try std.testing.expectEqual(StopReason.end_turn, event.stop_reason.?);
+    try std.testing.expect(event.text == null);
+}
+
+test "StreamEvent with tool call" {
+    const event = StreamEvent{
+        .event_type = .tool_call_start,
+        .tool_name = "bash",
+        .tool_call_id = "call_1",
+    };
+    try std.testing.expectEqualStrings("bash", event.tool_name.?);
+    try std.testing.expectEqualStrings("call_1", event.tool_call_id.?);
+}
+
+test "StreamEvent with usage data" {
+    const event = StreamEvent{
+        .event_type = .usage,
+        .usage = .{ .input_tokens = 10, .output_tokens = 5 },
+    };
+    try std.testing.expectEqual(@as(u64, 10), event.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u64, 5), event.usage.?.output_tokens);
+}
+
+test "StreamEvent defaults are null" {
+    const event = StreamEvent{ .event_type = .text_delta };
+    try std.testing.expect(event.text == null);
+    try std.testing.expect(event.stop_reason == null);
+    try std.testing.expect(event.tool_name == null);
+    try std.testing.expect(event.tool_call_id == null);
+    try std.testing.expect(event.tool_input_delta == null);
+    try std.testing.expect(event.error_message == null);
+}
+
+test "RequestConfig with all optional fields" {
+    const cfg = RequestConfig{
+        .model = "test-model",
+        .system_prompt = "Be helpful.",
+        .max_tokens = 100,
+        .temperature = 1.0,
+        .stream = false,
+        .api_key = "key",
+        .base_url = "https://example.com",
+    };
+    try std.testing.expectEqual(@as(f32, 1.0), cfg.temperature.?);
+    try std.testing.expectEqual(@as(u32, 100), cfg.max_tokens);
+    try std.testing.expect(!cfg.stream);
+}

@@ -977,3 +977,158 @@ test "writeJsonEscaped plain ascii" {
     try writeJsonEscaped(fbs.writer(), "abcABC123!@#$%^&*()");
     try std.testing.expectEqualStrings("abcABC123!@#$%^&*()", fbs.getWritten());
 }
+
+// --- Additional OpenAI tests ---
+
+test "parseStreamEvent with empty content delta" {
+    const event_data = sse.SseEvent{ .event_type = null, .data = "{\"choices\":[{\"delta\":{\"content\":\"\"}}]}" };
+    const event = parseStreamEvent(&event_data);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StreamEventType.text_delta, event.?.event_type);
+    try std.testing.expectEqualStrings("", event.?.text.?);
+}
+
+test "parseStreamEvent finish_reason stop" {
+    const event_data = sse.SseEvent{ .event_type = null, .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}" };
+    const event = parseStreamEvent(&event_data);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StopReason.end_turn, event.?.stop_reason.?);
+}
+
+test "parseStreamEvent finish_reason tool_calls" {
+    const event_data = sse.SseEvent{ .event_type = null, .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}" };
+    const event = parseStreamEvent(&event_data);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StopReason.tool_use, event.?.stop_reason.?);
+}
+
+test "parseStreamEvent finish_reason length" {
+    const event_data = sse.SseEvent{ .event_type = null, .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}" };
+    const event = parseStreamEvent(&event_data);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StopReason.max_tokens, event.?.stop_reason.?);
+}
+
+test "parseStreamEvent content_filter stop reason mapping" {
+    const event_data = sse.SseEvent{ .event_type = null, .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}" };
+    const event = parseStreamEvent(&event_data);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StopReason.content_filter, event.?.stop_reason.?);
+}
+
+test "parseStreamEvent with tool_calls delta" {
+    const event_data = sse.SseEvent{ .event_type = null, .data = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}" };
+    const event = parseStreamEvent(&event_data);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StreamEventType.tool_call_start, event.?.event_type);
+}
+
+test "parseStreamEvent [DONE] returns stop via isDone" {
+    const event_data = sse.SseEvent{ .event_type = null, .data = "[DONE]" };
+    const event = parseStreamEvent(&event_data);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StreamEventType.stop, event.?.event_type);
+}
+
+test "parseStreamEvent empty string returns null" {
+    const event_data = sse.SseEvent{ .event_type = null, .data = "" };
+    try std.testing.expect(parseStreamEvent(&event_data) == null);
+}
+
+test "parseStreamEvent role-only delta returns null" {
+    const event_data = sse.SseEvent{ .event_type = null, .data = "{\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}" };
+    const event = parseStreamEvent(&event_data);
+    // Role-only messages may return null or have no meaningful content
+    if (event) |e| {
+        // If it returns something, it shouldn't have text
+        try std.testing.expect(e.text == null or e.text.?.len == 0);
+    }
+}
+
+test "buildRequestBody with all options" {
+    var buf: [8192]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-4o",
+        .system_prompt = "You are helpful.",
+        .max_tokens = 2048,
+        .temperature = 0.5,
+        .stream = true,
+        .api_key = "key",
+    }, "[{\"role\":\"user\",\"content\":\"hello\"}]", "[{\"type\":\"function\",\"function\":{\"name\":\"test\"}}]");
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-4o\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":2048") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":") != null);
+}
+
+test "buildRequestBody without tools or system" {
+    var buf: [8192]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "gpt-3.5-turbo",
+        .api_key = "key",
+    }, "[]", null);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-3.5-turbo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":") == null);
+}
+
+test "buildUserMessage contains role user" {
+    var buf: [8192]u8 = undefined;
+    const msg = try buildUserMessage(&buf, "What time is it?");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "What time is it?") != null);
+}
+
+test "buildAssistantMessage contains role assistant" {
+    var buf: [8192]u8 = undefined;
+    const msg = try buildAssistantMessage(&buf, "It is noon.");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "It is noon.") != null);
+}
+
+test "buildToolResultMessage contains role tool" {
+    var buf: [8192]u8 = undefined;
+    const msg = try buildToolResultMessage(&buf, "call_abc", "tool output here");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"tool_call_id\":\"call_abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "tool output here") != null);
+}
+
+test "Client.sendMessage mock 429 rate limit" {
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 429, .body = "{\"error\":{\"message\":\"rate limit\"}}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    var client = Client.init(&http, "sk-test", null);
+
+    var resp = try client.sendMessage(.{
+        .model = "gpt-4",
+        .api_key = "sk-test",
+        .stream = false,
+    }, "[]", null);
+    defer resp.deinit();
+
+    try std.testing.expect(!resp.isSuccess());
+    try std.testing.expectEqual(@as(u16, 429), resp.status);
+}
+
+test "Client.sendMessage mock 401 auth error" {
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 401, .body = "{\"error\":{\"message\":\"invalid api key\"}}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    var client = Client.init(&http, "bad-key", null);
+
+    var resp = try client.sendMessage(.{
+        .model = "gpt-4",
+        .api_key = "bad-key",
+        .stream = false,
+    }, "[]", null);
+    defer resp.deinit();
+
+    try std.testing.expect(!resp.isSuccess());
+    try std.testing.expectEqual(@as(u16, 401), resp.status);
+}

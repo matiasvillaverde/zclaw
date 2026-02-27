@@ -491,3 +491,105 @@ test "DEFAULT_BASE_URL is correct" {
 test "API_VERSION is v1beta" {
     try std.testing.expectEqualStrings("v1beta", API_VERSION);
 }
+
+// --- Additional Gemini tests ---
+
+test "buildApiUrl different models" {
+    var buf: [512]u8 = undefined;
+    const url1 = try buildApiUrl(&buf, DEFAULT_BASE_URL, "gemini-pro", "test-key", false);
+    try std.testing.expect(std.mem.indexOf(u8, url1, "gemini-pro") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url1, "generateContent") != null);
+}
+
+test "buildApiUrl streaming endpoint" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, DEFAULT_BASE_URL, "gemini-2.0-flash", "key", true);
+    try std.testing.expect(std.mem.indexOf(u8, url, "streamGenerateContent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "alt=sse") != null);
+}
+
+test "buildApiUrl non-streaming endpoint" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, DEFAULT_BASE_URL, "gemini-2.0-flash", "key", false);
+    try std.testing.expect(std.mem.indexOf(u8, url, "generateContent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "alt=sse") == null);
+}
+
+test "buildApiUrl includes API key" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, DEFAULT_BASE_URL, "gemini-pro", "AIzaSy12345", false);
+    try std.testing.expect(std.mem.indexOf(u8, url, "AIzaSy12345") != null);
+}
+
+test "extractResponseText extraction" {
+    const json = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello world\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}";
+    const text = extractResponseText(json);
+    try std.testing.expect(text != null);
+    try std.testing.expectEqualStrings("Hello world", text.?);
+}
+
+test "extractFinishReason with STOP" {
+    const json = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}";
+    const reason = extractFinishReason(json);
+    try std.testing.expect(reason != null);
+    try std.testing.expectEqual(types.StopReason.end_turn, reason.?);
+}
+
+test "extractFinishReason with MAX_TOKENS" {
+    const json = "{\"candidates\":[{\"finishReason\":\"MAX_TOKENS\"}]}";
+    const reason = extractFinishReason(json);
+    try std.testing.expect(reason != null);
+    try std.testing.expectEqual(types.StopReason.max_tokens, reason.?);
+}
+
+test "extractFinishReason with SAFETY" {
+    const json = "{\"candidates\":[{\"finishReason\":\"SAFETY\"}]}";
+    const reason = extractFinishReason(json);
+    try std.testing.expect(reason != null);
+    try std.testing.expectEqual(types.StopReason.content_filter, reason.?);
+}
+
+test "parseStreamEvent Gemini text delta" {
+    const raw = sse.SseEvent{ .event_type = null, .data = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"streaming text\"}]}}]}" };
+    const event = parseStreamEvent(&raw);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StreamEventType.text_delta, event.?.event_type);
+    try std.testing.expectEqualStrings("streaming text", event.?.text.?);
+}
+
+test "parseStreamEvent Gemini with finish reason only" {
+    // finishReason without text — extractResponseText returns null, finishReason path taken
+    const raw = sse.SseEvent{ .event_type = null, .data = "{\"candidates\":[{\"finishReason\":\"STOP\"}]}" };
+    const event = parseStreamEvent(&raw);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StopReason.end_turn, event.?.stop_reason.?);
+}
+
+test "parseStreamEvent Gemini with text and finish reason returns text_delta" {
+    // When both text and finishReason present, text_delta is returned first
+    const raw = sse.SseEvent{ .event_type = null, .data = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}]}" };
+    const event = parseStreamEvent(&raw);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(types.StreamEventType.text_delta, event.?.event_type);
+    try std.testing.expectEqualStrings("done", event.?.text.?);
+}
+
+test "parseStreamEvent Gemini empty candidates" {
+    const raw = sse.SseEvent{ .event_type = null, .data = "{\"candidates\":[]}" };
+    const event = parseStreamEvent(&raw);
+    try std.testing.expect(event == null);
+}
+
+test "buildUserMessage format" {
+    var buf: [4096]u8 = undefined;
+    const msg = try buildUserMessage(&buf, "test message");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "test message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "user") != null);
+}
+
+test "buildModelMessage format" {
+    var buf: [4096]u8 = undefined;
+    const msg = try buildModelMessage(&buf, "model response");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "model response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "model") != null);
+}
