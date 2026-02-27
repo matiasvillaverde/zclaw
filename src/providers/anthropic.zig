@@ -1164,3 +1164,482 @@ test "API constants are correct" {
     try std.testing.expectEqualStrings("/v1/messages", MESSAGES_PATH);
     try std.testing.expectEqualStrings("2023-06-01", API_VERSION);
 }
+
+// =====================================================
+// Targeted scenario tests
+// =====================================================
+
+// --- 1. writeJsonEscaped with control characters ---
+
+test "writeJsonEscaped with tab newline carriage return" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "before\tand\nand\rafter");
+    try std.testing.expectEqualStrings("before\\tand\\nand\\rafter", fbs.getWritten());
+}
+
+test "writeJsonEscaped with null byte" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const input = "before\x00after";
+    try writeJsonEscaped(fbs.writer(), input);
+    const result = fbs.getWritten();
+    // Null byte (0x00) should be escaped as \u0000
+    try std.testing.expectEqualStrings("before\\u0000after", result);
+}
+
+test "writeJsonEscaped with backspace" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const input = "before\x08after";
+    try writeJsonEscaped(fbs.writer(), input);
+    const result = fbs.getWritten();
+    // Backspace (0x08) is a control char < 0x20, should be \u0008
+    try std.testing.expectEqualStrings("before\\u0008after", result);
+}
+
+test "writeJsonEscaped with multiple control characters in sequence" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    // Mix of named escapes (\t, \n, \r) and generic control chars (\x01, \x1f)
+    const input = "\x01\t\n\r\x1f";
+    try writeJsonEscaped(fbs.writer(), input);
+    const result = fbs.getWritten();
+    try std.testing.expectEqualStrings("\\u0001\\t\\n\\r\\u001f", result);
+}
+
+// --- 2. writeJsonEscaped with unicode ---
+
+test "writeJsonEscaped with non-ASCII latin characters" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    // UTF-8 encoded: e with accent (e-acute = 0xC3 0xA9)
+    try writeJsonEscaped(fbs.writer(), "caf\xc3\xa9");
+    const result = fbs.getWritten();
+    // Multi-byte UTF-8 characters have bytes >= 0x80, so they pass through as-is
+    try std.testing.expectEqualStrings("caf\xc3\xa9", result);
+}
+
+test "writeJsonEscaped with emoji" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    // Rocket emoji U+1F680 = 0xF0 0x9F 0x9A 0x80 in UTF-8
+    const rocket = "\xf0\x9f\x9a\x80";
+    try writeJsonEscaped(fbs.writer(), rocket);
+    const result = fbs.getWritten();
+    // All bytes are >= 0x80, so they pass through unchanged
+    try std.testing.expectEqualStrings(rocket, result);
+}
+
+test "writeJsonEscaped with CJK characters" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    // Japanese: "hello" in hiragana
+    const input = "\xe3\x81\x93\xe3\x82\x93\xe3\x81\xab\xe3\x81\xa1\xe3\x81\xaf";
+    try writeJsonEscaped(fbs.writer(), input);
+    const result = fbs.getWritten();
+    try std.testing.expectEqualStrings(input, result);
+}
+
+test "writeJsonEscaped with mixed unicode and escapes" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    // "caf\xc3\xa9" with a newline and a quote
+    try writeJsonEscaped(fbs.writer(), "caf\xc3\xa9\n\"bon\"");
+    const result = fbs.getWritten();
+    try std.testing.expectEqualStrings("caf\xc3\xa9\\n\\\"bon\\\"", result);
+}
+
+// --- 3. writeJsonEscaped with deeply nested escaping ---
+
+test "writeJsonEscaped with escaped quotes in source" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    // Input literally contains backslash-quote: value is  He said \"hi\"
+    try writeJsonEscaped(fbs.writer(), "He said \\\"hi\\\"");
+    const result = fbs.getWritten();
+    // Each \ becomes \\, each " becomes \"
+    // So \" in input becomes \\\"
+    try std.testing.expectEqualStrings("He said \\\\\\\"hi\\\\\\\"", result);
+}
+
+test "writeJsonEscaped with double backslashes" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "C:\\\\Users\\\\path");
+    const result = fbs.getWritten();
+    // Each \\ in input becomes \\\\ in output
+    try std.testing.expectEqualStrings("C:\\\\\\\\Users\\\\\\\\path", result);
+}
+
+test "writeJsonEscaped with backslash before newline" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "line\\\n");
+    const result = fbs.getWritten();
+    // \ becomes \\, \n becomes \n
+    try std.testing.expectEqualStrings("line\\\\\\n", result);
+}
+
+// --- 4. buildRequestBody near buffer capacity ---
+
+test "buildRequestBody near buffer capacity" {
+    // Create a buffer that is just barely large enough for the output
+    // A minimal request: {"model":"X","max_tokens":4096,"stream":true,"system":[{"type":"text","text":"Y"}],"messages":[]}
+    // Use a very long model name and system prompt to nearly fill the buffer
+    const model_name = "a" ** 200;
+    const system_prompt = "b" ** 300;
+    // Calculate approximate size: overhead + model + system + messages
+    // overhead ~ 120 bytes for JSON structure
+    var big_buf: [1024]u8 = undefined;
+    const body = try buildRequestBody(&big_buf, .{
+        .model = model_name,
+        .system_prompt = system_prompt,
+        .api_key = "sk-test",
+    }, "[]", null);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, model_name) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, system_prompt) != null);
+    try std.testing.expect(body.len > 500); // Should be substantial
+}
+
+test "buildRequestBody buffer too small returns error" {
+    // Buffer that is way too small
+    var tiny_buf: [10]u8 = undefined;
+    const result = buildRequestBody(&tiny_buf, .{
+        .model = "claude-3-5-sonnet-20241022",
+        .api_key = "sk-test",
+    }, "[]", null);
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+// --- 5. buildRequestBody with tools_json ---
+
+test "buildRequestBody with tools_json includes tools in output" {
+    var buf: [4096]u8 = undefined;
+    const tools = "[{\"name\":\"bash\",\"description\":\"Run shell commands\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}]";
+    const body = try buildRequestBody(&buf, .{
+        .model = "claude-3-5-sonnet",
+        .system_prompt = "You are a coding assistant.",
+        .api_key = "sk-test",
+    }, "[{\"role\":\"user\",\"content\":\"list files\"}]", tools);
+
+    // Verify tools are present in the output
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input_schema\"") != null);
+    // Verify it also has system and messages
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"messages\"") != null);
+}
+
+test "buildRequestBody tools_json null means no tools key" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildRequestBody(&buf, .{
+        .model = "claude-3-5-sonnet",
+        .api_key = "sk-test",
+    }, "[]", null);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
+}
+
+// --- 6. parseStreamEvent with unknown event type ---
+
+test "parseStreamEvent with completely unknown event type returns null" {
+    const event = sse.SseEvent{
+        .event_type = "ping",
+        .data = "{\"type\":\"ping\"}",
+    };
+    try std.testing.expect(parseStreamEvent(&event) == null);
+}
+
+test "parseStreamEvent with empty event type string returns null" {
+    const event = sse.SseEvent{
+        .event_type = "",
+        .data = "{}",
+    };
+    try std.testing.expect(parseStreamEvent(&event) == null);
+}
+
+test "parseStreamEvent with similar but wrong event type" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_deltas", // extra 's'
+        .data = "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}",
+    };
+    try std.testing.expect(parseStreamEvent(&event) == null);
+}
+
+// --- 7. parseStreamEvent with malformed JSON ---
+
+test "parseStreamEvent with malformed JSON in content_block_delta" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_delta",
+        .data = "this is not json at all",
+    };
+    // No extractable text or partial_json, should return null
+    try std.testing.expect(parseStreamEvent(&event) == null);
+}
+
+test "parseStreamEvent with truncated JSON" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_delta",
+        .data = "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":",
+    };
+    // extractJsonString for "text" won't find a properly quoted string
+    try std.testing.expect(parseStreamEvent(&event) == null);
+}
+
+test "parseStreamEvent with empty JSON object" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_delta",
+        .data = "{}",
+    };
+    // No text or partial_json fields found
+    try std.testing.expect(parseStreamEvent(&event) == null);
+}
+
+// --- 8. parseStreamEvent with empty data field ---
+
+test "parseStreamEvent with empty data string" {
+    const event = sse.SseEvent{
+        .event_type = "content_block_delta",
+        .data = "",
+    };
+    try std.testing.expect(parseStreamEvent(&event) == null);
+}
+
+test "parseStreamEvent message_start with empty data" {
+    const event = sse.SseEvent{
+        .event_type = "message_start",
+        .data = "",
+    };
+    const result = parseStreamEvent(&event).?;
+    // message_start always returns a start event, but usage will be null
+    try std.testing.expectEqual(types.StreamEventType.start, result.event_type);
+    try std.testing.expect(result.usage == null);
+}
+
+test "parseStreamEvent message_delta with empty data" {
+    const event = sse.SseEvent{
+        .event_type = "message_delta",
+        .data = "",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.stop, result.event_type);
+    try std.testing.expect(result.stop_reason == null);
+    try std.testing.expect(result.usage == null);
+}
+
+// --- 9. extractJsonString with escaped quotes ---
+
+test "extractJsonString with escaped quote in value" {
+    const json = "{\"text\":\"say \\\"hello\\\" world\"}";
+    const result = extractJsonString(json, "\"text\":\"");
+    try std.testing.expect(result != null);
+    // The extractor finds from start to first unescaped quote
+    // Input: say \"hello\" world
+    // The \" are escaped, so extractor should skip them
+    try std.testing.expectEqualStrings("say \\\"hello\\\" world", result.?);
+}
+
+test "extractJsonString with single escaped quote" {
+    const json = "{\"msg\":\"it's \\\"fine\\\"\"}";
+    const result = extractJsonString(json, "\"msg\":\"");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("it's \\\"fine\\\"", result.?);
+}
+
+test "extractJsonString with escaped backslash before quote" {
+    // JSON: {"val":"test\\"}  - value is test\ (escaped backslash then closing quote)
+    // The simple extractor sees \ before " and thinks it's escaped — known limitation.
+    // It returns null because it can't find the unescaped closing quote.
+    const json = "{\"val\":\"test\\\\\"}";
+    const result = extractJsonString(json, "\"val\":\"");
+    try std.testing.expect(result == null);
+}
+
+// --- 10. buildHeaders with custom base_url ---
+
+test "buildHeaders always includes api-key and version regardless of usage context" {
+    // Even when client uses a custom base_url, buildHeaders itself just takes an api key
+    var buf: [4][2][]const u8 = undefined;
+    const custom_key = "sk-ant-custom-proxy-key-12345";
+    const headers = buildHeaders(&buf, custom_key);
+
+    // Verify x-api-key header contains the custom key
+    try std.testing.expectEqualStrings("x-api-key", headers[1][0]);
+    try std.testing.expectEqualStrings(custom_key, headers[1][1]);
+
+    // Verify anthropic-version header is always present with correct value
+    try std.testing.expectEqualStrings("anthropic-version", headers[2][0]);
+    try std.testing.expectEqualStrings("2023-06-01", headers[2][1]);
+
+    // Verify content-type is application/json
+    try std.testing.expectEqualStrings("content-type", headers[0][0]);
+    try std.testing.expectEqualStrings("application/json", headers[0][1]);
+
+    // Verify accept is text/event-stream
+    try std.testing.expectEqualStrings("accept", headers[3][0]);
+    try std.testing.expectEqualStrings("text/event-stream", headers[3][1]);
+}
+
+test "buildHeaders with empty api key" {
+    var buf: [4][2][]const u8 = undefined;
+    const headers = buildHeaders(&buf, "");
+    try std.testing.expectEqualStrings("x-api-key", headers[1][0]);
+    try std.testing.expectEqualStrings("", headers[1][1]);
+    // Version header is still present
+    try std.testing.expectEqualStrings("anthropic-version", headers[2][0]);
+    try std.testing.expectEqualStrings(API_VERSION, headers[2][1]);
+}
+
+// --- 11. Client.sendMessage with 429 rate limit ---
+
+test "Client.sendMessage with 429 rate limit response" {
+    const error_body = "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Rate limit exceeded. Please retry after 30 seconds.\"}}";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 429, .body = error_body },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    var client = Client.init(&http, "sk-ant-key", null);
+
+    var resp = try client.sendMessage(.{
+        .model = "claude-3-5-sonnet-20241022",
+        .api_key = "sk-ant-key",
+    }, "[{\"role\":\"user\",\"content\":\"hello\"}]", null);
+    defer resp.deinit();
+
+    try std.testing.expect(!resp.isSuccess());
+    try std.testing.expectEqual(@as(u16, 429), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "rate_limit_error") != null);
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+}
+
+// --- 12. Client.sendMessage with 401 auth error ---
+
+test "Client.sendMessage with 401 authentication error" {
+    const error_body = "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"Invalid API key provided.\"}}";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 401, .body = error_body },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    var client = Client.init(&http, "sk-ant-INVALID", null);
+
+    var resp = try client.sendMessage(.{
+        .model = "claude-3-5-sonnet",
+        .api_key = "sk-ant-INVALID",
+    }, "[]", null);
+    defer resp.deinit();
+
+    try std.testing.expect(!resp.isSuccess());
+    try std.testing.expectEqual(@as(u16, 401), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "authentication_error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "Invalid API key") != null);
+}
+
+// --- 13. parseStreamEvent error event ---
+
+test "parseStreamEvent error event with rate_limit_error type" {
+    const event = sse.SseEvent{
+        .event_type = "error",
+        .data = "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Number of request tokens has exceeded your per-minute rate limit\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.@"error", result.event_type);
+    try std.testing.expectEqualStrings("Number of request tokens has exceeded your per-minute rate limit", result.error_message.?);
+}
+
+test "parseStreamEvent error event with api_error type" {
+    const event = sse.SseEvent{
+        .event_type = "error",
+        .data = "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.@"error", result.event_type);
+    try std.testing.expectEqualStrings("Internal server error", result.error_message.?);
+}
+
+test "parseStreamEvent error event with empty message" {
+    const event = sse.SseEvent{
+        .event_type = "error",
+        .data = "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"\"}}",
+    };
+    const result = parseStreamEvent(&event).?;
+    try std.testing.expectEqual(types.StreamEventType.@"error", result.event_type);
+    try std.testing.expectEqualStrings("", result.error_message.?);
+}
+
+// --- 14. buildUserMessage with very long content ---
+
+test "buildUserMessage with near 32KB content" {
+    // Generate content that is close to 32KB (the sendMessage body_buf is 64KB)
+    const long_text = "x" ** (30 * 1024);
+    var buf: [32 * 1024]u8 = undefined;
+    const msg = try buildUserMessage(&buf, long_text);
+
+    // Verify structure is correct
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"type\":\"text\"") != null);
+    // Verify the long content is present
+    try std.testing.expect(msg.len > 30 * 1024);
+    // Verify it starts and ends correctly
+    try std.testing.expect(std.mem.startsWith(u8, msg, "{\"role\":\"user\""));
+    try std.testing.expect(std.mem.endsWith(u8, msg, "\"}]}"));
+}
+
+test "buildUserMessage buffer too small for long content" {
+    const long_text = "y" ** 2000;
+    var small_buf: [100]u8 = undefined;
+    const result = buildUserMessage(&small_buf, long_text);
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+// --- 15. buildAssistantMessage content verification ---
+
+test "buildAssistantMessage JSON structure verification" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildAssistantMessage(&buf, "I can help you with that.");
+
+    // Verify exact JSON structure
+    try std.testing.expect(std.mem.startsWith(u8, msg, "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\""));
+    try std.testing.expect(std.mem.endsWith(u8, msg, "\"}]}"));
+
+    // Verify the role is assistant (not user)
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"role\":\"user\"") == null);
+
+    // Verify content array structure
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"content\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"text\":\"I can help you with that.\"") != null);
+}
+
+test "buildAssistantMessage with content requiring escaping" {
+    var buf: [1024]u8 = undefined;
+    const msg = try buildAssistantMessage(&buf, "Here is code:\n```\nfn main() {}\n```\nWith \"quotes\" and \\backslash");
+
+    // Verify escaping happened
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\\\"quotes\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\\\\backslash") != null);
+
+    // Verify structure is maintained
+    try std.testing.expect(std.mem.startsWith(u8, msg, "{\"role\":\"assistant\""));
+    try std.testing.expect(std.mem.endsWith(u8, msg, "\"}]}"));
+}
+
+test "buildAssistantMessage vs buildUserMessage role difference" {
+    var buf1: [1024]u8 = undefined;
+    var buf2: [1024]u8 = undefined;
+    const assistant_msg = try buildAssistantMessage(&buf1, "same content");
+    const user_msg = try buildUserMessage(&buf2, "same content");
+
+    // Both should have the same content but different roles
+    try std.testing.expect(std.mem.indexOf(u8, assistant_msg, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_msg, "\"role\":\"user\"") != null);
+
+    // Both should have the same text content
+    try std.testing.expect(std.mem.indexOf(u8, assistant_msg, "\"text\":\"same content\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_msg, "\"text\":\"same content\"") != null);
+}
