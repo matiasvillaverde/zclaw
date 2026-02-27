@@ -1150,3 +1150,71 @@ test "DiscordChannel startPolling stops on auth failure" {
     channel.startPolling("ch-1", dummyHandler, &stop, 100);
     try std.testing.expectEqual(plugin.ChannelStatus.error_state, channel.status);
 }
+
+// --- Additional Discord tests ---
+
+test "extractOpcode HEARTBEAT_ACK opcode 11" {
+    const payload = "{\"op\":11}";
+    const op = extractOpcode(payload);
+    try std.testing.expect(op != null);
+    try std.testing.expectEqual(@as(u8, 11), op.?);
+}
+
+test "extractOpcode INVALID_SESSION opcode 9" {
+    const payload = "{\"op\":9,\"d\":false}";
+    const op = extractOpcode(payload);
+    try std.testing.expect(op != null);
+    try std.testing.expectEqual(@as(u8, 9), op.?);
+}
+
+test "extractOpcode HELLO opcode 10 with heartbeat_interval" {
+    const payload = "{\"op\":10,\"d\":{\"heartbeat_interval\":41250}}";
+    const op = extractOpcode(payload);
+    try std.testing.expect(op != null);
+    try std.testing.expectEqual(@as(u8, 10), op.?);
+    // Also verify heartbeat interval extraction
+    const interval = extractHeartbeatInterval(payload);
+    try std.testing.expect(interval != null);
+    try std.testing.expectEqual(@as(i64, 41250), interval.?);
+}
+
+test "extractOpcode malformed returns null" {
+    try std.testing.expect(extractOpcode("not json") == null);
+    try std.testing.expect(extractOpcode("") == null);
+}
+
+test "buildIdentifyPayload includes intents" {
+    var buf: [2048]u8 = undefined;
+    const payload = try buildIdentifyPayload(&buf, "bot-token-123", 513);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "bot-token-123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "513") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"op\":2") != null);
+}
+
+test "buildHeartbeatPayload with sequence number includes op and d" {
+    var buf: [256]u8 = undefined;
+    const payload = try buildHeartbeatPayload(&buf, 42);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"op\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "42") != null);
+}
+
+test "buildHeartbeatPayload null sequence sends null d" {
+    var buf: [256]u8 = undefined;
+    const payload = try buildHeartbeatPayload(&buf, null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"op\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "null") != null);
+}
+
+test "DiscordConfig stores bot token" {
+    const config = DiscordConfig{ .bot_token = "test-token" };
+    try std.testing.expectEqualStrings("test-token", config.bot_token);
+}
+
+test "DiscordChannel init starts disconnected" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    const channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+    try std.testing.expectEqual(plugin.ChannelStatus.disconnected, channel.status);
+}
