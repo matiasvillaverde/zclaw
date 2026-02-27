@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // --- Tests ---
+    const test_coverage = b.option(bool, "test-coverage", "Emit test binary for kcov coverage") orelse false;
     const test_step = b.step("test", "Run all unit tests");
 
     // Main server tests (needs httpz)
@@ -71,4 +72,17 @@ pub fn build(b: *std.Build) void {
     lib_test_mod.addImport("zqlite", zqlite_dep.module("zqlite"));
     const lib_tests = b.addTest(.{ .root_module = lib_test_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+
+    // Coverage: emit test binary without running, for use with kcov
+    if (test_coverage) {
+        const cov_mod = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        cov_mod.addImport("zqlite", zqlite_dep.module("zqlite"));
+        const cov_tests = b.addTest(.{ .root_module = cov_mod });
+        const cov_install = b.addInstallBinFile(cov_tests.getEmittedBin(), "test-coverage");
+        test_step.dependOn(&cov_install.step);
+    }
 }
