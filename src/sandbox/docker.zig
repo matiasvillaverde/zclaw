@@ -619,3 +619,220 @@ test "DockerClient full lifecycle" {
     try docker.removeContainer(id);
     try std.testing.expectEqual(@as(usize, 5), mock.call_count);
 }
+
+// --- Additional Tests ---
+
+test "ContainerState all labels non-empty" {
+    for (std.meta.tags(ContainerState)) |cs| {
+        try std.testing.expect(cs.label().len > 0);
+    }
+}
+
+test "ContainerState created label" {
+    try std.testing.expectEqualStrings("created", ContainerState.created.label());
+}
+
+test "ContainerState paused label" {
+    try std.testing.expectEqualStrings("paused", ContainerState.paused.label());
+}
+
+test "ContainerState stopped label" {
+    try std.testing.expectEqualStrings("stopped", ContainerState.stopped.label());
+}
+
+test "ContainerState removing label" {
+    try std.testing.expectEqualStrings("removing", ContainerState.removing.label());
+}
+
+test "ContainerState dead label" {
+    try std.testing.expectEqualStrings("dead", ContainerState.dead.label());
+}
+
+test "ContainerState dead not alive" {
+    try std.testing.expect(!ContainerState.dead.isAlive());
+    try std.testing.expect(!ContainerState.removing.isAlive());
+}
+
+test "ContainerState fromString all valid" {
+    try std.testing.expectEqual(ContainerState.created, ContainerState.fromString("created").?);
+    try std.testing.expectEqual(ContainerState.paused, ContainerState.fromString("paused").?);
+    try std.testing.expectEqual(ContainerState.stopped, ContainerState.fromString("stopped").?);
+    try std.testing.expectEqual(ContainerState.removing, ContainerState.fromString("removing").?);
+}
+
+test "DOCKER_SOCKET value" {
+    try std.testing.expectEqualStrings("/var/run/docker.sock", DOCKER_SOCKET);
+}
+
+test "API_VERSION value" {
+    try std.testing.expectEqualStrings("v1.43", API_VERSION);
+}
+
+test "DEFAULT_IMAGE value" {
+    try std.testing.expectEqualStrings("ubuntu:22.04", DEFAULT_IMAGE);
+}
+
+test "ContainerConfig custom values" {
+    const config = ContainerConfig{
+        .image = "node:20",
+        .name = "my-container",
+        .working_dir = "/app",
+        .memory_limit = 1024 * 1024 * 1024,
+        .cpu_quota = 50000,
+        .network_disabled = true,
+    };
+    try std.testing.expectEqualStrings("node:20", config.image);
+    try std.testing.expectEqualStrings("my-container", config.name.?);
+    try std.testing.expectEqualStrings("/app", config.working_dir);
+    try std.testing.expect(config.network_disabled);
+}
+
+test "ContainerInfo defaults" {
+    const info = ContainerInfo{
+        .id = "abc",
+        .name = "test",
+        .image = "ubuntu:22.04",
+    };
+    try std.testing.expectEqual(ContainerState.created, info.state);
+    try std.testing.expectEqual(@as(i64, 0), info.created_at);
+}
+
+test "extractContainerId with warnings" {
+    const json = "{\"Id\":\"long-container-id-here\",\"Warnings\":[\"warning1\"]}";
+    try std.testing.expectEqualStrings("long-container-id-here", extractContainerId(json).?);
+}
+
+test "extractContainerState exited" {
+    const json = "{\"Status\":\"exited\"}";
+    try std.testing.expectEqualStrings("exited", extractContainerState(json).?);
+}
+
+test "extractExecId" {
+    const json = "{\"Id\":\"exec-id-123\"}";
+    try std.testing.expectEqualStrings("exec-id-123", extractExecId(json).?);
+}
+
+test "buildHttpRequest DELETE" {
+    var buf: [512]u8 = undefined;
+    const req = try buildHttpRequest(&buf, "DELETE", "/v1.43/containers/abc?force=true", null);
+    try std.testing.expect(std.mem.startsWith(u8, req, "DELETE"));
+    try std.testing.expect(std.mem.indexOf(u8, req, "force=true") != null);
+}
+
+// ===== New tests added for comprehensive coverage =====
+
+test "ContainerState fromString empty string" {
+    try std.testing.expectEqual(@as(?ContainerState, null), ContainerState.fromString(""));
+}
+
+test "ContainerState fromString case sensitive" {
+    try std.testing.expectEqual(@as(?ContainerState, null), ContainerState.fromString("Running"));
+    try std.testing.expectEqual(@as(?ContainerState, null), ContainerState.fromString("RUNNING"));
+}
+
+test "ContainerState isAlive for all states" {
+    try std.testing.expect(ContainerState.running.isAlive());
+    try std.testing.expect(ContainerState.paused.isAlive());
+    try std.testing.expect(!ContainerState.created.isAlive());
+    try std.testing.expect(!ContainerState.stopped.isAlive());
+    try std.testing.expect(!ContainerState.removing.isAlive());
+    try std.testing.expect(!ContainerState.exited.isAlive());
+    try std.testing.expect(!ContainerState.dead.isAlive());
+}
+
+test "ContainerConfig null name" {
+    const config = ContainerConfig{};
+    try std.testing.expect(config.name == null);
+}
+
+test "ContainerConfig default cpu_quota" {
+    const config = ContainerConfig{};
+    try std.testing.expectEqual(@as(i64, 100000), config.cpu_quota);
+}
+
+test "ContainerConfig empty cmd and env" {
+    const config = ContainerConfig{};
+    try std.testing.expectEqual(@as(usize, 0), config.cmd.len);
+    try std.testing.expectEqual(@as(usize, 0), config.env.len);
+}
+
+test "buildApiUrl images endpoint" {
+    var buf: [256]u8 = undefined;
+    const url = try buildApiUrl(&buf, "/images/json");
+    try std.testing.expectEqualStrings("/v1.43/images/json", url);
+}
+
+test "buildApiUrl volumes endpoint" {
+    var buf: [256]u8 = undefined;
+    const url = try buildApiUrl(&buf, "/volumes");
+    try std.testing.expectEqualStrings("/v1.43/volumes", url);
+}
+
+test "buildApiUrl buffer too small" {
+    var buf: [5]u8 = undefined;
+    const result = buildApiUrl(&buf, "/containers/create");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "buildCreateContainerBody with multiple cmd args" {
+    var buf: [2048]u8 = undefined;
+    const cmd = [_][]const u8{ "sh", "-c", "echo hello && ls" };
+    const body = try buildCreateContainerBody(&buf, .{ .cmd = &cmd });
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"sh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"-c\"") != null);
+}
+
+test "buildCreateContainerBody with multiple env vars" {
+    var buf: [2048]u8 = undefined;
+    const env = [_][]const u8{ "HOME=/workspace", "PATH=/usr/bin", "TERM=xterm" };
+    const body = try buildCreateContainerBody(&buf, .{ .env = &env });
+    try std.testing.expect(std.mem.indexOf(u8, body, "HOME=/workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "PATH=/usr/bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "TERM=xterm") != null);
+}
+
+test "buildCreateContainerBody custom memory and cpu" {
+    var buf: [2048]u8 = undefined;
+    const body = try buildCreateContainerBody(&buf, .{
+        .memory_limit = 1024 * 1024 * 1024,
+        .cpu_quota = 200000,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, body, "1073741824") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "200000") != null);
+}
+
+test "buildExecBody with single command" {
+    var buf: [1024]u8 = undefined;
+    const cmd = [_][]const u8{"whoami"};
+    const body = try buildExecBody(&buf, &cmd, null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"whoami\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "AttachStdout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "AttachStderr") != null);
+}
+
+test "extractContainerId empty json" {
+    try std.testing.expect(extractContainerId("{}") == null);
+}
+
+test "extractContainerState missing" {
+    try std.testing.expect(extractContainerState("{}") == null);
+}
+
+test "extractExecId missing" {
+    try std.testing.expect(extractExecId("{}") == null);
+}
+
+test "buildHttpRequest PUT" {
+    var buf: [512]u8 = undefined;
+    const req = try buildHttpRequest(&buf, "PUT", "/v1.43/containers/abc/update", "{\"Memory\":256}");
+    try std.testing.expect(std.mem.startsWith(u8, req, "PUT"));
+    try std.testing.expect(std.mem.indexOf(u8, req, "Content-Type: application/json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "{\"Memory\":256}") != null);
+}
+
+test "buildHttpRequest Content-Length is correct" {
+    var buf: [1024]u8 = undefined;
+    const body_content = "test body";
+    const req = try buildHttpRequest(&buf, "POST", "/path", body_content);
+    try std.testing.expect(std.mem.indexOf(u8, req, "Content-Length: 9") != null);
+}

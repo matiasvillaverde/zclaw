@@ -340,3 +340,206 @@ test "CommandDecision labels" {
     try std.testing.expectEqualStrings("deny", CommandDecision.deny.label());
     try std.testing.expectEqualStrings("sandbox", CommandDecision.sandbox.label());
 }
+
+// --- Additional Tests ---
+
+test "SecurityLevel all labels non-empty" {
+    for (std.meta.tags(SecurityLevel)) |level| {
+        try std.testing.expect(level.label().len > 0);
+    }
+}
+
+test "SecurityLevel fromString all valid" {
+    try std.testing.expectEqual(SecurityLevel.none, SecurityLevel.fromString("none").?);
+    try std.testing.expectEqual(SecurityLevel.basic, SecurityLevel.fromString("basic").?);
+    try std.testing.expectEqual(SecurityLevel.strict, SecurityLevel.fromString("strict").?);
+    try std.testing.expectEqual(SecurityLevel.paranoid, SecurityLevel.fromString("paranoid").?);
+}
+
+test "SecurityLevel none label" {
+    try std.testing.expectEqualStrings("none", SecurityLevel.none.label());
+}
+
+test "SandboxPolicy default network is limited" {
+    const pol = SandboxPolicy{};
+    try std.testing.expectEqual(NetworkAccess.limited, pol.network);
+}
+
+test "SandboxPolicy default max_runtime_seconds" {
+    const pol = SandboxPolicy{};
+    try std.testing.expectEqual(@as(u32, 300), pol.max_runtime_seconds);
+}
+
+test "SandboxPolicy default max_cpu_percent" {
+    const pol = SandboxPolicy{};
+    try std.testing.expectEqual(@as(u32, 100), pol.max_cpu_percent);
+}
+
+test "checkCommand strict level" {
+    try std.testing.expectEqual(CommandDecision.sandbox, checkCommand("ls", STRICT_POLICY));
+}
+
+test "checkDomain subdomain match" {
+    const domains = [_][]const u8{"example.com"};
+    const pol = SandboxPolicy{ .network = .limited, .allowed_domains = &domains };
+    try std.testing.expect(checkDomain("sub.example.com", pol));
+    try std.testing.expect(!checkDomain("notexample.com", pol));
+}
+
+test "checkDomain exact match only" {
+    const domains = [_][]const u8{"api.example.com"};
+    const pol = SandboxPolicy{ .network = .limited, .allowed_domains = &domains };
+    try std.testing.expect(checkDomain("api.example.com", pol));
+    try std.testing.expect(!checkDomain("example.com", pol));
+}
+
+test "policyForLevel none" {
+    const pol = policyForLevel(.none);
+    try std.testing.expectEqual(SecurityLevel.none, pol.level);
+    try std.testing.expectEqual(NetworkAccess.full, pol.network);
+    try std.testing.expectEqual(MountMode.rw, pol.mount_mode);
+}
+
+test "serializePolicy basic" {
+    var buf: [512]u8 = undefined;
+    const json = try serializePolicy(&buf, &BASIC_POLICY);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"level\":\"basic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mount\":\"rw\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"network\":\"limited\"") != null);
+}
+
+test "serializePolicy paranoid" {
+    var buf: [512]u8 = undefined;
+    const json = try serializePolicy(&buf, &PARANOID_POLICY);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"level\":\"paranoid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mount\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"max_runtime_seconds\":30") != null);
+}
+
+test "PARANOID_POLICY max_cpu_percent" {
+    try std.testing.expectEqual(@as(u32, 25), PARANOID_POLICY.max_cpu_percent);
+}
+
+test "matchesPrefix no star" {
+    try std.testing.expect(!matchesPrefix("ls", "ls"));
+}
+
+test "checkCommand allowed prefix" {
+    const allowed = [_][]const u8{"git*"};
+    const pol = SandboxPolicy{ .allowed_commands = &allowed };
+    try std.testing.expectEqual(CommandDecision.allow, checkCommand("git status", pol));
+    try std.testing.expectEqual(CommandDecision.allow, checkCommand("git", pol));
+}
+
+// ===== New tests added for comprehensive coverage =====
+
+test "SecurityLevel fromString empty string" {
+    try std.testing.expectEqual(@as(?SecurityLevel, null), SecurityLevel.fromString(""));
+}
+
+test "SecurityLevel fromString case sensitive" {
+    try std.testing.expectEqual(@as(?SecurityLevel, null), SecurityLevel.fromString("Basic"));
+    try std.testing.expectEqual(@as(?SecurityLevel, null), SecurityLevel.fromString("STRICT"));
+}
+
+test "MountMode all labels non-empty" {
+    const modes = [_]MountMode{ .none, .ro, .rw };
+    for (modes) |m| {
+        try std.testing.expect(m.label().len > 0);
+    }
+}
+
+test "NetworkAccess all labels non-empty" {
+    const accesses = [_]NetworkAccess{ .full, .limited, .none };
+    for (accesses) |a| {
+        try std.testing.expect(a.label().len > 0);
+    }
+}
+
+test "SandboxPolicy default allowed and blocked commands are empty" {
+    const pol = SandboxPolicy{};
+    try std.testing.expectEqual(@as(usize, 0), pol.allowed_commands.len);
+    try std.testing.expectEqual(@as(usize, 0), pol.blocked_commands.len);
+    try std.testing.expectEqual(@as(usize, 0), pol.allowed_domains.len);
+}
+
+test "checkCommand empty command string" {
+    const pol = SandboxPolicy{ .level = .basic };
+    try std.testing.expectEqual(CommandDecision.sandbox, checkCommand("", pol));
+}
+
+test "checkCommand blocked wildcard prefix" {
+    const blocked = [_][]const u8{"sudo*"};
+    const pol = SandboxPolicy{ .blocked_commands = &blocked };
+    try std.testing.expectEqual(CommandDecision.deny, checkCommand("sudo rm", pol));
+    try std.testing.expectEqual(CommandDecision.deny, checkCommand("sudo", pol));
+    try std.testing.expectEqual(CommandDecision.sandbox, checkCommand("ls", pol));
+}
+
+test "checkCommand allowed wildcard prefix" {
+    const allowed = [_][]const u8{"npm*"};
+    const pol = SandboxPolicy{ .allowed_commands = &allowed };
+    try std.testing.expectEqual(CommandDecision.allow, checkCommand("npm install", pol));
+    try std.testing.expectEqual(CommandDecision.allow, checkCommand("npm", pol));
+    try std.testing.expectEqual(CommandDecision.sandbox, checkCommand("yarn", pol));
+}
+
+test "checkCommand blocked wins over default allow in none level" {
+    const blocked = [_][]const u8{"rm"};
+    const pol = SandboxPolicy{ .level = .none, .blocked_commands = &blocked };
+    try std.testing.expectEqual(CommandDecision.deny, checkCommand("rm", pol));
+    try std.testing.expectEqual(CommandDecision.allow, checkCommand("ls", pol));
+}
+
+test "checkDomain subdomain deeper nesting" {
+    const domains = [_][]const u8{"example.com"};
+    const pol = SandboxPolicy{ .network = .limited, .allowed_domains = &domains };
+    try std.testing.expect(checkDomain("deep.sub.example.com", pol));
+    try std.testing.expect(checkDomain("a.b.c.example.com", pol));
+}
+
+test "checkDomain empty domain string" {
+    const domains = [_][]const u8{"example.com"};
+    const pol = SandboxPolicy{ .network = .limited, .allowed_domains = &domains };
+    try std.testing.expect(!checkDomain("", pol));
+}
+
+test "checkDomain no network no allowed domains" {
+    const pol = SandboxPolicy{ .network = .none };
+    try std.testing.expect(!checkDomain("anything.com", pol));
+}
+
+test "checkDomain full network ignores allowlist" {
+    const domains = [_][]const u8{"only.com"};
+    const pol = SandboxPolicy{ .network = .full, .allowed_domains = &domains };
+    try std.testing.expect(checkDomain("other.com", pol));
+}
+
+test "policyForLevel returns correct levels" {
+    try std.testing.expectEqual(SecurityLevel.none, policyForLevel(.none).level);
+    try std.testing.expectEqual(SecurityLevel.basic, policyForLevel(.basic).level);
+    try std.testing.expectEqual(SecurityLevel.strict, policyForLevel(.strict).level);
+    try std.testing.expectEqual(SecurityLevel.paranoid, policyForLevel(.paranoid).level);
+}
+
+test "policyForLevel strict has no network and ro mount" {
+    const pol = policyForLevel(.strict);
+    try std.testing.expectEqual(NetworkAccess.none, pol.network);
+    try std.testing.expectEqual(MountMode.ro, pol.mount_mode);
+}
+
+test "serializePolicy buffer too small" {
+    var buf: [5]u8 = undefined;
+    const result = serializePolicy(&buf, &BASIC_POLICY);
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "serializePolicy contains all required fields" {
+    var buf: [512]u8 = undefined;
+    const json = try serializePolicy(&buf, &BASIC_POLICY);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"level\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mount\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"network\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"max_memory_mb\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"max_runtime_seconds\":") != null);
+}

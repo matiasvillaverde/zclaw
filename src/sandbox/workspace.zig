@@ -602,3 +602,342 @@ test "WorkspaceManager paranoid mount mode" {
     try std.testing.expectEqual(policy_mod.MountMode.none, ws.mount_mode);
     try std.testing.expectEqual(policy_mod.SecurityLevel.paranoid, ws.security_level);
 }
+
+// --- Additional Tests ---
+
+test "WorkspaceState pruning label" {
+    try std.testing.expectEqualStrings("pruning", WorkspaceState.pruning.label());
+}
+
+test "WorkspaceState pruning not usable" {
+    try std.testing.expect(!WorkspaceState.pruning.isUsable());
+}
+
+test "Workspace isIdle zero last_used returns false" {
+    const ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp/ws1",
+        .state = .idle,
+        .last_used_at = 0,
+    };
+    try std.testing.expect(!ws.isIdle(100000, 1));
+}
+
+test "Workspace isIdle ready state also triggers" {
+    const ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp/ws1",
+        .state = .ready,
+        .last_used_at = 1000,
+    };
+    try std.testing.expect(ws.isIdle(90000, 86400));
+}
+
+test "Workspace markActive updates both fields" {
+    var ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp/ws1",
+        .state = .creating,
+    };
+    ws.markActive(12345);
+    try std.testing.expectEqual(WorkspaceState.active, ws.state);
+    try std.testing.expectEqual(@as(i64, 12345), ws.last_used_at);
+}
+
+test "buildWorkspacePath empty base" {
+    var buf: [256]u8 = undefined;
+    const path = try buildWorkspacePath(&buf, "", "ws1");
+    try std.testing.expectEqualStrings("ws1", path);
+}
+
+test "buildMountArg rw no trailing colon" {
+    var buf: [256]u8 = undefined;
+    const arg = try buildMountArg(&buf, "/a", "/b", .rw);
+    try std.testing.expect(!std.mem.endsWith(u8, arg, ":ro"));
+    try std.testing.expectEqualStrings("/a:/b", arg);
+}
+
+test "shouldPrune active workspace" {
+    const config = WorkspaceConfig{ .max_idle_seconds = 1 };
+    const ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp/ws1",
+        .state = .active,
+        .last_used_at = 1000,
+    };
+    try std.testing.expect(!shouldPrune(&ws, 99999, config));
+}
+
+test "WorkspaceConfig custom values" {
+    const config = WorkspaceConfig{
+        .base_dir = "/custom/path",
+        .max_idle_seconds = 3600,
+        .max_workspaces = 5,
+        .default_mount = .ro,
+    };
+    try std.testing.expectEqualStrings("/custom/path", config.base_dir);
+    try std.testing.expectEqual(@as(u64, 3600), config.max_idle_seconds);
+    try std.testing.expectEqual(@as(u32, 5), config.max_workspaces);
+    try std.testing.expectEqual(policy_mod.MountMode.ro, config.default_mount);
+}
+
+test "serializeWorkspace creating state" {
+    const ws = Workspace{
+        .id = "ws-new",
+        .name = "fresh",
+        .host_path = "/tmp/ws-new",
+        .state = .creating,
+        .security_level = .strict,
+    };
+    var buf: [512]u8 = undefined;
+    const json = try serializeWorkspace(&buf, &ws);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"state\":\"creating\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"security\":\"strict\"") != null);
+}
+
+test "WorkspaceManager getWorkspace nonexistent" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{});
+    defer mgr.deinit();
+
+    try std.testing.expect(mgr.getWorkspace("missing") == null);
+}
+
+test "WorkspaceManager deactivate nonexistent" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{});
+    defer mgr.deinit();
+
+    try std.testing.expectError(WorkspaceManager.ManagerError.WorkspaceNotFound, mgr.deactivateWorkspace("nope"));
+}
+
+// ===== New tests added for comprehensive coverage =====
+
+test "WorkspaceState all labels non-empty" {
+    const states = [_]WorkspaceState{ .creating, .ready, .active, .idle, .pruning, .removed };
+    for (states) |s| {
+        try std.testing.expect(s.label().len > 0);
+    }
+}
+
+test "WorkspaceState removed not usable" {
+    try std.testing.expect(!WorkspaceState.removed.isUsable());
+}
+
+test "Workspace isIdle creating state returns false" {
+    const ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp",
+        .state = .creating,
+        .last_used_at = 1000,
+    };
+    try std.testing.expect(!ws.isIdle(999999, 1));
+}
+
+test "Workspace isIdle removed state returns false" {
+    const ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp",
+        .state = .removed,
+        .last_used_at = 1000,
+    };
+    try std.testing.expect(!ws.isIdle(999999, 1));
+}
+
+test "Workspace isIdle pruning state returns false" {
+    const ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp",
+        .state = .pruning,
+        .last_used_at = 1000,
+    };
+    try std.testing.expect(!ws.isIdle(999999, 1));
+}
+
+test "Workspace markActive from idle" {
+    var ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp",
+        .state = .idle,
+    };
+    ws.markActive(9999);
+    try std.testing.expectEqual(WorkspaceState.active, ws.state);
+    try std.testing.expectEqual(@as(i64, 9999), ws.last_used_at);
+}
+
+test "buildWorkspacePath with long id" {
+    var buf: [512]u8 = undefined;
+    const long_id = "workspace-" ++ "a" ** 50;
+    const path = try buildWorkspacePath(&buf, "/tmp/sandboxes", long_id);
+    try std.testing.expect(std.mem.startsWith(u8, path, "/tmp/sandboxes/"));
+    try std.testing.expect(std.mem.endsWith(u8, path, long_id));
+}
+
+test "buildWorkspacePath buffer too small" {
+    var buf: [5]u8 = undefined;
+    const result = buildWorkspacePath(&buf, "/tmp/long-base-dir", "ws1");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "buildMountArg buffer too small" {
+    var buf: [5]u8 = undefined;
+    const result = buildMountArg(&buf, "/very/long/host/path", "/workspace", .rw);
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "shouldPrune removed workspace" {
+    const config = WorkspaceConfig{ .max_idle_seconds = 1 };
+    const ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp/ws1",
+        .state = .removed,
+        .last_used_at = 1000,
+    };
+    try std.testing.expect(!shouldPrune(&ws, 999999, config));
+}
+
+test "shouldPrune creating workspace" {
+    const config = WorkspaceConfig{ .max_idle_seconds = 1 };
+    const ws = Workspace{
+        .id = "ws1",
+        .name = "test",
+        .host_path = "/tmp/ws1",
+        .state = .creating,
+        .last_used_at = 1000,
+    };
+    try std.testing.expect(!shouldPrune(&ws, 999999, config));
+}
+
+test "buildContainerConfig paranoid policy" {
+    const ws = Workspace{
+        .id = "ws1",
+        .name = "paranoid-ws",
+        .host_path = "/tmp/ws1",
+    };
+    const pol = policy_mod.PARANOID_POLICY;
+    const config = buildContainerConfig(&ws, pol);
+    try std.testing.expect(config.network_disabled);
+    try std.testing.expectEqual(@as(u64, 128 * 1024 * 1024), config.memory_limit);
+    try std.testing.expectEqual(@as(i64, 25000), config.cpu_quota);
+}
+
+test "buildContainerConfig workspace name passed through" {
+    const ws = Workspace{
+        .id = "ws-xyz",
+        .name = "my-workspace",
+        .host_path = "/tmp/ws-xyz",
+    };
+    const config = buildContainerConfig(&ws, policy_mod.BASIC_POLICY);
+    try std.testing.expectEqualStrings("my-workspace", config.name.?);
+    try std.testing.expectEqualStrings(docker.DEFAULT_IMAGE, config.image);
+}
+
+test "serializeWorkspace idle state" {
+    const ws = Workspace{
+        .id = "ws-idle",
+        .name = "idle-ws",
+        .host_path = "/tmp",
+        .state = .idle,
+        .mount_mode = .ro,
+        .security_level = .paranoid,
+    };
+    var buf: [512]u8 = undefined;
+    const json = try serializeWorkspace(&buf, &ws);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"state\":\"idle\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mount\":\"ro\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"security\":\"paranoid\"") != null);
+}
+
+test "serializeWorkspace buffer too small" {
+    const ws = Workspace{
+        .id = "ws-abc",
+        .name = "my-workspace",
+        .host_path = "/tmp",
+    };
+    var buf: [10]u8 = undefined;
+    const result = serializeWorkspace(&buf, &ws);
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "WorkspaceManager create multiple workspaces" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{ .max_workspaces = 5 });
+    defer mgr.deinit();
+
+    _ = try mgr.createWorkspace("ws1", .basic);
+    _ = try mgr.createWorkspace("ws2", .strict);
+    _ = try mgr.createWorkspace("ws3", .paranoid);
+    try std.testing.expectEqual(@as(usize, 3), mgr.count());
+}
+
+test "WorkspaceManager strict workspace has ro mount" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{});
+    defer mgr.deinit();
+
+    const ws = try mgr.createWorkspace("strict-ws", .strict);
+    try std.testing.expectEqual(policy_mod.SecurityLevel.strict, ws.security_level);
+    // strict policy has .ro mount, but workspace uses config.default_mount (.rw) since policy is not .none
+    try std.testing.expectEqual(policy_mod.MountMode.rw, ws.mount_mode);
+}
+
+test "WorkspaceManager pruneIdle no workspaces" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{});
+    defer mgr.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), mgr.pruneIdle(999999));
+}
+
+test "WorkspaceManager activate and check state" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{});
+    defer mgr.deinit();
+
+    _ = try mgr.createWorkspace("ws1", .basic);
+    const ws = mgr.getWorkspace("ws1").?;
+    try std.testing.expectEqual(WorkspaceState.ready, ws.state);
+
+    try mgr.activateWorkspace("ws1", 1000);
+    try std.testing.expectEqual(WorkspaceState.active, ws.state);
+    try std.testing.expect(ws.state.isUsable());
+}

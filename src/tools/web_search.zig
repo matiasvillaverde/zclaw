@@ -349,3 +349,303 @@ test "BUILTIN_WEB_SEARCH definition" {
     try std.testing.expectEqualStrings("web_search", BUILTIN_WEB_SEARCH.name);
     try std.testing.expectEqual(registry.ToolCategory.web, BUILTIN_WEB_SEARCH.category);
 }
+
+// --- Additional Tests ---
+
+test "buildSearchUrl empty query" {
+    var buf: [1024]u8 = undefined;
+    const url = try buildSearchUrl(&buf, "", 5);
+    try std.testing.expect(std.mem.indexOf(u8, url, "q=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "count=5") != null);
+}
+
+test "buildSearchUrl with plus sign" {
+    var buf: [1024]u8 = undefined;
+    const url = try buildSearchUrl(&buf, "c++", 3);
+    try std.testing.expect(std.mem.indexOf(u8, url, "c%2B%2B") != null);
+}
+
+test "buildSearchUrl with question mark" {
+    var buf: [1024]u8 = undefined;
+    const url = try buildSearchUrl(&buf, "what?", 5);
+    try std.testing.expect(std.mem.indexOf(u8, url, "%3F") != null);
+}
+
+test "buildSearchUrl with hash" {
+    var buf: [1024]u8 = undefined;
+    const url = try buildSearchUrl(&buf, "c#", 5);
+    try std.testing.expect(std.mem.indexOf(u8, url, "%23") != null);
+}
+
+test "parseSearchResults with description only" {
+    const json =
+        \\{"web":{"results":[{"title":"Test","url":"https://t.com","description":"Desc here"}]}}
+    ;
+    var buf: [4096]u8 = undefined;
+    const result = parseSearchResults(json, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, result, "1. Test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Desc here") != null);
+}
+
+test "parseSearchResults no web field" {
+    var buf: [4096]u8 = undefined;
+    const result = parseSearchResults("{\"other\":\"data\"}", &buf);
+    try std.testing.expectEqualStrings("No results found.", result);
+}
+
+test "DEFAULT_COUNT is 5" {
+    try std.testing.expectEqual(@as(u8, 5), DEFAULT_COUNT);
+}
+
+test "BRAVE_BASE_URL format" {
+    try std.testing.expect(std.mem.startsWith(u8, BRAVE_BASE_URL, "https://"));
+    try std.testing.expect(std.mem.indexOf(u8, BRAVE_BASE_URL, "brave.com") != null);
+}
+
+test "BRAVE_SEARCH_PATH starts with slash" {
+    try std.testing.expect(std.mem.startsWith(u8, BRAVE_SEARCH_PATH, "/"));
+}
+
+test "BUILTIN_WEB_SEARCH parameters contain query" {
+    const params = BUILTIN_WEB_SEARCH.parameters_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, params, "query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "required") != null);
+}
+
+test "webSearchHandler with empty response body" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    setBraveApiKey("test-key");
+    defer clearHttpClient();
+    defer clearBraveApiKey();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"test\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("No results found.", result.output);
+}
+
+// === New Tests (batch 2) ===
+
+test "buildSearchUrl count parameter varies" {
+    var buf: [1024]u8 = undefined;
+    const url3 = try buildSearchUrl(&buf, "test", 3);
+    try std.testing.expect(std.mem.indexOf(u8, url3, "count=3") != null);
+
+    const url10 = try buildSearchUrl(&buf, "test", 10);
+    try std.testing.expect(std.mem.indexOf(u8, url10, "count=10") != null);
+
+    const url1 = try buildSearchUrl(&buf, "test", 1);
+    try std.testing.expect(std.mem.indexOf(u8, url1, "count=1") != null);
+}
+
+test "buildSearchUrl path is correct" {
+    var buf: [1024]u8 = undefined;
+    const url = try buildSearchUrl(&buf, "hello", 5);
+    try std.testing.expect(std.mem.indexOf(u8, url, BRAVE_SEARCH_PATH) != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, BRAVE_BASE_URL) != null);
+}
+
+test "buildSearchUrl multiple spaces" {
+    var buf: [1024]u8 = undefined;
+    const url = try buildSearchUrl(&buf, "a b c", 5);
+    try std.testing.expect(std.mem.indexOf(u8, url, "a+b+c") != null);
+}
+
+test "buildSearchUrl all special chars" {
+    var buf: [1024]u8 = undefined;
+    const url = try buildSearchUrl(&buf, "a&b=c?d#e+f", 5);
+    try std.testing.expect(std.mem.indexOf(u8, url, "%26") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "%3D") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "%3F") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "%23") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "%2B") != null);
+}
+
+test "buildSearchUrl normal alphanumeric not encoded" {
+    var buf: [1024]u8 = undefined;
+    const url = try buildSearchUrl(&buf, "hello123", 5);
+    try std.testing.expect(std.mem.indexOf(u8, url, "q=hello123") != null);
+}
+
+test "parseSearchResults three results" {
+    const json =
+        \\{"web":{"results":[{"title":"A","url":"https://a.com","description":"Desc A"},{"title":"B","url":"https://b.com","description":"Desc B"},{"title":"C","url":"https://c.com","description":"Desc C"}]}}
+    ;
+    var buf: [4096]u8 = undefined;
+    const result = parseSearchResults(json, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, result, "1. A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "2. B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "3. C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Desc A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Desc C") != null);
+}
+
+test "parseSearchResults result without description" {
+    const json =
+        \\{"web":{"results":[{"title":"NoDesc","url":"https://nodesc.com"}]}}
+    ;
+    var buf: [4096]u8 = undefined;
+    const result = parseSearchResults(json, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, result, "1. NoDesc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "https://nodesc.com") != null);
+}
+
+test "parseSearchResults malformed JSON" {
+    var buf: [4096]u8 = undefined;
+    const result = parseSearchResults("not json at all", &buf);
+    try std.testing.expectEqualStrings("No results found.", result);
+}
+
+test "parseSearchResults partial JSON" {
+    var buf: [4096]u8 = undefined;
+    const result = parseSearchResults("{\"title\":\"incomplete", &buf);
+    try std.testing.expectEqualStrings("No results found.", result);
+}
+
+test "webSearchHandler empty query error message" {
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("empty query", result.error_message.?);
+}
+
+test "webSearchHandler HTTP 500 error" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 500, .body = "Internal Server Error" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    setBraveApiKey("test-key");
+    defer clearHttpClient();
+    defer clearBraveApiKey();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"test\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_message.?, "500") != null);
+}
+
+test "webSearchHandler HTTP 401 unauthorized" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 401, .body = "{\"error\":\"unauthorized\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    setBraveApiKey("bad-key");
+    defer clearHttpClient();
+    defer clearBraveApiKey();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"test\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_message.?, "401") != null);
+}
+
+test "webSearchHandler HTTP 403 forbidden" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 403, .body = "Forbidden" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    setBraveApiKey("test-key");
+    defer clearHttpClient();
+    defer clearBraveApiKey();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"test\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_message.?, "403") != null);
+}
+
+test "BUILTIN_WEB_SEARCH description is non-empty" {
+    try std.testing.expect(BUILTIN_WEB_SEARCH.description.len > 0);
+}
+
+test "BUILTIN_WEB_SEARCH not sandboxed" {
+    try std.testing.expect(!BUILTIN_WEB_SEARCH.sandboxed);
+}
+
+test "BUILTIN_WEB_SEARCH not require approval" {
+    try std.testing.expect(!BUILTIN_WEB_SEARCH.requires_approval);
+}
+
+test "setHttpClient and clearHttpClient" {
+    clearHttpClient();
+    clearBraveApiKey();
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"test\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("HTTP client not initialized", result.error_message.?);
+}
+
+test "setBraveApiKey and clearBraveApiKey" {
+    setBraveApiKey("test-key-123");
+    clearBraveApiKey();
+    // After clearing, should report no API key
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"test\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Brave API key not configured", result.error_message.?);
+}
+
+test "parseSearchResults output format includes newlines" {
+    const json =
+        \\{"web":{"results":[{"title":"Test","url":"https://t.com","description":"Desc"}]}}
+    ;
+    var buf: [4096]u8 = undefined;
+    const result = parseSearchResults(json, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\n") != null);
+}
+
+test "buildSearchUrl with single char query" {
+    var buf: [1024]u8 = undefined;
+    const url = try buildSearchUrl(&buf, "x", 5);
+    try std.testing.expect(std.mem.indexOf(u8, url, "q=x") != null);
+}
+
+test "webSearchHandler single result output" {
+    const allocator = std.testing.allocator;
+    const brave_json =
+        \\{"web":{"results":[{"title":"Only One","url":"https://only.com","description":"Single result"}]}}
+    ;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = brave_json },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    setBraveApiKey("key");
+    defer clearHttpClient();
+    defer clearBraveApiKey();
+
+    var buf: [4096]u8 = undefined;
+    const result = webSearchHandler("{\"query\":\"only one\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "1. Only One") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "2.") == null);
+}

@@ -315,3 +315,355 @@ test "PolicyEngine ruleCount" {
     try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .allow });
     try std.testing.expectEqual(@as(usize, 1), engine.ruleCount());
 }
+
+// --- Additional Tests ---
+
+test "PolicyLayer all labels non-empty" {
+    for (std.meta.tags(PolicyLayer)) |layer| {
+        try std.testing.expect(layer.label().len > 0);
+    }
+}
+
+test "PolicyLayer priority ordering" {
+    try std.testing.expect(PolicyLayer.global.priority() < PolicyLayer.provider.priority());
+    try std.testing.expect(PolicyLayer.provider.priority() < PolicyLayer.agent.priority());
+    try std.testing.expect(PolicyLayer.agent.priority() < PolicyLayer.profile.priority());
+    try std.testing.expect(PolicyLayer.profile.priority() < PolicyLayer.sandbox.priority());
+}
+
+test "PolicyLayer provider label" {
+    try std.testing.expectEqualStrings("provider", PolicyLayer.provider.label());
+}
+
+test "PolicyLayer profile label" {
+    try std.testing.expectEqualStrings("profile", PolicyLayer.profile.label());
+}
+
+test "PolicyLayer agent label" {
+    try std.testing.expectEqualStrings("agent", PolicyLayer.agent.label());
+}
+
+test "matchesPattern empty pattern" {
+    try std.testing.expect(!matchesPattern("", "bash"));
+}
+
+test "matchesPattern empty name" {
+    try std.testing.expect(matchesPattern("*", ""));
+}
+
+test "matchesPattern prefix no match" {
+    try std.testing.expect(!matchesPattern("file*", "exec_bash"));
+}
+
+test "matchesPattern exact with star at end" {
+    try std.testing.expect(matchesPattern("exec*", "exec"));
+}
+
+test "PolicyEngine getDenyReason no reason" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.sandbox, .{ .tool_pattern = "bash", .decision = .deny });
+    // No reason set, but deny rule exists
+    try std.testing.expect(engine.getDenyReason("bash") == null);
+}
+
+test "PolicyEngine multiple denies first reason" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "bash", .decision = .deny, .reason = "global deny" });
+    try engine.addRule(.sandbox, .{ .tool_pattern = "bash", .decision = .deny, .reason = "sandbox deny" });
+
+    const reason = engine.getDenyReason("bash").?;
+    try std.testing.expectEqualStrings("global deny", reason);
+}
+
+test "PolicyEngine ask does not override deny" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "bash", .decision = .deny });
+    try engine.addRule(.sandbox, .{ .tool_pattern = "bash", .decision = .ask });
+
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("bash"));
+}
+
+test "sandboxPolicy deny reasons" {
+    const allocator = std.testing.allocator;
+    var engine = try sandboxPolicy(allocator);
+    defer engine.deinit();
+
+    try std.testing.expectEqualStrings("sandboxed", engine.getDenyReason("bash").?);
+    try std.testing.expectEqualStrings("sandboxed", engine.getDenyReason("write").?);
+    try std.testing.expectEqualStrings("sandboxed", engine.getDenyReason("exec").?);
+    try std.testing.expectEqualStrings("sandboxed", engine.getDenyReason("edit").?);
+    try std.testing.expectEqualStrings("sandboxed", engine.getDenyReason("apply_patch").?);
+}
+
+test "sandboxPolicy ruleCount" {
+    const allocator = std.testing.allocator;
+    var engine = try sandboxPolicy(allocator);
+    defer engine.deinit();
+
+    try std.testing.expectEqual(@as(usize, 6), engine.ruleCount());
+}
+
+test "defaultPolicy ruleCount" {
+    const allocator = std.testing.allocator;
+    var engine = try defaultPolicy(allocator);
+    defer engine.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), engine.ruleCount());
+}
+
+test "PolicyRule defaults" {
+    const rule = PolicyRule{ .tool_pattern = "*", .decision = .allow };
+    try std.testing.expectEqualStrings("", rule.reason);
+}
+
+// === New Tests (batch 2) ===
+
+test "matchesPattern exact match with underscores" {
+    try std.testing.expect(matchesPattern("memory_search", "memory_search"));
+    try std.testing.expect(!matchesPattern("memory_search", "memory_index"));
+}
+
+test "matchesPattern prefix glob with underscores" {
+    try std.testing.expect(matchesPattern("memory_*", "memory_search"));
+    try std.testing.expect(matchesPattern("memory_*", "memory_index"));
+    try std.testing.expect(!matchesPattern("memory_*", "web_fetch"));
+}
+
+test "matchesPattern single char prefix" {
+    try std.testing.expect(matchesPattern("a*", "abc"));
+    try std.testing.expect(matchesPattern("a*", "a"));
+    try std.testing.expect(!matchesPattern("a*", "bc"));
+}
+
+test "matchesPattern just star literal" {
+    // "*" matches everything, including empty string
+    try std.testing.expect(matchesPattern("*", ""));
+    try std.testing.expect(matchesPattern("*", "any_tool_name"));
+    try std.testing.expect(matchesPattern("*", "a"));
+}
+
+test "PolicyEngine evaluate with wildcard allow and specific deny" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .allow });
+    try engine.addRule(.agent, .{ .tool_pattern = "bash", .decision = .deny, .reason = "no bash" });
+    try engine.addRule(.agent, .{ .tool_pattern = "exec*", .decision = .deny, .reason = "no exec" });
+
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("bash"));
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("exec_cmd"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("read"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("write"));
+}
+
+test "PolicyEngine multiple layers same decision" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "read", .decision = .allow });
+    try engine.addRule(.agent, .{ .tool_pattern = "read", .decision = .allow });
+    try engine.addRule(.profile, .{ .tool_pattern = "read", .decision = .allow });
+
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("read"));
+}
+
+test "PolicyEngine highest priority layer wins for non-deny" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "tool", .decision = .allow });
+    try engine.addRule(.agent, .{ .tool_pattern = "tool", .decision = .ask });
+    try engine.addRule(.sandbox, .{ .tool_pattern = "tool", .decision = .allow });
+
+    // sandbox has highest priority, so allow wins
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("tool"));
+}
+
+test "PolicyEngine deny at any layer blocks regardless" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    // Even if sandbox (highest) says allow, a global deny should still win
+    try engine.addRule(.global, .{ .tool_pattern = "bash", .decision = .deny, .reason = "blocked" });
+    try engine.addRule(.agent, .{ .tool_pattern = "bash", .decision = .allow });
+    try engine.addRule(.profile, .{ .tool_pattern = "bash", .decision = .allow });
+    try engine.addRule(.sandbox, .{ .tool_pattern = "bash", .decision = .allow });
+
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("bash"));
+}
+
+test "PolicyEngine getDenyReason returns first matching reason" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "exec*", .decision = .deny, .reason = "exec is unsafe" });
+    try engine.addRule(.sandbox, .{ .tool_pattern = "exec_bash", .decision = .deny, .reason = "sandbox blocks bash" });
+
+    // First matching deny is returned
+    const reason = engine.getDenyReason("exec_bash").?;
+    try std.testing.expectEqualStrings("exec is unsafe", reason);
+}
+
+test "PolicyEngine getDenyReason for non-denied tool" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .allow });
+    try engine.addRule(.sandbox, .{ .tool_pattern = "bash", .decision = .deny, .reason = "blocked" });
+
+    // "read" is not denied
+    try std.testing.expect(engine.getDenyReason("read") == null);
+}
+
+test "PolicyEngine evaluate with only ask rules" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .ask });
+
+    try std.testing.expectEqual(PolicyDecision.ask, engine.evaluate("any_tool"));
+}
+
+test "PolicyEngine evaluate wildcard deny blocks everything" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .deny, .reason = "lockdown" });
+
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("bash"));
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("read"));
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("write"));
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("memory_search"));
+}
+
+test "PolicyEngine ruleCount after multiple adds" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .allow });
+    try engine.addRule(.agent, .{ .tool_pattern = "bash", .decision = .deny });
+    try engine.addRule(.profile, .{ .tool_pattern = "exec*", .decision = .ask });
+    try engine.addRule(.sandbox, .{ .tool_pattern = "write", .decision = .deny });
+
+    try std.testing.expectEqual(@as(usize, 4), engine.ruleCount());
+}
+
+test "PolicyDecision label completeness" {
+    // All variants have distinct non-empty labels
+    const decisions = [_]PolicyDecision{ .allow, .deny, .ask };
+    for (decisions, 0..) |d1, i| {
+        try std.testing.expect(d1.label().len > 0);
+        for (decisions[i + 1 ..]) |d2| {
+            try std.testing.expect(!std.mem.eql(u8, d1.label(), d2.label()));
+        }
+    }
+}
+
+test "PolicyLayer priority values are unique" {
+    const layers = std.meta.tags(PolicyLayer);
+    for (layers, 0..) |l1, i| {
+        for (layers[i + 1 ..]) |l2| {
+            try std.testing.expect(l1.priority() != l2.priority());
+        }
+    }
+}
+
+test "PolicyLayer global has lowest priority" {
+    const layers = std.meta.tags(PolicyLayer);
+    for (layers) |l| {
+        try std.testing.expect(PolicyLayer.global.priority() <= l.priority());
+    }
+}
+
+test "PolicyLayer sandbox has highest priority" {
+    const layers = std.meta.tags(PolicyLayer);
+    for (layers) |l| {
+        try std.testing.expect(PolicyLayer.sandbox.priority() >= l.priority());
+    }
+}
+
+test "sandboxPolicy allows read and search" {
+    const allocator = std.testing.allocator;
+    var engine = try sandboxPolicy(allocator);
+    defer engine.deinit();
+
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("read"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("memory_search"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("web_fetch"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("web_search"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("list_dir"));
+}
+
+test "sandboxPolicy denies all dangerous tools" {
+    const allocator = std.testing.allocator;
+    var engine = try sandboxPolicy(allocator);
+    defer engine.deinit();
+
+    const denied = [_][]const u8{ "write", "edit", "exec", "bash", "apply_patch" };
+    for (denied) |tool| {
+        try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate(tool));
+    }
+}
+
+test "defaultPolicy allows everything" {
+    const allocator = std.testing.allocator;
+    var engine = try defaultPolicy(allocator);
+    defer engine.deinit();
+
+    const tools = [_][]const u8{ "bash", "read", "write", "exec", "memory_search", "web_fetch", "apply_patch", "edit" };
+    for (tools) |tool| {
+        try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate(tool));
+    }
+}
+
+test "PolicyEngine empty pattern only matches empty name" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "", .decision = .deny });
+
+    // Empty pattern matches empty name via exact match
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("bash"));
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate(""));
+}
+
+test "PolicyRule with reason" {
+    const rule = PolicyRule{ .tool_pattern = "bash", .decision = .deny, .reason = "dangerous command execution" };
+    try std.testing.expectEqualStrings("bash", rule.tool_pattern);
+    try std.testing.expectEqual(PolicyDecision.deny, rule.decision);
+    try std.testing.expectEqualStrings("dangerous command execution", rule.reason);
+}
+
+test "PolicyEngine multiple prefix patterns" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .allow });
+    try engine.addRule(.agent, .{ .tool_pattern = "file_*", .decision = .ask });
+    try engine.addRule(.agent, .{ .tool_pattern = "exec_*", .decision = .deny });
+
+    try std.testing.expectEqual(PolicyDecision.ask, engine.evaluate("file_read"));
+    try std.testing.expectEqual(PolicyDecision.ask, engine.evaluate("file_write"));
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("exec_bash"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("memory_search"));
+}

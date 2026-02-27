@@ -229,3 +229,288 @@ test "parseField specific value" {
     try std.testing.expect(fs.isSet(42));
     try std.testing.expectEqual(@as(u32, 1), fs.count());
 }
+
+// --- Additional Tests ---
+
+test "FieldSet set and count" {
+    var fs = FieldSet{};
+    fs.set(0);
+    fs.set(10);
+    fs.set(20);
+    try std.testing.expectEqual(@as(u32, 3), fs.count());
+}
+
+test "FieldSet setStep with step 1" {
+    var fs = FieldSet{};
+    fs.setStep(0, 3, 1);
+    try std.testing.expectEqual(@as(u32, 4), fs.count());
+    try std.testing.expect(fs.isSet(0));
+    try std.testing.expect(fs.isSet(1));
+    try std.testing.expect(fs.isSet(2));
+    try std.testing.expect(fs.isSet(3));
+}
+
+test "FieldSet setStep with step 0 is noop" {
+    var fs = FieldSet{};
+    fs.setStep(0, 10, 0);
+    try std.testing.expectEqual(@as(u32, 0), fs.count());
+}
+
+test "FieldSet empty count is zero" {
+    const fs = FieldSet{};
+    try std.testing.expectEqual(@as(u32, 0), fs.count());
+}
+
+test "FieldSet setAll same min and max" {
+    var fs = FieldSet{};
+    fs.setAll(5, 5);
+    try std.testing.expect(fs.isSet(5));
+    try std.testing.expectEqual(@as(u32, 1), fs.count());
+}
+
+test "parse midnight daily" {
+    const cron = try parse("0 0 * * *");
+    try std.testing.expect(cron.minute.isSet(0));
+    try std.testing.expect(!cron.minute.isSet(1));
+    try std.testing.expect(cron.hour.isSet(0));
+    try std.testing.expect(!cron.hour.isSet(1));
+}
+
+test "parse every 5 minutes" {
+    const cron = try parse("*/5 * * * *");
+    try std.testing.expect(cron.minute.isSet(0));
+    try std.testing.expect(cron.minute.isSet(5));
+    try std.testing.expect(cron.minute.isSet(10));
+    try std.testing.expect(!cron.minute.isSet(3));
+    try std.testing.expectEqual(@as(u32, 12), cron.minute.count());
+}
+
+test "parse specific month" {
+    const cron = try parse("0 0 1 6 *");
+    try std.testing.expect(cron.month.isSet(6));
+    try std.testing.expect(!cron.month.isSet(5));
+    try std.testing.expect(cron.day_of_month.isSet(1));
+}
+
+test "CronExpr matches midnight Monday" {
+    const cron = try parse("0 0 * * 1");
+    try std.testing.expect(cron.matches(0, 0, 15, 6, 1));
+    try std.testing.expect(!cron.matches(0, 0, 15, 6, 0)); // Sunday
+}
+
+test "parse range with step" {
+    const cron = try parse("0-30/10 * * * *");
+    try std.testing.expect(cron.minute.isSet(0));
+    try std.testing.expect(cron.minute.isSet(10));
+    try std.testing.expect(cron.minute.isSet(20));
+    try std.testing.expect(cron.minute.isSet(30));
+    try std.testing.expect(!cron.minute.isSet(5));
+}
+
+test "parse invalid step zero" {
+    try std.testing.expectError(error.InvalidField, parse("*/0 * * * *"));
+}
+
+test "parse invalid reversed range" {
+    try std.testing.expectError(error.InvalidField, parse("* 17-9 * * *"));
+}
+
+test "parseField empty string" {
+    try std.testing.expectError(error.InvalidField, parseField("", 0, 59));
+}
+
+test "parseField out of range" {
+    try std.testing.expectError(error.InvalidField, parseField("60", 0, 59));
+}
+
+// === New Tests (batch 2) ===
+
+test "FieldSet set maximum value 63" {
+    var fs = FieldSet{};
+    fs.set(63);
+    try std.testing.expect(fs.isSet(63));
+    try std.testing.expectEqual(@as(u32, 1), fs.count());
+}
+
+test "FieldSet set minimum value 0" {
+    var fs = FieldSet{};
+    fs.set(0);
+    try std.testing.expect(fs.isSet(0));
+    try std.testing.expect(!fs.isSet(1));
+}
+
+test "FieldSet setAll full range 0-59" {
+    var fs = FieldSet{};
+    fs.setAll(0, 59);
+    try std.testing.expectEqual(@as(u32, 60), fs.count());
+    try std.testing.expect(fs.isSet(0));
+    try std.testing.expect(fs.isSet(59));
+}
+
+test "FieldSet setStep every 10 from 0 to 59" {
+    var fs = FieldSet{};
+    fs.setStep(0, 59, 10);
+    try std.testing.expect(fs.isSet(0));
+    try std.testing.expect(fs.isSet(10));
+    try std.testing.expect(fs.isSet(20));
+    try std.testing.expect(fs.isSet(30));
+    try std.testing.expect(fs.isSet(40));
+    try std.testing.expect(fs.isSet(50));
+    try std.testing.expect(!fs.isSet(59));
+    try std.testing.expectEqual(@as(u32, 6), fs.count());
+}
+
+test "FieldSet setStep every 30 from 0 to 59" {
+    var fs = FieldSet{};
+    fs.setStep(0, 59, 30);
+    try std.testing.expect(fs.isSet(0));
+    try std.testing.expect(fs.isSet(30));
+    try std.testing.expect(!fs.isSet(15));
+    try std.testing.expectEqual(@as(u32, 2), fs.count());
+}
+
+test "FieldSet multiple set calls idempotent" {
+    var fs = FieldSet{};
+    fs.set(5);
+    fs.set(5);
+    fs.set(5);
+    try std.testing.expectEqual(@as(u32, 1), fs.count());
+}
+
+test "FieldSet setAll then check boundary" {
+    var fs = FieldSet{};
+    fs.setAll(10, 20);
+    try std.testing.expect(!fs.isSet(9));
+    try std.testing.expect(fs.isSet(10));
+    try std.testing.expect(fs.isSet(20));
+    try std.testing.expect(!fs.isSet(21));
+    try std.testing.expectEqual(@as(u32, 11), fs.count());
+}
+
+test "parse every hour" {
+    const cron = try parse("0 * * * *");
+    try std.testing.expect(cron.minute.isSet(0));
+    try std.testing.expect(!cron.minute.isSet(1));
+    try std.testing.expectEqual(@as(u32, 24), cron.hour.count());
+}
+
+test "parse every 2 hours" {
+    const cron = try parse("0 */2 * * *");
+    try std.testing.expect(cron.hour.isSet(0));
+    try std.testing.expect(cron.hour.isSet(2));
+    try std.testing.expect(cron.hour.isSet(22));
+    try std.testing.expect(!cron.hour.isSet(1));
+    try std.testing.expect(!cron.hour.isSet(23));
+    try std.testing.expectEqual(@as(u32, 12), cron.hour.count());
+}
+
+test "parse specific day of month" {
+    const cron = try parse("0 0 15 * *");
+    try std.testing.expect(cron.day_of_month.isSet(15));
+    try std.testing.expect(!cron.day_of_month.isSet(14));
+    try std.testing.expect(!cron.day_of_month.isSet(16));
+    try std.testing.expectEqual(@as(u32, 1), cron.day_of_month.count());
+}
+
+test "parse Sunday only" {
+    const cron = try parse("0 0 * * 0");
+    try std.testing.expect(cron.day_of_week.isSet(0));
+    try std.testing.expect(!cron.day_of_week.isSet(1));
+    try std.testing.expectEqual(@as(u32, 1), cron.day_of_week.count());
+}
+
+test "parse Saturday and Sunday" {
+    const cron = try parse("0 0 * * 0-1");
+    try std.testing.expect(cron.day_of_week.isSet(0));
+    try std.testing.expect(cron.day_of_week.isSet(1));
+    try std.testing.expect(!cron.day_of_week.isSet(2));
+}
+
+test "parse all months" {
+    const cron = try parse("0 0 1 * *");
+    try std.testing.expectEqual(@as(u32, 12), cron.month.count());
+}
+
+test "parse specific month range" {
+    const cron = try parse("0 0 1 3-6 *");
+    try std.testing.expect(cron.month.isSet(3));
+    try std.testing.expect(cron.month.isSet(4));
+    try std.testing.expect(cron.month.isSet(5));
+    try std.testing.expect(cron.month.isSet(6));
+    try std.testing.expect(!cron.month.isSet(2));
+    try std.testing.expect(!cron.month.isSet(7));
+}
+
+test "CronExpr matches every minute scenario" {
+    const cron = try parse("* * * * *");
+    // Should match any valid time
+    try std.testing.expect(cron.matches(0, 0, 1, 1, 0));
+    try std.testing.expect(cron.matches(59, 23, 31, 12, 6));
+    try std.testing.expect(cron.matches(30, 12, 15, 6, 3));
+}
+
+test "CronExpr does not match wrong minute" {
+    const cron = try parse("15 * * * *");
+    try std.testing.expect(cron.matches(15, 0, 1, 1, 0));
+    try std.testing.expect(!cron.matches(14, 0, 1, 1, 0));
+    try std.testing.expect(!cron.matches(16, 0, 1, 1, 0));
+}
+
+test "CronExpr does not match wrong day of week" {
+    const cron = try parse("0 0 * * 5");
+    try std.testing.expect(cron.matches(0, 0, 1, 1, 5));
+    try std.testing.expect(!cron.matches(0, 0, 1, 1, 4));
+    try std.testing.expect(!cron.matches(0, 0, 1, 1, 6));
+}
+
+test "parse with extra spaces between fields" {
+    const cron = try parse("0  0  *  *  *");
+    try std.testing.expect(cron.minute.isSet(0));
+    try std.testing.expect(cron.hour.isSet(0));
+}
+
+test "parse invalid non-numeric field" {
+    try std.testing.expectError(error.InvalidField, parse("abc * * * *"));
+}
+
+test "parse empty string" {
+    try std.testing.expectError(error.InvalidField, parse(""));
+}
+
+test "parse single field" {
+    try std.testing.expectError(error.InvalidField, parse("*"));
+}
+
+test "parseField wildcard range" {
+    const fs = try parseField("*", 0, 59);
+    try std.testing.expectEqual(@as(u32, 60), fs.count());
+}
+
+test "parseField step from range" {
+    const fs = try parseField("1-10/3", 0, 59);
+    try std.testing.expect(fs.isSet(1));
+    try std.testing.expect(fs.isSet(4));
+    try std.testing.expect(fs.isSet(7));
+    try std.testing.expect(fs.isSet(10));
+    try std.testing.expect(!fs.isSet(2));
+    try std.testing.expect(!fs.isSet(0));
+}
+
+test "parseField value at boundary" {
+    const fs = try parseField("0", 0, 59);
+    try std.testing.expect(fs.isSet(0));
+    try std.testing.expectEqual(@as(u32, 1), fs.count());
+
+    const fs2 = try parseField("59", 0, 59);
+    try std.testing.expect(fs2.isSet(59));
+    try std.testing.expectEqual(@as(u32, 1), fs2.count());
+}
+
+test "parseField below minimum" {
+    try std.testing.expectError(error.InvalidField, parseField("0", 1, 12));
+}
+
+test "parseField value exactly at max" {
+    const fs = try parseField("23", 0, 23);
+    try std.testing.expect(fs.isSet(23));
+}

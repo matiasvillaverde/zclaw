@@ -221,3 +221,307 @@ test "HookRegistry register returns false when full" {
     // Should fail on 17th handler
     try std.testing.expect(!reg.register(.message_received, testHandler));
 }
+
+// --- Additional Tests ---
+
+test "HookEvent all labels are non-empty" {
+    for (std.meta.tags(HookEvent)) |event| {
+        try std.testing.expect(event.label().len > 0);
+    }
+}
+
+test "HookEvent message_sent label" {
+    try std.testing.expectEqualStrings("message_sent", HookEvent.message_sent.label());
+}
+
+test "HookEvent tool_call_after label" {
+    try std.testing.expectEqualStrings("tool_call_after", HookEvent.tool_call_after.label());
+}
+
+test "HookEvent session_end label" {
+    try std.testing.expectEqualStrings("session_end", HookEvent.session_end.label());
+}
+
+test "HookEvent agent_turn label" {
+    try std.testing.expectEqualStrings("agent_turn", HookEvent.agent_turn.label());
+}
+
+test "HookRegistry isolated events" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_received, testHandler);
+
+    // Emitting a different event should not trigger message_received handler
+    reg.emit(.{ .event = .session_start });
+    try std.testing.expectEqual(@as(u32, 0), test_counter);
+}
+
+test "HookRegistry clear does not affect other events" {
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_received, testHandler);
+    _ = reg.register(.session_start, testHandler);
+
+    reg.clear(.message_received);
+    try std.testing.expectEqual(@as(usize, 0), reg.hookCount(.message_received));
+    try std.testing.expectEqual(@as(usize, 1), reg.hookCount(.session_start));
+}
+
+test "HookContext defaults" {
+    const ctx = HookContext{ .event = .message_received };
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.agent_id);
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.data);
+}
+
+test "HookRegistry emit with data" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.tool_call_before, testHandler);
+
+    reg.emit(.{
+        .event = .tool_call_before,
+        .agent_id = "agent-1",
+        .data = "{\"tool\":\"bash\"}",
+    });
+    try std.testing.expectEqual(@as(u32, 1), test_counter);
+}
+
+test "MAX_HANDLERS_PER_EVENT is 16" {
+    try std.testing.expectEqual(@as(usize, 16), MAX_HANDLERS_PER_EVENT);
+}
+
+test "HookRegistry clearAll resets emit counter" {
+    var reg = HookRegistry.init();
+    reg.emit(.{ .event = .agent_complete });
+    reg.emit(.{ .event = .agent_complete });
+    try std.testing.expectEqual(@as(u64, 2), reg.total_emits);
+
+    reg.clearAll();
+    try std.testing.expectEqual(@as(u64, 0), reg.total_emits);
+}
+
+// === New Tests (batch 2) ===
+
+test "HookRegistry register same handler twice" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_received, testHandler);
+    _ = reg.register(.message_received, testHandler);
+
+    try std.testing.expectEqual(@as(usize, 2), reg.hookCount(.message_received));
+
+    reg.emit(.{ .event = .message_received });
+    // Both handlers fire, each incrementing by 1
+    try std.testing.expectEqual(@as(u32, 2), test_counter);
+}
+
+test "HookRegistry register different events independently" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_received, testHandler);
+    _ = reg.register(.session_start, testHandler2);
+
+    try std.testing.expectEqual(@as(usize, 1), reg.hookCount(.message_received));
+    try std.testing.expectEqual(@as(usize, 1), reg.hookCount(.session_start));
+
+    reg.emit(.{ .event = .message_received });
+    try std.testing.expectEqual(@as(u32, 1), test_counter);
+
+    reg.emit(.{ .event = .session_start });
+    try std.testing.expectEqual(@as(u32, 11), test_counter);
+}
+
+test "HookRegistry emit increments total even with no handlers" {
+    var reg = HookRegistry.init();
+    for (0..5) |_| {
+        reg.emit(.{ .event = .agent_complete });
+    }
+    try std.testing.expectEqual(@as(u64, 5), reg.total_emits);
+}
+
+test "HookRegistry clear only one event preserves others" {
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_received, testHandler);
+    _ = reg.register(.message_sent, testHandler);
+    _ = reg.register(.session_start, testHandler);
+    _ = reg.register(.session_end, testHandler);
+
+    try std.testing.expectEqual(@as(usize, 4), reg.totalHandlers());
+
+    reg.clear(.message_received);
+    try std.testing.expectEqual(@as(usize, 3), reg.totalHandlers());
+    try std.testing.expectEqual(@as(usize, 0), reg.hookCount(.message_received));
+    try std.testing.expectEqual(@as(usize, 1), reg.hookCount(.message_sent));
+    try std.testing.expectEqual(@as(usize, 1), reg.hookCount(.session_start));
+    try std.testing.expectEqual(@as(usize, 1), reg.hookCount(.session_end));
+}
+
+test "HookRegistry clear idempotent" {
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_received, testHandler);
+
+    reg.clear(.message_received);
+    try std.testing.expectEqual(@as(usize, 0), reg.hookCount(.message_received));
+
+    // Clearing again should be fine
+    reg.clear(.message_received);
+    try std.testing.expectEqual(@as(usize, 0), reg.hookCount(.message_received));
+}
+
+test "HookRegistry clearAll with populated handlers" {
+    var reg = HookRegistry.init();
+    for (std.meta.tags(HookEvent)) |event| {
+        _ = reg.register(event, testHandler);
+    }
+
+    try std.testing.expectEqual(@as(usize, 8), reg.totalHandlers());
+
+    reg.clearAll();
+    try std.testing.expectEqual(@as(usize, 0), reg.totalHandlers());
+    for (std.meta.tags(HookEvent)) |event| {
+        try std.testing.expectEqual(@as(usize, 0), reg.hookCount(event));
+    }
+}
+
+test "HookRegistry total emits across events" {
+    var reg = HookRegistry.init();
+    reg.emit(.{ .event = .message_received });
+    reg.emit(.{ .event = .message_sent });
+    reg.emit(.{ .event = .tool_call_before });
+    reg.emit(.{ .event = .tool_call_after });
+    reg.emit(.{ .event = .session_start });
+    reg.emit(.{ .event = .session_end });
+    reg.emit(.{ .event = .agent_turn });
+    reg.emit(.{ .event = .agent_complete });
+
+    try std.testing.expectEqual(@as(u64, 8), reg.total_emits);
+}
+
+test "HookRegistry hookCount zero for all events initially" {
+    const reg = HookRegistry.init();
+    for (std.meta.tags(HookEvent)) |event| {
+        try std.testing.expectEqual(@as(usize, 0), reg.hookCount(event));
+    }
+}
+
+test "HookRegistry multiple handlers execution order" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.agent_turn, testHandler);  // +1
+    _ = reg.register(.agent_turn, testHandler2); // +10
+
+    reg.emit(.{ .event = .agent_turn });
+    // Both should have fired: 1 + 10 = 11
+    try std.testing.expectEqual(@as(u32, 11), test_counter);
+}
+
+test "HookContext with all fields" {
+    const ctx = HookContext{
+        .event = .message_received,
+        .agent_id = "test-agent-123",
+        .data = "{\"content\":\"hello\"}",
+    };
+    try std.testing.expectEqual(HookEvent.message_received, ctx.event);
+    try std.testing.expectEqualStrings("test-agent-123", ctx.agent_id.?);
+    try std.testing.expectEqualStrings("{\"content\":\"hello\"}", ctx.data.?);
+}
+
+test "HookContext with null agent_id and data" {
+    const ctx = HookContext{ .event = .session_end };
+    try std.testing.expect(ctx.agent_id == null);
+    try std.testing.expect(ctx.data == null);
+}
+
+test "HookRegistry register returns true up to limit" {
+    var reg = HookRegistry.init();
+    var count: usize = 0;
+    while (count < MAX_HANDLERS_PER_EVENT) : (count += 1) {
+        try std.testing.expect(reg.register(.tool_call_after, testHandler));
+    }
+    try std.testing.expectEqual(@as(usize, MAX_HANDLERS_PER_EVENT), reg.hookCount(.tool_call_after));
+    // One more should fail
+    try std.testing.expect(!reg.register(.tool_call_after, testHandler));
+}
+
+test "HookRegistry register full on one event does not affect others" {
+    var reg = HookRegistry.init();
+    // Fill up message_received
+    for (0..MAX_HANDLERS_PER_EVENT) |_| {
+        _ = reg.register(.message_received, testHandler);
+    }
+    try std.testing.expect(!reg.register(.message_received, testHandler));
+
+    // Other events should still accept handlers
+    try std.testing.expect(reg.register(.session_start, testHandler));
+    try std.testing.expect(reg.register(.agent_complete, testHandler));
+}
+
+test "HookRegistry emit after clear does nothing" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_received, testHandler);
+
+    reg.clear(.message_received);
+    reg.emit(.{ .event = .message_received });
+
+    try std.testing.expectEqual(@as(u32, 0), test_counter);
+    try std.testing.expectEqual(@as(u64, 1), reg.total_emits);
+}
+
+test "HookRegistry re-register after clear" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.session_start, testHandler);
+
+    reg.clear(.session_start);
+    try std.testing.expectEqual(@as(usize, 0), reg.hookCount(.session_start));
+
+    _ = reg.register(.session_start, testHandler2);
+    try std.testing.expectEqual(@as(usize, 1), reg.hookCount(.session_start));
+
+    reg.emit(.{ .event = .session_start });
+    try std.testing.expectEqual(@as(u32, 10), test_counter);
+}
+
+test "HookEvent enum has 8 variants" {
+    const tags = std.meta.tags(HookEvent);
+    try std.testing.expectEqual(@as(usize, 8), tags.len);
+}
+
+test "HookEvent labels are all distinct" {
+    const tags = std.meta.tags(HookEvent);
+    for (tags, 0..) |e1, i| {
+        for (tags[i + 1 ..]) |e2| {
+            try std.testing.expect(!std.mem.eql(u8, e1.label(), e2.label()));
+        }
+    }
+}
+
+test "HookRegistry totalHandlers reflects all events" {
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_received, testHandler);
+    _ = reg.register(.message_received, testHandler2);
+    _ = reg.register(.session_start, testHandler);
+    _ = reg.register(.agent_turn, testHandler);
+    _ = reg.register(.agent_turn, testHandler);
+    _ = reg.register(.agent_turn, testHandler);
+
+    try std.testing.expectEqual(@as(usize, 6), reg.totalHandlers());
+}
+
+test "HookRegistry emit with agent_id only" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.agent_complete, testHandler);
+
+    reg.emit(.{ .event = .agent_complete, .agent_id = "agent-99" });
+    try std.testing.expectEqual(@as(u32, 1), test_counter);
+}
+
+test "HookRegistry emit with data only" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.tool_call_before, testHandler);
+
+    reg.emit(.{ .event = .tool_call_before, .data = "{\"tool\":\"read\"}" });
+    try std.testing.expectEqual(@as(u32, 1), test_counter);
+}

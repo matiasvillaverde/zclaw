@@ -331,3 +331,277 @@ test "BUILTIN_WEB_FETCH definition" {
     try std.testing.expectEqual(registry.ToolCategory.web, BUILTIN_WEB_FETCH.category);
     try std.testing.expect(BUILTIN_WEB_FETCH.parameters_json != null);
 }
+
+// --- Additional Tests ---
+
+test "stripHtml nested tags" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("<div><p><span>text</span></p></div>", &buf);
+    try std.testing.expectEqualStrings("text", result);
+}
+
+test "stripHtml with attributes" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("<a href=\"url\" class=\"link\">Click</a>", &buf);
+    try std.testing.expectEqualStrings("Click", result);
+}
+
+test "stripHtml self-closing tags" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("before<br/>after", &buf);
+    try std.testing.expectEqualStrings("beforeafter", result);
+}
+
+test "stripHtml multiple entities" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("&lt;&gt;&amp;&quot;&apos;", &buf);
+    try std.testing.expectEqualStrings("<>&\"'", result);
+}
+
+test "stripHtml unknown entity passthrough" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("&unknown;test", &buf);
+    try std.testing.expectEqualStrings("&unknown;test", result);
+}
+
+test "stripHtml mixed content" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("<b>Bold</b> and <i>italic</i> &amp; more", &buf);
+    try std.testing.expectEqualStrings("Bold and italic & more", result);
+}
+
+test "webFetchHandler blocks 192.168.x.x" {
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"http://192.168.1.1\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("URL blocked: private/internal address", result.error_message.?);
+}
+
+test "webFetchHandler blocks localhost" {
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"http://localhost:8080/admin\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("URL blocked: private/internal address", result.error_message.?);
+}
+
+test "BUILTIN_WEB_FETCH parameters contain url" {
+    const params = BUILTIN_WEB_FETCH.parameters_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, params, "url") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "required") != null);
+}
+
+test "MAX_RESPONSE_SIZE is 1MB" {
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), MAX_RESPONSE_SIZE);
+}
+
+test "MAX_OUTPUT_SIZE is 64KB" {
+    try std.testing.expectEqual(@as(usize, 64 * 1024), MAX_OUTPUT_SIZE);
+}
+
+test "webFetchHandler HTTP 500 error" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 500, .body = "Internal Server Error" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com/error\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_message.?, "non-success") != null);
+}
+
+// === New Tests (batch 2) ===
+
+test "stripHtml only tags no text" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("<div><span></span></div>", &buf);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "stripHtml unclosed tag" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("<p>hello<br", &buf);
+    // Unclosed tag: everything after < is treated as tag content
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "stripHtml script-like tags" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("<script>var x=1;</script>visible", &buf);
+    // Tags are stripped but text inside script tag is kept by simple parser
+    try std.testing.expect(std.mem.indexOf(u8, result, "visible") != null);
+}
+
+test "stripHtml multiple nbsp" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("a&nbsp;&nbsp;&nbsp;b", &buf);
+    try std.testing.expectEqualStrings("a   b", result);
+}
+
+test "stripHtml ampersand at end" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("test&", &buf);
+    try std.testing.expectEqualStrings("test&", result);
+}
+
+test "stripHtml mixed entities and tags" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("<b>&lt;code&gt;</b>", &buf);
+    try std.testing.expectEqualStrings("<code>", result);
+}
+
+test "stripHtml consecutive tags" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("<h1></h1><h2></h2><p>text</p>", &buf);
+    try std.testing.expectEqualStrings("text", result);
+}
+
+test "stripHtml preserves whitespace" {
+    var buf: [1024]u8 = undefined;
+    const result = stripHtml("  hello   world  ", &buf);
+    try std.testing.expectEqualStrings("  hello   world  ", result);
+}
+
+test "stripHtml small output buffer" {
+    var buf: [5]u8 = undefined;
+    const result = stripHtml("hello world this is long", &buf);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "stripHtml angle brackets in text" {
+    var buf: [1024]u8 = undefined;
+    // > without matching < is just text
+    const result = stripHtml("5 > 3 is true", &buf);
+    // The > closes the implicit 'tag' started by nothing
+    try std.testing.expect(result.len > 0);
+}
+
+test "webFetchHandler blocks 10.x.x.x" {
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"http://10.0.0.1:80\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("URL blocked: private/internal address", result.error_message.?);
+}
+
+test "webFetchHandler blocks 172.16.x.x" {
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"http://172.16.0.1\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("URL blocked: private/internal address", result.error_message.?);
+}
+
+test "webFetchHandler HTTP 301 redirect" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 301, .body = "" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com/old\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_message.?, "non-success") != null);
+}
+
+test "webFetchHandler HTTP 403 forbidden" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 403, .body = "Forbidden" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com/secret\"}", &buf);
+    try std.testing.expect(!result.success);
+}
+
+test "webFetchHandler HTTP 429 rate limit" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 429, .body = "Rate Limited" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com/api\"}", &buf);
+    try std.testing.expect(!result.success);
+}
+
+test "webFetchHandler HTTP 200 with empty body" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com/empty\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("", result.output);
+}
+
+test "webFetchHandler with entities in response" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "<p>A &amp; B &lt; C</p>" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    setHttpClient(&client);
+    defer clearHttpClient();
+
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("A & B < C", result.output);
+}
+
+test "BUILTIN_WEB_FETCH description is non-empty" {
+    try std.testing.expect(BUILTIN_WEB_FETCH.description.len > 0);
+}
+
+test "BUILTIN_WEB_FETCH is not sandboxed" {
+    try std.testing.expect(!BUILTIN_WEB_FETCH.sandboxed);
+}
+
+test "BUILTIN_WEB_FETCH does not require approval" {
+    try std.testing.expect(!BUILTIN_WEB_FETCH.requires_approval);
+}
+
+test "setHttpClient and clearHttpClient toggle" {
+    clearHttpClient();
+    // After clearing, fetching should fail with no client
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"https://example.com\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("HTTP client not initialized", result.error_message.?);
+}
+
+test "webFetchHandler blocks 0.0.0.0" {
+    var buf: [4096]u8 = undefined;
+    const result = webFetchHandler("{\"url\":\"http://0.0.0.0:8080\"}", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("URL blocked: private/internal address", result.error_message.?);
+}
