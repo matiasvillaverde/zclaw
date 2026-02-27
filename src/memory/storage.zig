@@ -377,3 +377,301 @@ test "SearchRow fields" {
     try std.testing.expectEqual(@as(u32, 3), row.chunk_index);
     try std.testing.expectEqualStrings("docs/readme.md", row.source_file.?);
 }
+
+// --- New Tests ---
+
+test "SearchRow defaults" {
+    const row = SearchRow{
+        .chunk_id = 0,
+        .text = "",
+    };
+    try std.testing.expectEqual(@as(u32, 0), row.chunk_index);
+    try std.testing.expect(row.source_file == null);
+}
+
+test "freeSearchRows empty slice" {
+    const allocator = std.testing.allocator;
+    const rows = try allocator.alloc(SearchRow, 0);
+    freeSearchRows(allocator, rows);
+}
+
+test "freeSearchRows with allocated data" {
+    const allocator = std.testing.allocator;
+    const rows = try allocator.alloc(SearchRow, 2);
+    rows[0] = .{
+        .chunk_id = 1,
+        .text = try allocator.dupe(u8, "hello"),
+        .source_file = try allocator.dupe(u8, "a.md"),
+    };
+    rows[1] = .{
+        .chunk_id = 2,
+        .text = try allocator.dupe(u8, "world"),
+        .source_file = null,
+    };
+    freeSearchRows(allocator, rows);
+}
+
+test "SqliteStorage insertDocument returns incrementing IDs" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const id1 = try storage.insertDocument("a.md", 1, 1);
+    const id2 = try storage.insertDocument("b.md", 2, 1);
+    const id3 = try storage.insertDocument("c.md", 3, 1);
+
+    try std.testing.expect(id2 > id1);
+    try std.testing.expect(id3 > id2);
+}
+
+test "SqliteStorage insertDocument with zero hash" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const id = try storage.insertDocument("zero.md", 0, 0);
+    try std.testing.expect(id > 0);
+
+    const count = try storage.documentCount();
+    try std.testing.expectEqual(@as(i64, 1), count);
+}
+
+test "SqliteStorage insertDocument with max u64 hash" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const id = try storage.insertDocument("max.md", std.math.maxInt(u64), 5);
+    try std.testing.expect(id > 0);
+
+    // Verify reindex check works with large hash
+    try std.testing.expect(!try storage.needsReindex("max.md", std.math.maxInt(u64)));
+    try std.testing.expect(try storage.needsReindex("max.md", 0));
+}
+
+test "SqliteStorage insertChunk and chunkCount multiple docs" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc1 = try storage.insertDocument("a.md", 1, 2);
+    const doc2 = try storage.insertDocument("b.md", 2, 3);
+
+    try storage.insertChunk(doc1, "chunk A1", 0);
+    try storage.insertChunk(doc1, "chunk A2", 1);
+    try storage.insertChunk(doc2, "chunk B1", 0);
+    try storage.insertChunk(doc2, "chunk B2", 1);
+    try storage.insertChunk(doc2, "chunk B3", 2);
+
+    const count = try storage.chunkCount();
+    try std.testing.expectEqual(@as(i64, 5), count);
+}
+
+test "SqliteStorage deleteByPath nonexistent is safe" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    // Should not error on nonexistent path
+    try storage.deleteByPath("nonexistent.md");
+    const count = try storage.documentCount();
+    try std.testing.expectEqual(@as(i64, 0), count);
+}
+
+test "SqliteStorage deleteByPath only deletes target" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc1 = try storage.insertDocument("a.md", 1, 1);
+    try storage.insertChunk(doc1, "chunk A", 0);
+    const doc2 = try storage.insertDocument("b.md", 2, 1);
+    try storage.insertChunk(doc2, "chunk B", 0);
+
+    try storage.deleteByPath("a.md");
+
+    try std.testing.expectEqual(@as(i64, 1), try storage.documentCount());
+    try std.testing.expectEqual(@as(i64, 1), try storage.chunkCount());
+}
+
+test "SqliteStorage needsReindex with replaced document" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    _ = try storage.insertDocument("test.md", 100, 1);
+    try std.testing.expect(!try storage.needsReindex("test.md", 100));
+
+    // Replace with new hash
+    _ = try storage.insertDocument("test.md", 200, 2);
+    try std.testing.expect(!try storage.needsReindex("test.md", 200));
+    try std.testing.expect(try storage.needsReindex("test.md", 100));
+}
+
+test "SqliteStorage searchChunks case sensitive" {
+    const allocator = std.testing.allocator;
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc_id = try storage.insertDocument("test.md", 1, 2);
+    try storage.insertChunk(doc_id, "Hello World", 0);
+    try storage.insertChunk(doc_id, "hello world", 1);
+
+    // LIKE is case-insensitive in SQLite by default for ASCII
+    const results = try storage.searchChunks(allocator, "hello", 10);
+    defer freeSearchRows(allocator, results);
+
+    try std.testing.expect(results.len >= 1);
+}
+
+test "SqliteStorage searchChunks across multiple documents" {
+    const allocator = std.testing.allocator;
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc1 = try storage.insertDocument("a.md", 1, 1);
+    try storage.insertChunk(doc1, "Zig programming", 0);
+    const doc2 = try storage.insertDocument("b.md", 2, 1);
+    try storage.insertChunk(doc2, "Zig compiler", 0);
+    const doc3 = try storage.insertDocument("c.md", 3, 1);
+    try storage.insertChunk(doc3, "Rust language", 0);
+
+    const results = try storage.searchChunks(allocator, "Zig", 10);
+    defer freeSearchRows(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "SqliteStorage searchChunks result has correct source_file" {
+    const allocator = std.testing.allocator;
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc_id = try storage.insertDocument("docs/api.md", 1, 1);
+    try storage.insertChunk(doc_id, "API documentation", 0);
+
+    const results = try storage.searchChunks(allocator, "API", 10);
+    defer freeSearchRows(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("docs/api.md", results[0].source_file.?);
+}
+
+test "SqliteStorage searchChunks result chunk_index" {
+    const allocator = std.testing.allocator;
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc_id = try storage.insertDocument("test.md", 1, 3);
+    try storage.insertChunk(doc_id, "match at index 0", 0);
+    try storage.insertChunk(doc_id, "no result here", 1);
+    try storage.insertChunk(doc_id, "match at index 2", 2);
+
+    const results = try storage.searchChunks(allocator, "match at", 10);
+    defer freeSearchRows(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "SqliteStorage searchChunks with limit 1" {
+    const allocator = std.testing.allocator;
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc_id = try storage.insertDocument("test.md", 1, 3);
+    try storage.insertChunk(doc_id, "match one", 0);
+    try storage.insertChunk(doc_id, "match two", 1);
+    try storage.insertChunk(doc_id, "match three", 2);
+
+    const results = try storage.searchChunks(allocator, "match", 1);
+    defer freeSearchRows(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "SqliteStorage getChunksByPath ordered by chunk_index" {
+    const allocator = std.testing.allocator;
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc_id = try storage.insertDocument("test.md", 1, 3);
+    // Insert out of order
+    try storage.insertChunk(doc_id, "Third", 2);
+    try storage.insertChunk(doc_id, "First", 0);
+    try storage.insertChunk(doc_id, "Second", 1);
+
+    const chunks = try storage.getChunksByPath(allocator, "test.md");
+    defer freeSearchRows(allocator, chunks);
+
+    try std.testing.expectEqual(@as(usize, 3), chunks.len);
+    try std.testing.expectEqualStrings("First", chunks[0].text);
+    try std.testing.expectEqualStrings("Second", chunks[1].text);
+    try std.testing.expectEqualStrings("Third", chunks[2].text);
+}
+
+test "SqliteStorage getChunksByPath has correct source_file" {
+    const allocator = std.testing.allocator;
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc_id = try storage.insertDocument("mypath.md", 1, 1);
+    try storage.insertChunk(doc_id, "content", 0);
+
+    const chunks = try storage.getChunksByPath(allocator, "mypath.md");
+    defer freeSearchRows(allocator, chunks);
+
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqualStrings("mypath.md", chunks[0].source_file.?);
+}
+
+test "SqliteStorage empty chunk text" {
+    const allocator = std.testing.allocator;
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc_id = try storage.insertDocument("empty.md", 1, 1);
+    try storage.insertChunk(doc_id, "", 0);
+
+    const count = try storage.chunkCount();
+    try std.testing.expectEqual(@as(i64, 1), count);
+
+    const chunks = try storage.getChunksByPath(allocator, "empty.md");
+    defer freeSearchRows(allocator, chunks);
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqualStrings("", chunks[0].text);
+}
+
+test "SqliteStorage long document path" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const long_path = "a" ** 200 ++ ".md";
+    const id = try storage.insertDocument(long_path, 42, 0);
+    try std.testing.expect(id > 0);
+    try std.testing.expect(!try storage.needsReindex(long_path, 42));
+}
+
+test "SqliteStorage document count after multiple operations" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    _ = try storage.insertDocument("a.md", 1, 0);
+    _ = try storage.insertDocument("b.md", 2, 0);
+    _ = try storage.insertDocument("c.md", 3, 0);
+    try std.testing.expectEqual(@as(i64, 3), try storage.documentCount());
+
+    try storage.deleteByPath("b.md");
+    try std.testing.expectEqual(@as(i64, 2), try storage.documentCount());
+
+    _ = try storage.insertDocument("d.md", 4, 0);
+    try std.testing.expectEqual(@as(i64, 3), try storage.documentCount());
+}
+
+test "SqliteStorage chunk count after delete" {
+    var storage = try SqliteStorage.openMemory();
+    defer storage.close();
+
+    const doc1 = try storage.insertDocument("a.md", 1, 2);
+    try storage.insertChunk(doc1, "A1", 0);
+    try storage.insertChunk(doc1, "A2", 1);
+    const doc2 = try storage.insertDocument("b.md", 2, 1);
+    try storage.insertChunk(doc2, "B1", 0);
+
+    try std.testing.expectEqual(@as(i64, 3), try storage.chunkCount());
+
+    try storage.deleteByPath("a.md");
+    try std.testing.expectEqual(@as(i64, 1), try storage.chunkCount());
+}

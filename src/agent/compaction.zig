@@ -126,3 +126,207 @@ test "findCompactionCutoff" {
     try std.testing.expectEqual(@as(usize, 10), findCompactionCutoff(20, 10));
     try std.testing.expectEqual(@as(usize, 90), findCompactionCutoff(100, 10));
 }
+
+// --- Additional Tests ---
+
+test "needsCompaction zero bytes" {
+    try std.testing.expect(!needsCompaction(0, 200_000));
+}
+
+test "needsCompaction zero context window" {
+    // 0 token context means threshold = 0, any bytes > 0 triggers compaction
+    try std.testing.expect(needsCompaction(4, 0));
+    try std.testing.expect(!needsCompaction(0, 0));
+}
+
+test "needsCompaction small context window" {
+    // 100 tokens, threshold = 80 tokens = 320 bytes
+    try std.testing.expect(!needsCompaction(320, 100));
+    try std.testing.expect(needsCompaction(324, 100));
+}
+
+test "needsCompaction large content exactly at threshold" {
+    // 10000 tokens, threshold = 8000 tokens = 32000 bytes
+    try std.testing.expect(!needsCompaction(32000, 10000));
+    try std.testing.expect(needsCompaction(32004, 10000));
+}
+
+test "estimateTokens single char" {
+    try std.testing.expectEqual(@as(u32, 1), estimateTokens("a"));
+}
+
+test "estimateTokens exactly 4 chars" {
+    try std.testing.expectEqual(@as(u32, 1), estimateTokens("abcd"));
+}
+
+test "estimateTokens large text" {
+    const text = "a" ** 10000;
+    try std.testing.expectEqual(@as(u32, 2500), estimateTokens(text));
+}
+
+test "estimateTokens 3 chars" {
+    // 3 / 4 = 0, but max(1, 0) = 1
+    try std.testing.expectEqual(@as(u32, 1), estimateTokens("abc"));
+}
+
+test "buildCompactionPrompt empty preview" {
+    var buf: [16384]u8 = undefined;
+    const prompt = try buildCompactionPrompt(&buf, "");
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Summarize") != null);
+}
+
+test "buildCompactionPrompt contains key instructions" {
+    var buf: [16384]u8 = undefined;
+    const prompt = try buildCompactionPrompt(&buf, "test");
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "key topics") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "decisions made") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "unresolved tasks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "500 words") != null);
+}
+
+test "createEntry with zero bytes saved" {
+    const entry = createEntry("No content removed", 0, 0);
+    try std.testing.expectEqual(@as(u32, 0), entry.estimated_tokens_saved);
+    try std.testing.expectEqual(@as(u32, 0), entry.original_message_count);
+}
+
+test "createEntry timestamp is recent" {
+    const before = std.time.milliTimestamp();
+    const entry = createEntry("summary", 10, 4000);
+    const after = std.time.milliTimestamp();
+    try std.testing.expect(entry.compacted_at_ms >= before);
+    try std.testing.expect(entry.compacted_at_ms <= after);
+}
+
+test "createEntry token savings calculation" {
+    // 8000 bytes / 4 = 2000 tokens
+    const entry = createEntry("s", 25, 8000);
+    try std.testing.expectEqual(@as(u32, 2000), entry.estimated_tokens_saved);
+}
+
+test "findCompactionCutoff zero messages" {
+    try std.testing.expectEqual(@as(usize, 0), findCompactionCutoff(0, 10));
+}
+
+test "findCompactionCutoff keep one" {
+    try std.testing.expectEqual(@as(usize, 99), findCompactionCutoff(100, 1));
+}
+
+test "findCompactionCutoff keep all" {
+    try std.testing.expectEqual(@as(usize, 0), findCompactionCutoff(5, 5));
+    try std.testing.expectEqual(@as(usize, 0), findCompactionCutoff(5, 100));
+}
+
+test "CompactionEntry struct fields" {
+    const entry = CompactionEntry{
+        .summary = "test",
+        .original_message_count = 42,
+        .compacted_at_ms = 12345,
+        .estimated_tokens_saved = 500,
+    };
+    try std.testing.expectEqualStrings("test", entry.summary);
+    try std.testing.expectEqual(@as(u32, 42), entry.original_message_count);
+    try std.testing.expectEqual(@as(i64, 12345), entry.compacted_at_ms);
+    try std.testing.expectEqual(@as(u32, 500), entry.estimated_tokens_saved);
+}
+
+// ===== New tests added for comprehensive coverage =====
+
+test "needsCompaction just under threshold" {
+    // 500 tokens context, threshold = 400 tokens = 1600 bytes
+    // 1600 bytes / 4 = 400 tokens, 400 > 400 = false
+    try std.testing.expect(!needsCompaction(1600, 500));
+}
+
+test "needsCompaction just over threshold" {
+    // 500 tokens context, threshold = 400 tokens = 1600 bytes
+    // 1604 bytes / 4 = 401 tokens, 401 > 400 = true
+    try std.testing.expect(needsCompaction(1604, 500));
+}
+
+test "needsCompaction with very large context" {
+    // 1M tokens context window
+    try std.testing.expect(!needsCompaction(0, 1_000_000));
+    try std.testing.expect(!needsCompaction(3_200_000, 1_000_000));
+    try std.testing.expect(needsCompaction(3_200_004, 1_000_000));
+}
+
+test "needsCompaction small messages in big context" {
+    // Small messages (100 bytes) in 200k context - never needs compaction
+    try std.testing.expect(!needsCompaction(100, 200_000));
+}
+
+test "estimateTokens five chars" {
+    // 5 / 4 = 1
+    try std.testing.expectEqual(@as(u32, 1), estimateTokens("hello"));
+}
+
+test "estimateTokens eight chars" {
+    // 8 / 4 = 2
+    try std.testing.expectEqual(@as(u32, 2), estimateTokens("12345678"));
+}
+
+test "estimateTokens twelve chars" {
+    // 12 / 4 = 3
+    try std.testing.expectEqual(@as(u32, 3), estimateTokens("123456789012"));
+}
+
+test "estimateTokens two chars gives minimum 1" {
+    try std.testing.expectEqual(@as(u32, 1), estimateTokens("ab"));
+}
+
+test "buildCompactionPrompt buffer too small" {
+    var buf: [10]u8 = undefined;
+    const result = buildCompactionPrompt(&buf, "some text");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "buildCompactionPrompt preserves short preview exactly" {
+    var buf: [16384]u8 = undefined;
+    const preview = "Short preview text";
+    const prompt = try buildCompactionPrompt(&buf, preview);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, preview) != null);
+}
+
+test "buildCompactionPrompt exactly 8000 char preview" {
+    var buf: [16384]u8 = undefined;
+    const preview = "a" ** 8000;
+    const prompt = try buildCompactionPrompt(&buf, preview);
+    // All 8000 chars should be included (max_preview = min(8000, 8000) = 8000)
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Summarize") != null);
+}
+
+test "createEntry large values" {
+    const entry = createEntry("Long summary", 10000, 1_000_000);
+    try std.testing.expectEqual(@as(u32, 10000), entry.original_message_count);
+    try std.testing.expectEqual(@as(u32, 250_000), entry.estimated_tokens_saved);
+}
+
+test "createEntry with 1 byte saved" {
+    // 1 byte / 4 = 0 tokens saved
+    const entry = createEntry("s", 1, 1);
+    try std.testing.expectEqual(@as(u32, 0), entry.estimated_tokens_saved);
+}
+
+test "createEntry with 4 bytes saved" {
+    // 4 bytes / 4 = 1 token saved
+    const entry = createEntry("s", 1, 4);
+    try std.testing.expectEqual(@as(u32, 1), entry.estimated_tokens_saved);
+}
+
+test "findCompactionCutoff keep zero" {
+    // keep_recent = 0, should cut all messages
+    try std.testing.expectEqual(@as(usize, 10), findCompactionCutoff(10, 0));
+}
+
+test "findCompactionCutoff one message keep one" {
+    try std.testing.expectEqual(@as(usize, 0), findCompactionCutoff(1, 1));
+}
+
+test "findCompactionCutoff two messages keep one" {
+    try std.testing.expectEqual(@as(usize, 1), findCompactionCutoff(2, 1));
+}
+
+test "findCompactionCutoff large numbers" {
+    try std.testing.expectEqual(@as(usize, 9950), findCompactionCutoff(10000, 50));
+}

@@ -334,3 +334,291 @@ test "buildFailoverKey openai" {
     const key = try buildFailoverKey(&buf, "openai", "gpt-4-turbo");
     try std.testing.expectEqualStrings("openai:gpt-4-turbo", key);
 }
+
+// --- Additional Tests ---
+
+test "FailoverReason all labels" {
+    try std.testing.expectEqualStrings("auth", FailoverReason.auth.label());
+    try std.testing.expectEqualStrings("timeout", FailoverReason.timeout.label());
+    try std.testing.expectEqualStrings("format", FailoverReason.format.label());
+    try std.testing.expectEqualStrings("model_not_found", FailoverReason.model_not_found.label());
+    try std.testing.expectEqualStrings("overloaded", FailoverReason.overloaded.label());
+    try std.testing.expectEqualStrings("unknown", FailoverReason.unknown.label());
+}
+
+test "FailoverReason unknown shouldFailover" {
+    try std.testing.expect(FailoverReason.unknown.shouldFailover());
+}
+
+test "FailoverReason unknown isTransient" {
+    try std.testing.expect(FailoverReason.unknown.isTransient());
+}
+
+test "FailoverReason format is not transient" {
+    try std.testing.expect(!FailoverReason.format.isTransient());
+    try std.testing.expect(!FailoverReason.format.shouldFailover());
+}
+
+test "FailoverReason model_not_found is not transient" {
+    try std.testing.expect(!FailoverReason.model_not_found.isTransient());
+    try std.testing.expect(!FailoverReason.model_not_found.shouldFailover());
+}
+
+test "FailoverState multiple different keys" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 2, 60_000);
+    defer state.deinit();
+
+    try state.recordFailure("openai:gpt-4", .rate_limit);
+    try state.recordFailure("anthropic:claude", .timeout);
+
+    try std.testing.expectEqual(@as(u32, 1), state.getFailureCount("openai:gpt-4"));
+    try std.testing.expectEqual(@as(u32, 1), state.getFailureCount("anthropic:claude"));
+    try std.testing.expectEqual(@as(u32, 0), state.getFailureCount("unknown:model"));
+}
+
+test "FailoverState increment failure count" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 5, 60_000);
+    defer state.deinit();
+
+    try state.recordFailure("k", .billing);
+    try state.recordFailure("k", .billing);
+    try state.recordFailure("k", .auth);
+
+    try std.testing.expectEqual(@as(u32, 3), state.getFailureCount("k"));
+}
+
+test "FailoverState reset nonexistent key is safe" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 3, 60_000);
+    defer state.deinit();
+
+    // Should not crash
+    state.reset("does-not-exist");
+    try std.testing.expectEqual(@as(u32, 0), state.getFailureCount("does-not-exist"));
+}
+
+test "FailoverState not in cooldown below max retries" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 3, 60_000);
+    defer state.deinit();
+
+    try state.recordFailure("k", .rate_limit);
+    try state.recordFailure("k", .rate_limit);
+    // 2 failures, max is 3 -- not in cooldown
+    try std.testing.expect(!state.isInCooldown("k"));
+}
+
+test "ModelResolution fallback model is valid" {
+    try std.testing.expect(ModelResolution.FALLBACK_MODEL.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ModelResolution.FALLBACK_MODEL, "claude") != null);
+}
+
+test "ModelResolution resolve with only global default" {
+    const result = ModelResolution.resolve(null, null, null, "gpt-4");
+    try std.testing.expectEqualStrings("gpt-4", result);
+}
+
+test "AuthRotation single key" {
+    const allocator = std.testing.allocator;
+    const keys = [_][]const u8{"only-key"};
+    var rotation = try AuthRotation.init(allocator, &keys);
+    defer rotation.deinit();
+
+    try std.testing.expectEqualStrings("only-key", rotation.currentKey().?);
+    rotation.rotate(); // should not change with single key
+    try std.testing.expectEqualStrings("only-key", rotation.currentKey().?);
+}
+
+test "AuthRotation full cycle" {
+    const allocator = std.testing.allocator;
+    const keys = [_][]const u8{ "a", "b", "c" };
+    var rotation = try AuthRotation.init(allocator, &keys);
+    defer rotation.deinit();
+
+    try std.testing.expectEqualStrings("a", rotation.currentKey().?);
+    rotation.rotate();
+    try std.testing.expectEqualStrings("b", rotation.currentKey().?);
+    rotation.rotate();
+    try std.testing.expectEqualStrings("c", rotation.currentKey().?);
+    rotation.rotate();
+    try std.testing.expectEqualStrings("a", rotation.currentKey().?);
+}
+
+test "AuthRotation resetCurrent clears counter" {
+    const allocator = std.testing.allocator;
+    const keys = [_][]const u8{ "k1", "k2" };
+    var rotation = try AuthRotation.init(allocator, &keys);
+    defer rotation.deinit();
+
+    rotation.rotate(); // k1 gets 1 failure, now on k2
+    rotation.rotate(); // k2 gets 1 failure, now on k1
+    rotation.resetCurrent(); // reset k1's counter
+
+    try std.testing.expect(!rotation.allExhausted(1));
+}
+
+test "buildFailoverKey buffer too small" {
+    var buf: [3]u8 = undefined;
+    const result = buildFailoverKey(&buf, "anthropic", "claude");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "buildFailoverKey local provider" {
+    var buf: [256]u8 = undefined;
+    const key = try buildFailoverKey(&buf, "local", "llama-3");
+    try std.testing.expectEqualStrings("local:llama-3", key);
+}
+
+// ===== New tests added for comprehensive coverage =====
+
+test "FailoverState record and reset multiple keys" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 2, 60_000);
+    defer state.deinit();
+
+    try state.recordFailure("key1", .rate_limit);
+    try state.recordFailure("key2", .timeout);
+    try state.recordFailure("key3", .billing);
+
+    try std.testing.expectEqual(@as(u32, 1), state.getFailureCount("key1"));
+    try std.testing.expectEqual(@as(u32, 1), state.getFailureCount("key2"));
+    try std.testing.expectEqual(@as(u32, 1), state.getFailureCount("key3"));
+
+    state.reset("key2");
+    try std.testing.expectEqual(@as(u32, 0), state.getFailureCount("key2"));
+    try std.testing.expectEqual(@as(u32, 1), state.getFailureCount("key1"));
+}
+
+test "FailoverState reason changes on subsequent failures" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 5, 60_000);
+    defer state.deinit();
+
+    try state.recordFailure("k", .rate_limit);
+    try state.recordFailure("k", .timeout);
+    try state.recordFailure("k", .overloaded);
+
+    try std.testing.expectEqual(@as(u32, 3), state.getFailureCount("k"));
+}
+
+test "FailoverState max_retries 1 goes into cooldown immediately" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 1, 60_000);
+    defer state.deinit();
+
+    try state.recordFailure("k", .auth);
+    try std.testing.expect(state.isInCooldown("k"));
+}
+
+test "FailoverState cooldown with 0 ms expires immediately" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 1, 0);
+    defer state.deinit();
+
+    try state.recordFailure("k", .rate_limit);
+    // cooldown_ms = 0, so cooldown should not be active (now - last >= 0)
+    try std.testing.expect(!state.isInCooldown("k"));
+}
+
+test "FailoverState getFailureCount for unknown key" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 3, 60_000);
+    defer state.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), state.getFailureCount("nonexistent"));
+}
+
+test "FailoverState isInCooldown for unknown key" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 3, 60_000);
+    defer state.deinit();
+
+    try std.testing.expect(!state.isInCooldown("nonexistent"));
+}
+
+test "FailoverReason all variants have non-empty labels" {
+    const reasons = [_]FailoverReason{
+        .billing, .rate_limit, .auth, .timeout, .format, .model_not_found, .overloaded, .unknown,
+    };
+    for (reasons) |r| {
+        try std.testing.expect(r.label().len > 0);
+    }
+}
+
+test "FailoverReason shouldFailover and isTransient consistency" {
+    // Things that are transient should also trigger failover
+    try std.testing.expect(FailoverReason.rate_limit.shouldFailover());
+    try std.testing.expect(FailoverReason.rate_limit.isTransient());
+
+    try std.testing.expect(FailoverReason.timeout.shouldFailover());
+    try std.testing.expect(FailoverReason.timeout.isTransient());
+
+    try std.testing.expect(FailoverReason.overloaded.shouldFailover());
+    try std.testing.expect(FailoverReason.overloaded.isTransient());
+}
+
+test "FailoverReason non-transient non-failover reasons" {
+    // format and model_not_found are both non-transient and non-failover
+    try std.testing.expect(!FailoverReason.format.shouldFailover());
+    try std.testing.expect(!FailoverReason.format.isTransient());
+    try std.testing.expect(!FailoverReason.model_not_found.shouldFailover());
+    try std.testing.expect(!FailoverReason.model_not_found.isTransient());
+}
+
+test "ModelResolution all nulls returns fallback" {
+    const result = ModelResolution.resolve(null, null, null, null);
+    try std.testing.expectEqualStrings(ModelResolution.FALLBACK_MODEL, result);
+}
+
+test "ModelResolution user override wins over all" {
+    const result = ModelResolution.resolve("user-model", "session-model", "agent-model", "global-model");
+    try std.testing.expectEqualStrings("user-model", result);
+}
+
+test "ModelResolution session pin wins over defaults" {
+    const result = ModelResolution.resolve(null, "session-model", "agent-model", "global-model");
+    try std.testing.expectEqualStrings("session-model", result);
+}
+
+test "AuthRotation two keys exhaust check" {
+    const allocator = std.testing.allocator;
+    const keys = [_][]const u8{ "k1", "k2" };
+    var rotation = try AuthRotation.init(allocator, &keys);
+    defer rotation.deinit();
+
+    // Not exhausted initially
+    try std.testing.expect(!rotation.allExhausted(1));
+
+    rotation.rotate(); // k1 = 1 fail, now on k2
+    try std.testing.expect(!rotation.allExhausted(1)); // k2 has 0 failures
+
+    rotation.rotate(); // k2 = 1 fail, now on k1
+    try std.testing.expect(rotation.allExhausted(1)); // both >= 1
+}
+
+test "AuthRotation empty keys rotate is safe" {
+    const allocator = std.testing.allocator;
+    const keys = [_][]const u8{};
+    var rotation = try AuthRotation.init(allocator, &keys);
+    defer rotation.deinit();
+
+    rotation.rotate(); // should not crash
+    try std.testing.expect(rotation.currentKey() == null);
+}
+
+test "AuthRotation resetCurrent on empty keys is safe" {
+    const allocator = std.testing.allocator;
+    const keys = [_][]const u8{};
+    var rotation = try AuthRotation.init(allocator, &keys);
+    defer rotation.deinit();
+
+    rotation.resetCurrent(); // should not crash
+}
+
+test "buildFailoverKey empty strings" {
+    var buf: [256]u8 = undefined;
+    const key = try buildFailoverKey(&buf, "", "");
+    try std.testing.expectEqualStrings(":", key);
+}

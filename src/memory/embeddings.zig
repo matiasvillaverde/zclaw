@@ -309,3 +309,304 @@ test "EmbeddingClient.embed custom base_url" {
 
     try std.testing.expect(std.mem.startsWith(u8, mock.last_url.?, "https://custom.ai"));
 }
+
+// --- Additional Tests ---
+
+test "EmbeddingConfig custom values" {
+    const config = EmbeddingConfig{
+        .provider = .local,
+        .model = "custom-model",
+        .dimensions = 768,
+        .api_key = "sk-test",
+        .base_url = "http://localhost:8080",
+        .batch_size = 50,
+    };
+    try std.testing.expectEqual(EmbeddingProvider.local, config.provider);
+    try std.testing.expectEqualStrings("custom-model", config.model);
+    try std.testing.expectEqual(@as(u32, 768), config.dimensions);
+    try std.testing.expectEqual(@as(u32, 50), config.batch_size);
+}
+
+test "EmbeddingResult struct" {
+    const result = EmbeddingResult{
+        .vector = &.{},
+        .model = "test-model",
+        .tokens_used = 42,
+    };
+    try std.testing.expectEqualStrings("test-model", result.model);
+    try std.testing.expectEqual(@as(u32, 42), result.tokens_used);
+}
+
+test "buildOpenAIEmbeddingRequest with zero dimensions" {
+    var buf: [4096]u8 = undefined;
+    const json = try buildOpenAIEmbeddingRequest(&buf, "test", .{ .dimensions = 0 });
+    // Should not include dimensions field
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"dimensions\"") == null);
+}
+
+test "buildBatchEmbeddingRequest single text" {
+    var buf: [4096]u8 = undefined;
+    const texts = [_][]const u8{"only one"};
+    const json = try buildBatchEmbeddingRequest(&buf, &texts, .{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"only one\"") != null);
+}
+
+test "buildBatchEmbeddingRequest empty list" {
+    var buf: [4096]u8 = undefined;
+    const texts = [_][]const u8{};
+    const json = try buildBatchEmbeddingRequest(&buf, &texts, .{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input\":[]") != null);
+}
+
+test "parseEmbeddingResponse single value" {
+    const allocator = std.testing.allocator;
+    const json = "{\"data\":[{\"embedding\":[0.5],\"index\":0}]}";
+    const vec = try parseEmbeddingResponse(allocator, json);
+    defer allocator.free(vec);
+
+    try std.testing.expectEqual(@as(usize, 1), vec.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), vec[0], 0.001);
+}
+
+test "parseEmbeddingResponse negative values" {
+    const allocator = std.testing.allocator;
+    const json = "{\"data\":[{\"embedding\":[-0.1,0.2,-0.3],\"index\":0}]}";
+    const vec = try parseEmbeddingResponse(allocator, json);
+    defer allocator.free(vec);
+
+    try std.testing.expectEqual(@as(usize, 3), vec.len);
+    try std.testing.expectApproxEqAbs(@as(f64, -0.1), vec[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, -0.3), vec[2], 0.001);
+}
+
+test "parseEmbeddingResponse empty array" {
+    const allocator = std.testing.allocator;
+    const json = "{\"data\":[{\"embedding\":[],\"index\":0}]}";
+    const result = parseEmbeddingResponse(allocator, json);
+    try std.testing.expectError(error.InvalidResponse, result);
+}
+
+test "normalizeVector unit vector unchanged" {
+    var vec = [_]f64{ 1.0, 0.0, 0.0 };
+    normalizeVector(&vec);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), vec[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), vec[1], 0.001);
+}
+
+test "normalizeVector single element" {
+    var vec = [_]f64{5.0};
+    normalizeVector(&vec);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), vec[0], 0.001);
+}
+
+test "normalizeVector negative values" {
+    var vec = [_]f64{ -3.0, 4.0 };
+    normalizeVector(&vec);
+    var sum_sq: f64 = 0.0;
+    for (vec) |v| sum_sq += v * v;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), sum_sq, 0.001);
+}
+
+test "EmbeddingClient.embed connection failure" {
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    var client = EmbeddingClient.init(&http, .{ .api_key = "sk-test" });
+
+    const result = client.embed(std.testing.allocator, "test");
+    try std.testing.expectError(error.EmbeddingFailed, result);
+}
+
+// --- New Tests ---
+
+test "EmbeddingProvider enum values are distinct" {
+    try std.testing.expect(EmbeddingProvider.openai != EmbeddingProvider.local);
+}
+
+test "EmbeddingConfig batch_size default" {
+    const config = EmbeddingConfig{};
+    try std.testing.expectEqual(@as(u32, 100), config.batch_size);
+    try std.testing.expectEqualStrings("", config.api_key);
+    try std.testing.expect(config.base_url == null);
+}
+
+test "EmbeddingResult with empty vector" {
+    const result = EmbeddingResult{
+        .vector = &.{},
+        .model = "empty",
+        .tokens_used = 0,
+    };
+    try std.testing.expectEqual(@as(usize, 0), result.vector.len);
+    try std.testing.expectEqual(@as(u32, 0), result.tokens_used);
+}
+
+test "buildOpenAIEmbeddingRequest with custom model" {
+    var buf: [4096]u8 = undefined;
+    const json = try buildOpenAIEmbeddingRequest(&buf, "test", .{ .model = "text-embedding-ada-002" });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"text-embedding-ada-002\"") != null);
+}
+
+test "buildOpenAIEmbeddingRequest with empty text" {
+    var buf: [4096]u8 = undefined;
+    const json = try buildOpenAIEmbeddingRequest(&buf, "", .{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input\":\"\"") != null);
+}
+
+test "buildOpenAIEmbeddingRequest escapes tab" {
+    var buf: [4096]u8 = undefined;
+    const json = try buildOpenAIEmbeddingRequest(&buf, "col1\tcol2", .{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\t") != null);
+}
+
+test "buildOpenAIEmbeddingRequest escapes carriage return" {
+    var buf: [4096]u8 = undefined;
+    const json = try buildOpenAIEmbeddingRequest(&buf, "line\r\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\n") != null);
+}
+
+test "buildOpenAIEmbeddingRequest escapes backslash" {
+    var buf: [4096]u8 = undefined;
+    const json = try buildOpenAIEmbeddingRequest(&buf, "path\\to\\file", .{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "path\\\\to\\\\file") != null);
+}
+
+test "buildBatchEmbeddingRequest with escaping" {
+    var buf: [4096]u8 = undefined;
+    const texts = [_][]const u8{ "hello \"world\"", "line\nnew" };
+    const json = try buildBatchEmbeddingRequest(&buf, &texts, .{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\\"world\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\n") != null);
+}
+
+test "buildBatchEmbeddingRequest with zero dimensions" {
+    var buf: [4096]u8 = undefined;
+    const texts = [_][]const u8{"hello"};
+    const json = try buildBatchEmbeddingRequest(&buf, &texts, .{ .dimensions = 0 });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"dimensions\"") == null);
+}
+
+test "buildBatchEmbeddingRequest with custom dimensions" {
+    var buf: [4096]u8 = undefined;
+    const texts = [_][]const u8{"hello"};
+    const json = try buildBatchEmbeddingRequest(&buf, &texts, .{ .dimensions = 768 });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"dimensions\":768") != null);
+}
+
+test "parseEmbeddingResponse whitespace in values" {
+    const allocator = std.testing.allocator;
+    const json = "{\"data\":[{\"embedding\":[ 0.1 , 0.2 , 0.3 ],\"index\":0}]}";
+    const vec = try parseEmbeddingResponse(allocator, json);
+    defer allocator.free(vec);
+
+    try std.testing.expectEqual(@as(usize, 3), vec.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), vec[0], 0.001);
+}
+
+test "parseEmbeddingResponse scientific notation" {
+    const allocator = std.testing.allocator;
+    const json = "{\"data\":[{\"embedding\":[1.5e-2,2.0e1],\"index\":0}]}";
+    const vec = try parseEmbeddingResponse(allocator, json);
+    defer allocator.free(vec);
+
+    try std.testing.expectEqual(@as(usize, 2), vec.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.015), vec[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), vec[1], 0.001);
+}
+
+test "parseEmbeddingResponse no embedding key" {
+    const allocator = std.testing.allocator;
+    const result = parseEmbeddingResponse(allocator, "{\"data\":[{\"vector\":[1.0]}]}");
+    try std.testing.expectError(error.InvalidResponse, result);
+}
+
+test "parseEmbeddingResponse no closing bracket" {
+    const allocator = std.testing.allocator;
+    const result = parseEmbeddingResponse(allocator, "{\"data\":[{\"embedding\":[0.1,0.2");
+    try std.testing.expectError(error.InvalidResponse, result);
+}
+
+test "parseEmbeddingResponse large vector" {
+    const allocator = std.testing.allocator;
+    // Build a JSON with 10 values
+    const json = "{\"data\":[{\"embedding\":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0],\"index\":0}]}";
+    const vec = try parseEmbeddingResponse(allocator, json);
+    defer allocator.free(vec);
+
+    try std.testing.expectEqual(@as(usize, 10), vec.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), vec[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), vec[9], 0.001);
+}
+
+test "normalizeVector large values" {
+    var vec = [_]f64{ 300.0, 400.0 };
+    normalizeVector(&vec);
+    // 300/500 = 0.6, 400/500 = 0.8
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6), vec[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), vec[1], 0.001);
+}
+
+test "normalizeVector three dimensions" {
+    var vec = [_]f64{ 1.0, 2.0, 2.0 };
+    normalizeVector(&vec);
+    var sum_sq: f64 = 0.0;
+    for (vec) |v| sum_sq += v * v;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), sum_sq, 0.001);
+}
+
+test "normalizeVector already normalized" {
+    var vec = [_]f64{ 0.6, 0.8 };
+    normalizeVector(&vec);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6), vec[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), vec[1], 0.001);
+}
+
+test "normalizeVector all same values" {
+    var vec = [_]f64{ 1.0, 1.0, 1.0 };
+    normalizeVector(&vec);
+    // Each should be 1/sqrt(3)
+    const expected = 1.0 / @sqrt(3.0);
+    for (vec) |v| {
+        try std.testing.expectApproxEqAbs(expected, v, 0.001);
+    }
+}
+
+test "EmbeddingClient.embed status 500" {
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 500, .body = "{\"error\":\"server error\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    var client = EmbeddingClient.init(&http, .{ .api_key = "sk-test" });
+
+    const result = client.embed(std.testing.allocator, "test");
+    try std.testing.expectError(error.EmbeddingFailed, result);
+}
+
+test "EmbeddingClient.embed status 429 rate limited" {
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 429, .body = "{\"error\":\"rate limited\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    var client = EmbeddingClient.init(&http, .{ .api_key = "sk-test" });
+
+    const result = client.embed(std.testing.allocator, "test");
+    try std.testing.expectError(error.EmbeddingFailed, result);
+}
+
+test "EmbeddingClient init preserves config" {
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    const client = EmbeddingClient.init(&http, .{
+        .api_key = "my-key",
+        .model = "custom-model",
+        .dimensions = 512,
+    });
+
+    try std.testing.expectEqualStrings("my-key", client.config.api_key);
+    try std.testing.expectEqualStrings("custom-model", client.config.model);
+    try std.testing.expectEqual(@as(u32, 512), client.config.dimensions);
+}

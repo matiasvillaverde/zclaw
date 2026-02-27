@@ -1686,3 +1686,237 @@ test "dispatchToolCall with registry miss" {
     try std.testing.expectEqualStrings("c2", tr.tool_call_id);
     try std.testing.expectEqualStrings("tool not found", tr.content);
 }
+
+// --- Additional Tests ---
+
+test "RunState all labels non-empty" {
+    for (std.meta.tags(RunState)) |rs| {
+        try std.testing.expect(rs.label().len > 0);
+    }
+}
+
+test "RunState waiting_tool label" {
+    try std.testing.expectEqualStrings("waiting_tool", RunState.waiting_tool.label());
+}
+
+test "RunState compacting label" {
+    try std.testing.expectEqualStrings("compacting", RunState.compacting.label());
+}
+
+test "RunState waiting_tool not terminal" {
+    try std.testing.expect(!RunState.waiting_tool.isTerminal());
+}
+
+test "RunState compacting not terminal" {
+    try std.testing.expect(!RunState.compacting.isTerminal());
+}
+
+test "Role all labels non-empty" {
+    for (std.meta.tags(Role)) |r| {
+        try std.testing.expect(r.label().len > 0);
+    }
+}
+
+test "Role tool_result label" {
+    try std.testing.expectEqualStrings("tool_result", Role.tool_result.label());
+}
+
+test "RunEvent defaults" {
+    const event = RunEvent{ .event_type = .start };
+    try std.testing.expectEqualStrings("", event.agent_id);
+    try std.testing.expectEqualStrings("", event.run_id);
+    try std.testing.expect(event.text == null);
+    try std.testing.expect(event.tool_name == null);
+    try std.testing.expect(event.tool_call_id == null);
+    try std.testing.expect(event.tool_input == null);
+    try std.testing.expect(event.error_message == null);
+    try std.testing.expectEqual(@as(u32, 0), event.turn);
+}
+
+test "RunEvent error type" {
+    const event = RunEvent{
+        .event_type = .@"error",
+        .error_message = "something went wrong",
+    };
+    try std.testing.expectEqual(RunEventType.@"error", event.event_type);
+    try std.testing.expectEqualStrings("something went wrong", event.error_message.?);
+}
+
+test "HistoryMessage defaults" {
+    const msg = HistoryMessage{ .role = .user, .content = "hi" };
+    try std.testing.expect(msg.tool_call_id == null);
+    try std.testing.expect(msg.tool_name == null);
+}
+
+test "HistoryMessage with tool fields" {
+    const msg = HistoryMessage{
+        .role = .tool_result,
+        .content = "output",
+        .tool_call_id = "call_1",
+        .tool_name = "bash",
+    };
+    try std.testing.expectEqualStrings("call_1", msg.tool_call_id.?);
+    try std.testing.expectEqualStrings("bash", msg.tool_name.?);
+}
+
+test "ToolResultInput fields" {
+    const tri = ToolResultInput{ .tool_call_id = "tc1", .content = "result" };
+    try std.testing.expectEqualStrings("tc1", tri.tool_call_id);
+    try std.testing.expectEqualStrings("result", tri.content);
+}
+
+test "RunResult defaults" {
+    const result = RunResult{};
+    try std.testing.expect(result.text == null);
+    try std.testing.expect(!result.hasToolCalls());
+    try std.testing.expect(result.stop_reason == null);
+    try std.testing.expectEqual(@as(u64, 0), result.usage.input_tokens);
+}
+
+test "RunConfig custom values" {
+    const config = RunConfig{
+        .agent_id = "custom",
+        .model = "gpt-4o",
+        .max_turns = 10,
+        .max_tokens = 8192,
+        .temperature = 0.7,
+        .stream = false,
+    };
+    try std.testing.expectEqualStrings("custom", config.agent_id);
+    try std.testing.expectEqualStrings("gpt-4o", config.model);
+    try std.testing.expectEqual(@as(u32, 10), config.max_turns);
+    try std.testing.expectEqual(@as(u32, 8192), config.max_tokens);
+    try std.testing.expect(!config.stream);
+}
+
+test "RunConfig system_prompt default null" {
+    const config = RunConfig{};
+    try std.testing.expect(config.system_prompt == null);
+    try std.testing.expect(config.tools_json == null);
+    try std.testing.expect(config.temperature == null);
+}
+
+test "AgentRuntime run_id is populated" {
+    const allocator = std.testing.allocator;
+    var runtime = AgentRuntime.init(allocator, .{});
+    defer runtime.deinit();
+
+    // run_id should be non-zero after init
+    try std.testing.expectEqual(@as(usize, 36), runtime.run_id.len);
+}
+
+test "AgentRuntime token tracking starts at zero" {
+    const allocator = std.testing.allocator;
+    var runtime = AgentRuntime.init(allocator, .{});
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), runtime.total_input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), runtime.total_output_tokens);
+}
+
+test "AgentRuntime multiple user messages" {
+    const allocator = std.testing.allocator;
+    var runtime = AgentRuntime.init(allocator, .{});
+    defer runtime.deinit();
+
+    try runtime.addUserMessage("msg1");
+    try runtime.addUserMessage("msg2");
+    try runtime.addUserMessage("msg3");
+
+    try std.testing.expectEqual(@as(usize, 3), runtime.messageCount());
+    try std.testing.expectEqualStrings("msg1", runtime.history.items[0].content);
+    try std.testing.expectEqualStrings("msg3", runtime.history.items[2].content);
+}
+
+test "AgentRuntime historyBytes empty" {
+    const allocator = std.testing.allocator;
+    var runtime = AgentRuntime.init(allocator, .{});
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.historyBytes());
+}
+
+test "AgentRuntime start changes state from idle" {
+    const allocator = std.testing.allocator;
+    var runtime = AgentRuntime.init(allocator, .{});
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(RunState.idle, runtime.state);
+    runtime.start();
+    try std.testing.expectEqual(RunState.running, runtime.state);
+    try std.testing.expectEqual(@as(u32, 0), runtime.turn);
+}
+
+test "AgentRuntime max_turns 1" {
+    const allocator = std.testing.allocator;
+    var runtime = AgentRuntime.init(allocator, .{ .max_turns = 1 });
+    defer runtime.deinit();
+
+    runtime.start();
+    try std.testing.expect(runtime.nextTurn()); // turn 1
+    try std.testing.expect(!runtime.nextTurn()); // exceeded
+    try std.testing.expectEqual(RunState.failed, runtime.state);
+}
+
+test "AgentRuntime complete then nextTurn fails" {
+    const allocator = std.testing.allocator;
+    var runtime = AgentRuntime.init(allocator, .{});
+    defer runtime.deinit();
+
+    runtime.start();
+    runtime.complete("done");
+    try std.testing.expect(!runtime.nextTurn());
+}
+
+test "AgentRuntime abort then nextTurn fails" {
+    const allocator = std.testing.allocator;
+    var runtime = AgentRuntime.init(allocator, .{});
+    defer runtime.deinit();
+
+    runtime.start();
+    runtime.abort();
+    try std.testing.expect(!runtime.nextTurn());
+}
+
+test "ProviderResult isSuccess boundary" {
+    const ok_200 = ProviderResult{ .status = 200, .body = "", .api_type = .anthropic_messages };
+    try std.testing.expect(ok_200.isSuccess());
+
+    const ok_299 = ProviderResult{ .status = 299, .body = "", .api_type = .anthropic_messages };
+    try std.testing.expect(ok_299.isSuccess());
+
+    const fail_300 = ProviderResult{ .status = 300, .body = "", .api_type = .anthropic_messages };
+    try std.testing.expect(!fail_300.isSuccess());
+
+    const fail_199 = ProviderResult{ .status = 199, .body = "", .api_type = .anthropic_messages };
+    try std.testing.expect(!fail_199.isSuccess());
+
+    const fail_400 = ProviderResult{ .status = 400, .body = "", .api_type = .anthropic_messages };
+    try std.testing.expect(!fail_400.isSuccess());
+}
+
+test "buildMessagesJson single user message Anthropic" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]HistoryMessage{
+        .{ .role = .user, .content = "test" },
+    };
+
+    const json = try buildMessagesJson(allocator, &msgs, .anthropic_messages);
+    defer allocator.free(json);
+
+    try std.testing.expect(json[0] == '[');
+    try std.testing.expect(json[json.len - 1] == ']');
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"role\":\"user\"") != null);
+}
+
+test "buildMessagesJson tool_result Anthropic" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]HistoryMessage{
+        .{ .role = .tool_result, .content = "output", .tool_call_id = "tc_1" },
+    };
+
+    const json = try buildMessagesJson(allocator, &msgs, .anthropic_messages);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "tc_1") != null);
+}
