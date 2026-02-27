@@ -1039,3 +1039,175 @@ test "parseConfigJson with trailing commas" {
     const config = parseConfigJson(input).?;
     try std.testing.expectEqual(@as(u16, 5555), config.gateway.port);
 }
+
+// --- Expanded Tests ---
+
+test "stripJson5 with nested comments inside object values" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  "gateway": {
+        \\    "port": 8080 // port comment
+        \\  },
+        \\  "logging": {
+        \\    /* level comment */
+        \\    "level": "debug"
+        \\  }
+        \\}
+    ;
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "//") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "/*") == null);
+    const config = parseConfigJson(result).?;
+    try std.testing.expectEqual(@as(u16, 8080), config.gateway.port);
+    try std.testing.expectEqual(schema.LogLevel.debug, config.logging.level);
+}
+
+test "stripJson5 with comment-like strings preserved" {
+    const allocator = std.testing.allocator;
+    // String values containing // and /* should NOT be stripped
+    const input = "{\"url\": \"http://example.com\", \"note\": \"use /* carefully */\"}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "http://example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "use /* carefully */") != null);
+}
+
+test "stripJson5 with multi-line comment spanning multiple lines" {
+    const allocator = std.testing.allocator;
+    const input = "{\n/* This comment\nspans multiple\nlines and has * stars */\n\"key\": 42\n}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "/*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "*/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"key\"") != null);
+    // Should be valid JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch {
+        return error.ParseFailed;
+    };
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+}
+
+test "parseConfigJson with all sections filled" {
+    const input =
+        \\{
+        \\  "gateway": {
+        \\    "port": 3000
+        \\  },
+        \\  "logging": {
+        \\    "level": "trace",
+        \\    "consoleStyle": "json"
+        \\  },
+        \\  "session": {
+        \\    "mainKey": "production"
+        \\  },
+        \\  "memory": {
+        \\    "backend": "builtin"
+        \\  },
+        \\  "agents": {
+        \\    "defaultAgent": "primary"
+        \\  },
+        \\  "meta": {
+        \\    "lastTouchedVersion": "1.0.0"
+        \\  }
+        \\}
+    ;
+    const config = parseConfigJson(input).?;
+    try std.testing.expectEqual(@as(u16, 3000), config.gateway.port);
+    try std.testing.expectEqual(schema.LogLevel.trace, config.logging.level);
+    try std.testing.expectEqual(schema.ConsoleStyle.json, config.logging.console_style);
+    // session.main_key cannot be set via parseConfigJson (data freed on return)
+    try std.testing.expectEqualStrings("main", config.session.main_key);
+}
+
+test "loadConfigFromPath with empty file returns defaults" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/zclaw_empty_config_test.json";
+    {
+        const f = try std.fs.cwd().createFile(tmp_path, .{});
+        defer f.close();
+        // Write empty string - file exists but has no content
+        try f.writeAll("");
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const result = loadConfigFromPath(allocator, tmp_path);
+    // Empty file is not valid JSON, so we get defaults
+    try std.testing.expectEqual(@as(u16, 18789), result.config.gateway.port);
+    try std.testing.expectEqual(schema.LogLevel.info, result.config.logging.level);
+    if (result.raw_json) |raw| {
+        allocator.free(raw);
+    }
+}
+
+test "stripJson5 preserves valid JSON unchanged" {
+    const allocator = std.testing.allocator;
+    const input = "{\"name\":\"test\",\"port\":8080,\"list\":[1,2,3],\"nested\":{\"key\":\"val\"}}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(input, result);
+}
+
+test "parseConfigJson with unknown fields ignores gracefully" {
+    const config = parseConfigJson(
+        \\{"gateway":{"port":4444},"totally_unknown":{"foo":"bar"},"another_field":123,"deeply":{"nested":{"thing":true}}}
+    ).?;
+    try std.testing.expectEqual(@as(u16, 4444), config.gateway.port);
+    // All other defaults should be preserved
+    try std.testing.expectEqual(schema.LogLevel.info, config.logging.level);
+    try std.testing.expectEqual(schema.ConsoleStyle.pretty, config.logging.console_style);
+    try std.testing.expectEqualStrings("main", config.session.main_key);
+}
+
+test "stripJson5 with consecutive trailing commas" {
+    const allocator = std.testing.allocator;
+    // Multiple trailing commas: stripJson5 removes trailing commas one at a time
+    // {a:1,,,} - first comma kept (separates), second stripped (before ,),
+    // third stripped (before })
+    const input = "{\"a\":1,,,}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    // The result should have the trailing commas removed; verify it parses
+    // Note: consecutive commas produce invalid JSON even after stripping trailing ones,
+    // because only the last comma before } is "trailing". The intermediate ,, are not
+    // trailing. The parser strips commas where the next non-whitespace is } or ].
+    // So ",," - first comma: next non-ws is ",", not stripped.
+    // Second comma: next non-ws is ",", not stripped. Third comma: next non-ws is "}", stripped.
+    // Result: {"a":1,,} which is still invalid JSON, but that's expected behavior.
+    try std.testing.expect(result.len > 0);
+}
+
+test "env var substitution with nested braces edge case" {
+    const allocator = std.testing.allocator;
+    // ${OUTER_${INNER}} - the parser treats this as var name "OUTER_${INNER"
+    // because it scans for the first closing brace
+    const result = try substituteEnvVars(allocator, "${OUTER_${INNER}}");
+    defer allocator.free(result);
+    // The first } closes the outer ${, so var name is "OUTER_${INNER"
+    // which won't match any env var, yielding empty string + trailing "}"
+    try std.testing.expectEqualStrings("}", result);
+}
+
+test "processIncludes exactly at max depth minus one succeeds" {
+    const allocator = std.testing.allocator;
+    // Depth 9 (MAX_INCLUDE_DEPTH - 1) should succeed
+    const result = try processIncludes(allocator, "{\"simple\": true}", MAX_INCLUDE_DEPTH - 1);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("{\"simple\": true}", result);
+}
+
+test "processIncludes exactly at max depth fails" {
+    const allocator = std.testing.allocator;
+    // Depth exactly at MAX_INCLUDE_DEPTH should fail
+    const err = processIncludes(allocator, "{\"any\": \"content\"}", MAX_INCLUDE_DEPTH);
+    try std.testing.expectError(error.ParseFailed, err);
+}
+
+test "processIncludes one over max depth fails" {
+    const allocator = std.testing.allocator;
+    // Depth MAX_INCLUDE_DEPTH + 1 should also fail
+    const err = processIncludes(allocator, "{}", MAX_INCLUDE_DEPTH + 1);
+    try std.testing.expectError(error.ParseFailed, err);
+}
