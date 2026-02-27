@@ -2,7 +2,7 @@
 
 Personal AI assistant gateway. Connects your AI providers to Telegram, Discord, and Slack from a single 769 KB binary.
 
-Zig port of [OpenClaw](https://github.com/AiChatBot/OpenClaw).
+Zig port of [OpenClaw](https://github.com/openclaw/openclaw).
 
 ## Install
 
