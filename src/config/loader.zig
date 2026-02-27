@@ -45,12 +45,17 @@ pub fn loadConfigFromPath(allocator: std.mem.Allocator, path: []const u8) LoadRe
     return .{ .config = config, .raw_json = content, .source_path = path };
 }
 
-/// Parses a JSON string into a Config struct.
+/// Parses a JSON or JSON5 string into a Config struct.
+/// Strips JSON5 features (comments, trailing commas, unquoted keys) before parsing.
 /// Falls back to defaults for missing fields.
 pub fn parseConfigJson(json_str: []const u8) ?schema.Config {
     var config = schema.defaultConfig();
 
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_str, .{}) catch return null;
+    // Pre-process JSON5 → JSON
+    const clean = stripJson5(std.heap.page_allocator, json_str) catch return null;
+    defer if (clean.ptr != json_str.ptr) std.heap.page_allocator.free(clean);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, clean, .{}) catch return null;
     defer parsed.deinit();
 
     const root = parsed.value;
@@ -288,6 +293,146 @@ pub fn loadConfigWithIncludes(allocator: std.mem.Allocator, path: []const u8) Lo
     };
 
     return .{ .config = config, .raw_json = processed, .source_path = path };
+}
+
+// --- JSON5 → JSON Preprocessor ---
+
+/// Strip JSON5 extensions to produce valid JSON:
+/// - Single-line comments (// ...)
+/// - Multi-line comments (/* ... */)
+/// - Trailing commas before } or ]
+/// - Unquoted object keys (bare identifiers → "quoted")
+/// Preserves string contents unchanged.
+pub fn stripJson5(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (input.len == 0) return input;
+
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        const c = input[i];
+
+        // Handle strings — pass through unchanged
+        if (c == '"') {
+            try out.append(allocator, '"');
+            i += 1;
+            while (i < input.len) {
+                if (input[i] == '\\' and i + 1 < input.len) {
+                    try out.append(allocator, input[i]);
+                    try out.append(allocator, input[i + 1]);
+                    i += 2;
+                } else if (input[i] == '"') {
+                    try out.append(allocator, '"');
+                    i += 1;
+                    break;
+                } else {
+                    try out.append(allocator, input[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Single-quoted strings (JSON5 extension) — convert to double-quoted
+        if (c == '\'') {
+            try out.append(allocator, '"');
+            i += 1;
+            while (i < input.len) {
+                if (input[i] == '\\' and i + 1 < input.len) {
+                    try out.append(allocator, input[i]);
+                    try out.append(allocator, input[i + 1]);
+                    i += 2;
+                } else if (input[i] == '\'') {
+                    try out.append(allocator, '"');
+                    i += 1;
+                    break;
+                } else if (input[i] == '"') {
+                    // Escape double quotes inside single-quoted string
+                    try out.appendSlice(allocator, "\\\"");
+                    i += 1;
+                } else {
+                    try out.append(allocator, input[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Single-line comment: // ...
+        if (c == '/' and i + 1 < input.len and input[i + 1] == '/') {
+            i += 2;
+            while (i < input.len and input[i] != '\n') : (i += 1) {}
+            continue;
+        }
+
+        // Multi-line comment: /* ... */
+        if (c == '/' and i + 1 < input.len and input[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < input.len) {
+                if (input[i] == '*' and input[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            } else {
+                i = input.len; // unterminated comment
+            }
+            continue;
+        }
+
+        // Trailing commas: skip comma if next non-whitespace is } or ]
+        if (c == ',') {
+            var j = i + 1;
+            while (j < input.len and (input[j] == ' ' or input[j] == '\t' or input[j] == '\n' or input[j] == '\r')) : (j += 1) {}
+            if (j < input.len and (input[j] == '}' or input[j] == ']')) {
+                // Skip the trailing comma
+                i += 1;
+                continue;
+            }
+            try out.append(allocator, ',');
+            i += 1;
+            continue;
+        }
+
+        // Unquoted keys: bare identifier after { or , (with optional whitespace)
+        // Detect: we're after { or , (ignoring whitespace), and next is an identifier char
+        if (isIdentStart(c) and shouldQuoteKey(out.items)) {
+            // Collect the identifier
+            const key_start = i;
+            while (i < input.len and isIdentChar(input[i])) : (i += 1) {}
+            try out.append(allocator, '"');
+            try out.appendSlice(allocator, input[key_start..i]);
+            try out.append(allocator, '"');
+            continue;
+        }
+
+        try out.append(allocator, c);
+        i += 1;
+    }
+
+    return try allocator.dupe(u8, out.items);
+}
+
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
+}
+
+fn isIdentChar(c: u8) bool {
+    return isIdentStart(c) or (c >= '0' and c <= '9');
+}
+
+/// Check if the last non-whitespace character in output is { or , or start of input
+/// which would indicate we're in key position.
+fn shouldQuoteKey(output: []const u8) bool {
+    var j: usize = output.len;
+    while (j > 0) {
+        j -= 1;
+        const ch = output[j];
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') continue;
+        return ch == '{' or ch == ',';
+    }
+    return false;
 }
 
 // --- Tests ---
@@ -686,4 +831,211 @@ test "substituteEnvVars only dollar sign" {
     const result = try substituteEnvVars(allocator, "$");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("$", result);
+}
+
+// --- JSON5 Preprocessor Tests ---
+
+test "stripJson5 passthrough plain JSON" {
+    const allocator = std.testing.allocator;
+    const result = try stripJson5(allocator, "{\"key\":\"value\"}");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("{\"key\":\"value\"}", result);
+}
+
+test "stripJson5 single-line comment" {
+    const allocator = std.testing.allocator;
+    const input = "{\n  // this is a comment\n  \"key\": \"value\"\n}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    // Comment should be stripped
+    try std.testing.expect(std.mem.indexOf(u8, result, "//") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"key\"") != null);
+}
+
+test "stripJson5 multi-line comment" {
+    const allocator = std.testing.allocator;
+    const input = "{ /* block comment */ \"key\": \"value\" }";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "/*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"key\"") != null);
+}
+
+test "stripJson5 trailing comma object" {
+    const allocator = std.testing.allocator;
+    const input = "{\"a\":1, \"b\":2,}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    // Parse should succeed (no trailing comma)
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch {
+        return error.ParseFailed;
+    };
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+}
+
+test "stripJson5 trailing comma array" {
+    const allocator = std.testing.allocator;
+    const input = "[1, 2, 3,]";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch {
+        return error.ParseFailed;
+    };
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+}
+
+test "stripJson5 unquoted keys" {
+    const allocator = std.testing.allocator;
+    const input = "{port: 8080, host: \"localhost\"}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"port\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"host\"") != null);
+}
+
+test "stripJson5 single-quoted strings" {
+    const allocator = std.testing.allocator;
+    const input = "{\"key\": 'value'}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"value\"") != null);
+}
+
+test "stripJson5 comment inside string preserved" {
+    const allocator = std.testing.allocator;
+    const input = "{\"key\": \"https://example.com\"}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(input, result);
+}
+
+test "stripJson5 double-slash in string preserved" {
+    const allocator = std.testing.allocator;
+    const input = "{\"url\": \"http://example.com//path\"}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(input, result);
+}
+
+test "stripJson5 empty input" {
+    const allocator = std.testing.allocator;
+    const result = try stripJson5(allocator, "");
+    // Empty input returns original slice
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "stripJson5 full JSON5 config" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  // Gateway configuration
+        \\  gateway: {
+        \\    port: 9999,
+        \\  },
+        \\  /* Logging */
+        \\  logging: {
+        \\    level: 'debug',
+        \\  },
+        \\}
+    ;
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    // Should parse as valid JSON
+    const config = parseConfigJson(result);
+    try std.testing.expect(config != null);
+}
+
+test "stripJson5 OpenClaw-style config" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  // OpenClaw JSON5 config
+        \\  gateway: {
+        \\    port: 8080, // custom port
+        \\  },
+        \\  logging: {
+        \\    level: "info",
+        \\    consoleStyle: "compact",
+        \\  },
+        \\}
+    ;
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    const config = parseConfigJson(result).?;
+    try std.testing.expectEqual(@as(u16, 8080), config.gateway.port);
+    try std.testing.expectEqual(schema.LogLevel.info, config.logging.level);
+    try std.testing.expectEqual(schema.ConsoleStyle.compact, config.logging.console_style);
+}
+
+test "stripJson5 nested trailing commas" {
+    const allocator = std.testing.allocator;
+    const input = "{\"a\": {\"b\": 1,}, \"c\": [1, 2,],}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch {
+        return error.ParseFailed;
+    };
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+}
+
+test "stripJson5 comment at end of file" {
+    const allocator = std.testing.allocator;
+    const input = "{\"key\":\"value\"}\n// trailing comment";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "//") == null);
+}
+
+test "stripJson5 multiline comment spanning lines" {
+    const allocator = std.testing.allocator;
+    const input = "{\n/*\n * multi\n * line\n */\n\"key\":1\n}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "/*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"key\"") != null);
+}
+
+test "stripJson5 escaped quote in string" {
+    const allocator = std.testing.allocator;
+    const input = "{\"key\": \"value with \\\"quotes\\\"\"}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(input, result);
+}
+
+test "stripJson5 single-quoted with double quotes inside" {
+    const allocator = std.testing.allocator;
+    const input = "{\"key\": 'He said \"hi\"'}";
+    const result = try stripJson5(allocator, input);
+    defer allocator.free(result);
+    // Double quotes inside single-quoted string should be escaped
+    try std.testing.expect(std.mem.indexOf(u8, result, "\\\"hi\\\"") != null);
+}
+
+test "parseConfigJson with JSON5 comments" {
+    const input =
+        \\{
+        \\  // comment
+        \\  "gateway": {
+        \\    "port": 7777
+        \\  }
+        \\}
+    ;
+    const config = parseConfigJson(input).?;
+    try std.testing.expectEqual(@as(u16, 7777), config.gateway.port);
+}
+
+test "parseConfigJson with trailing commas" {
+    const input =
+        \\{
+        \\  "gateway": {
+        \\    "port": 5555,
+        \\  },
+        \\}
+    ;
+    const config = parseConfigJson(input).?;
+    try std.testing.expectEqual(@as(u16, 5555), config.gateway.port);
 }
