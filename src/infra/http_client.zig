@@ -896,3 +896,191 @@ test "HttpError - ConnectionFailed from exhausted mock" {
     try std.testing.expectError(HttpError.ConnectionFailed, client.get("https://a.com", &.{}));
     try std.testing.expectError(HttpError.ConnectionFailed, client.post("https://a.com", &.{}, ""));
 }
+
+// === New Tests (batch 3) ===
+
+test "MockTransport response sequence of 3" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"page\":1}" },
+        .{ .status = 200, .body = "{\"page\":2}" },
+        .{ .status = 200, .body = "{\"page\":3}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var r1 = try client.get("https://api.example.com/items?page=1", &.{});
+    defer r1.deinit();
+    try std.testing.expectEqualStrings("{\"page\":1}", r1.body);
+
+    var r2 = try client.get("https://api.example.com/items?page=2", &.{});
+    defer r2.deinit();
+    try std.testing.expectEqualStrings("{\"page\":2}", r2.body);
+
+    var r3 = try client.get("https://api.example.com/items?page=3", &.{});
+    defer r3.deinit();
+    try std.testing.expectEqualStrings("{\"page\":3}", r3.body);
+
+    // Exhausted - next call should fail
+    try std.testing.expectError(HttpError.ConnectionFailed, client.get("https://api.example.com/items?page=4", &.{}));
+}
+
+test "MockTransport call_count tracking" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{}" },
+        .{ .status = 200, .body = "{}" },
+        .{ .status = 200, .body = "{}" },
+        .{ .status = 200, .body = "{}" },
+        .{ .status = 200, .body = "{}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    try std.testing.expectEqual(@as(usize, 0), mock.call_count);
+
+    var r1 = try client.get("https://a.com", &.{});
+    defer r1.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+
+    var r2 = try client.post("https://a.com", &.{}, "body");
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), mock.call_count);
+
+    var r3 = try client.get("https://a.com", &.{});
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(usize, 3), mock.call_count);
+
+    var r4 = try client.postJson("https://a.com", &.{}, "{}");
+    defer r4.deinit();
+    try std.testing.expectEqual(@as(usize, 4), mock.call_count);
+
+    var r5 = try client.postSse("https://a.com", &.{}, "{}");
+    defer r5.deinit();
+    try std.testing.expectEqual(@as(usize, 5), mock.call_count);
+}
+
+test "HttpClient.get with custom headers" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"user\":\"admin\"}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    const headers = [_]Header{
+        .{ .name = "Authorization", .value = "Bearer sk-test-token-123" },
+        .{ .name = "Accept", .value = "application/json" },
+        .{ .name = "X-Request-Id", .value = "req-abc-456" },
+    };
+    var resp = try client.get("https://api.example.com/me", &headers);
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("{\"user\":\"admin\"}", resp.body);
+    try std.testing.expectEqual(HttpMethod.GET, mock.last_method.?);
+    try std.testing.expectEqualStrings("https://api.example.com/me", mock.last_url.?);
+}
+
+test "HttpClient.post with body" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 201, .body = "{\"id\":42}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    const body = "{\"name\":\"test-agent\",\"model\":\"claude-3\",\"temperature\":0.7}";
+    const headers = [_]Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "x-api-key", .value = "sk-ant-123" },
+    };
+    var resp = try client.post("https://api.anthropic.com/v1/agents", &headers, body);
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expectEqualStrings("{\"id\":42}", resp.body);
+    try std.testing.expectEqual(HttpMethod.POST, mock.last_method.?);
+    try std.testing.expectEqualStrings(body, mock.last_body.?);
+}
+
+test "Response.deinit cleanup" {
+    // Allocated body should be freed without leaks (testing allocator checks for leaks)
+    const body1 = try std.testing.allocator.dupe(u8, "response body data here that is allocated");
+    var resp1 = HttpResponse{
+        .status = 200,
+        .body = body1,
+        .allocator = std.testing.allocator,
+    };
+    resp1.deinit();
+
+    // Larger allocation
+    const body2 = try std.testing.allocator.alloc(u8, 4096);
+    @memset(body2, 'Z');
+    var resp2 = HttpResponse{
+        .status = 200,
+        .body = body2,
+        .allocator = std.testing.allocator,
+    };
+    resp2.deinit();
+
+    // No allocator means no free needed
+    var resp3 = HttpResponse{
+        .status = 404,
+        .body = "static not found",
+    };
+    resp3.deinit();
+}
+
+test "MockTransport empty response body" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 204, .body = "" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var resp = try client.post("https://api.example.com/delete/42", &.{}, "");
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 204), resp.status);
+    try std.testing.expectEqualStrings("", resp.body);
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+}
+
+test "Response status code ranges" {
+    // Test a variety of status codes through MockTransport
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "OK" },
+        .{ .status = 301, .body = "" },
+        .{ .status = 404, .body = "Not Found" },
+        .{ .status = 500, .body = "Internal Server Error" },
+        .{ .status = 418, .body = "I'm a teapot" },
+        .{ .status = 100, .body = "" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var r200 = try client.get("https://a.com/ok", &.{});
+    defer r200.deinit();
+    try std.testing.expectEqual(@as(u16, 200), r200.status);
+
+    var r301 = try client.get("https://a.com/redirect", &.{});
+    defer r301.deinit();
+    try std.testing.expectEqual(@as(u16, 301), r301.status);
+
+    var r404 = try client.get("https://a.com/missing", &.{});
+    defer r404.deinit();
+    try std.testing.expectEqual(@as(u16, 404), r404.status);
+    try std.testing.expectEqualStrings("Not Found", r404.body);
+
+    var r500 = try client.get("https://a.com/error", &.{});
+    defer r500.deinit();
+    try std.testing.expectEqual(@as(u16, 500), r500.status);
+
+    var r418 = try client.get("https://a.com/teapot", &.{});
+    defer r418.deinit();
+    try std.testing.expectEqual(@as(u16, 418), r418.status);
+    try std.testing.expectEqualStrings("I'm a teapot", r418.body);
+
+    var r100 = try client.get("https://a.com/continue", &.{});
+    defer r100.deinit();
+    try std.testing.expectEqual(@as(u16, 100), r100.status);
+
+    try std.testing.expectEqual(@as(usize, 6), mock.call_count);
+}

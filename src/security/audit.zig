@@ -197,3 +197,94 @@ test "isSafeBinary blocked" {
     try std.testing.expect(!isSafeBinary("dd if=/dev/zero"));
     try std.testing.expect(!isSafeBinary(""));
 }
+
+// === New Tests (batch 3) ===
+
+test "path traversal detection with encoded dots" {
+    // URL-encoded dots (%2e) are literal bytes in the string - isPathTraversal
+    // looks for ".." which covers the decoded form. The encoded form "%2e%2e"
+    // does not contain ".." so it should not be detected at byte level,
+    // but if decoded first it would. Test the raw detection:
+    try std.testing.expect(!isPathTraversal("%2e%2e/etc/passwd"));
+    // However, the actual ".." sequence is always detected
+    try std.testing.expect(isPathTraversal("../etc/passwd"));
+    try std.testing.expect(isPathTraversal("/foo/%2e%2e/../etc/passwd"));
+}
+
+test "path traversal with null byte" {
+    try std.testing.expect(isPathTraversal("file\x00.txt"));
+    try std.testing.expect(isPathTraversal("/etc/passwd\x00.jpg"));
+    try std.testing.expect(isPathTraversal("\x00"));
+    try std.testing.expect(isPathTraversal("normal/path/\x00hidden"));
+    // Clean path without null byte should pass
+    try std.testing.expect(!isPathTraversal("file.txt"));
+}
+
+test "safe binary allowlist" {
+    // Common binaries that should be in the allowlist
+    try std.testing.expect(isSafeBinary("ls"));
+    try std.testing.expect(isSafeBinary("cat file.txt"));
+    try std.testing.expect(isSafeBinary("git status"));
+    try std.testing.expect(isSafeBinary("grep -r pattern ."));
+    try std.testing.expect(isSafeBinary("find . -name '*.zig'"));
+    try std.testing.expect(isSafeBinary("head -n 10 file"));
+    try std.testing.expect(isSafeBinary("tail -f log.txt"));
+    try std.testing.expect(isSafeBinary("wc -l file"));
+    try std.testing.expect(isSafeBinary("sort data.csv"));
+    try std.testing.expect(isSafeBinary("echo hello"));
+    try std.testing.expect(isSafeBinary("python3 script.py"));
+    try std.testing.expect(isSafeBinary("node app.js"));
+    try std.testing.expect(isSafeBinary("zig build"));
+    try std.testing.expect(isSafeBinary("cargo test"));
+    try std.testing.expect(isSafeBinary("curl https://example.com"));
+    try std.testing.expect(isSafeBinary("jq '.data' response.json"));
+    try std.testing.expect(isSafeBinary("mkdir -p dir/sub"));
+    try std.testing.expect(isSafeBinary("cp src dst"));
+    try std.testing.expect(isSafeBinary("mv old new"));
+    try std.testing.expect(isSafeBinary("touch newfile"));
+    try std.testing.expect(isSafeBinary("chmod 644 file"));
+}
+
+test "unsafe binary detection" {
+    try std.testing.expect(!isSafeBinary("rm -rf /"));
+    try std.testing.expect(!isSafeBinary("dd if=/dev/zero of=/dev/sda"));
+    try std.testing.expect(!isSafeBinary("mkfs.ext4 /dev/sda1"));
+    try std.testing.expect(!isSafeBinary("sudo rm -rf /"));
+    try std.testing.expect(!isSafeBinary("shutdown -h now"));
+    try std.testing.expect(!isSafeBinary("reboot"));
+    try std.testing.expect(!isSafeBinary("kill -9 1"));
+    try std.testing.expect(!isSafeBinary("fdisk /dev/sda"));
+    try std.testing.expect(!isSafeBinary("mount /dev/sda1 /mnt"));
+    try std.testing.expect(!isSafeBinary("chown root:root /etc/passwd"));
+    try std.testing.expect(!isSafeBinary("iptables -F"));
+}
+
+test "path traversal with symlink-like paths" {
+    // /tmp/../etc/shadow contains ".."
+    try std.testing.expect(isPathTraversal("/tmp/../etc/shadow"));
+    try std.testing.expect(isPathTraversal("/var/log/../../../etc/passwd"));
+    try std.testing.expect(isPathTraversal("/home/user/../../root/.ssh/id_rsa"));
+    // Clean paths that do not traverse
+    try std.testing.expect(!isPathTraversal("/tmp/myfile.txt"));
+    try std.testing.expect(!isPathTraversal("/etc/shadow"));
+}
+
+test "nested traversal" {
+    // Multiple levels of traversal
+    try std.testing.expect(isPathTraversal("foo/../../bar"));
+    try std.testing.expect(isPathTraversal("a/b/c/../../../d"));
+    try std.testing.expect(isPathTraversal("../../../../../../etc/passwd"));
+    try std.testing.expect(isPathTraversal("deep/path/../../../../root"));
+    // Single level still detected
+    try std.testing.expect(isPathTraversal("one/../two"));
+}
+
+test "Windows-style traversal" {
+    // Backslash traversal: "..\\..\\" contains ".." so it's detected
+    try std.testing.expect(isPathTraversal("..\\..\\windows\\system32"));
+    try std.testing.expect(isPathTraversal("..\\etc\\passwd"));
+    try std.testing.expect(isPathTraversal("foo\\..\\bar\\..\\secret"));
+    // Mixed forward/backward slashes
+    try std.testing.expect(isPathTraversal("foo/..\\bar"));
+    try std.testing.expect(isPathTraversal("..\\../etc/passwd"));
+}
