@@ -315,3 +315,318 @@ test "extractMessageType" {
     const json = "{\"type\":\"text\"}";
     try std.testing.expectEqualStrings("text", extractMessageType(json).?);
 }
+
+// ======================================================================
+// Additional comprehensive tests
+// ======================================================================
+
+// --- API URL Builder Tests ---
+
+test "buildApiUrl messages endpoint" {
+    var buf: [256]u8 = undefined;
+    const url = try buildApiUrl(&buf, "123456789", "messages");
+    try std.testing.expectEqualStrings("https://graph.facebook.com/v18.0/123456789/messages", url);
+}
+
+test "buildApiUrl media endpoint" {
+    var buf: [256]u8 = undefined;
+    const url = try buildApiUrl(&buf, "987654321", "media");
+    try std.testing.expectEqualStrings("https://graph.facebook.com/v18.0/987654321/media", url);
+}
+
+test "buildApiUrl phone_numbers endpoint" {
+    var buf: [256]u8 = undefined;
+    const url = try buildApiUrl(&buf, "111222333", "phone_numbers");
+    try std.testing.expectEqualStrings("https://graph.facebook.com/v18.0/111222333/phone_numbers", url);
+}
+
+test "buildApiUrl buffer too small" {
+    var buf: [5]u8 = undefined;
+    const result = buildApiUrl(&buf, "123", "messages");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+// --- Send Text Body Tests ---
+
+test "buildSendTextBody contains messaging_product" {
+    var buf: [1024]u8 = undefined;
+    const body = try buildSendTextBody(&buf, "15551234567", "Hi");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"messaging_product\":\"whatsapp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"text\"") != null);
+}
+
+test "buildSendTextBody escapes quotes" {
+    var buf: [1024]u8 = undefined;
+    const body = try buildSendTextBody(&buf, "15551234567", "He said \"hi\"");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"hi\\\"") != null);
+}
+
+test "buildSendTextBody escapes newlines" {
+    var buf: [1024]u8 = undefined;
+    const body = try buildSendTextBody(&buf, "15551234567", "line1\nline2");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\n") != null);
+}
+
+test "buildSendTextBody international phone number" {
+    var buf: [1024]u8 = undefined;
+    const body = try buildSendTextBody(&buf, "4915112345678", "Hallo");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"to\":\"4915112345678\"") != null);
+}
+
+test "buildSendTextBody empty text" {
+    var buf: [1024]u8 = undefined;
+    const body = try buildSendTextBody(&buf, "123", "");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"body\":\"\"") != null);
+}
+
+// --- Mark Read Body Tests ---
+
+test "buildMarkReadBody structure" {
+    var buf: [256]u8 = undefined;
+    const body = try buildMarkReadBody(&buf, "wamid.XYZ123");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"messaging_product\":\"whatsapp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"status\":\"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"message_id\":\"wamid.XYZ123\"") != null);
+}
+
+test "buildMarkReadBody with long wamid" {
+    var buf: [512]u8 = undefined;
+    const body = try buildMarkReadBody(&buf, "wamid.HBgNMTIzNDU2Nzg5MDEyFQIAEhgWM0VCMEU5RjM2REIzNzRDQjc5MjkA");
+    try std.testing.expect(std.mem.indexOf(u8, body, "wamid.HBgNMTIzNDU2Nzg5MDEyFQIAEhgWM0VCMEU5RjM2REIzNzRDQjc5MjkA") != null);
+}
+
+// --- Reaction Body Tests ---
+
+test "buildReactionBody structure" {
+    var buf: [256]u8 = undefined;
+    const body = try buildReactionBody(&buf, "wamid.abc", "👍");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"messaging_product\":\"whatsapp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"reaction\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"message_id\":\"wamid.abc\"") != null);
+}
+
+test "buildReactionBody different emoji" {
+    var buf: [256]u8 = undefined;
+    const body = try buildReactionBody(&buf, "wamid.xyz", "❤️");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reaction\":{") != null);
+}
+
+// --- Webhook Verification Tests ---
+
+test "verifyWebhook case sensitive mode" {
+    try std.testing.expect(verifyWebhook("Subscribe", "tok", "c", "tok") == null);
+}
+
+test "verifyWebhook case sensitive token" {
+    try std.testing.expect(verifyWebhook("subscribe", "Token", "c", "token") == null);
+}
+
+test "verifyWebhook empty challenge" {
+    const result = verifyWebhook("subscribe", "tok", "", "tok");
+    try std.testing.expectEqualStrings("", result.?);
+}
+
+test "verifyWebhook empty token" {
+    try std.testing.expect(verifyWebhook("subscribe", "", "c", "tok") == null);
+}
+
+test "verifyWebhook empty expected_token" {
+    try std.testing.expect(verifyWebhook("subscribe", "tok", "c", "") == null);
+}
+
+test "verifyWebhook matching empty tokens" {
+    const result = verifyWebhook("subscribe", "", "challenge", "");
+    try std.testing.expectEqualStrings("challenge", result.?);
+}
+
+// --- Extraction Tests ---
+
+test "extractMessageText from webhook payload" {
+    const json =
+        \\{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"messages":[{"from":"15551234567","text":{"body":"Hello from webhook"},"type":"text"}]}}]}]}
+    ;
+    try std.testing.expectEqualStrings("Hello from webhook", extractMessageText(json).?);
+}
+
+test "extractMessageText missing" {
+    const json = "{\"type\":\"image\",\"image\":{\"id\":\"abc\"}}";
+    try std.testing.expect(extractMessageText(json) == null);
+}
+
+test "extractFrom from message" {
+    const json = "{\"from\":\"491234567890\",\"type\":\"text\"}";
+    try std.testing.expectEqualStrings("491234567890", extractFrom(json).?);
+}
+
+test "extractFrom missing" {
+    const json = "{\"type\":\"text\"}";
+    try std.testing.expect(extractFrom(json) == null);
+}
+
+test "extractWamid from message" {
+    const json = "{\"id\":\"wamid.HBgNMTIzNDU2Nzg5MDEyFQ\",\"type\":\"text\"}";
+    const result = extractWamid(json);
+    try std.testing.expect(result != null);
+}
+
+test "extractWamid missing" {
+    const json = "{\"id\":\"not-a-wamid\",\"type\":\"text\"}";
+    try std.testing.expect(extractWamid(json) == null);
+}
+
+test "extractMessageId with wamid" {
+    const json = "{\"id\":\"wamid.ABC123\"}";
+    const id = extractMessageId(json).?;
+    try std.testing.expect(std.mem.startsWith(u8, id, "wamid."));
+}
+
+test "extractMessageId without wamid prefix" {
+    const json = "{\"id\":\"regular-id-123\"}";
+    const id = extractMessageId(json).?;
+    try std.testing.expectEqualStrings("regular-id-123", id);
+}
+
+test "extractMessageId missing" {
+    const json = "{\"type\":\"text\"}";
+    try std.testing.expect(extractMessageId(json) == null);
+}
+
+test "extractMessageType image" {
+    const json = "{\"type\":\"image\",\"image\":{\"id\":\"abc\"}}";
+    try std.testing.expectEqualStrings("image", extractMessageType(json).?);
+}
+
+test "extractMessageType video" {
+    const json = "{\"type\":\"video\",\"video\":{\"id\":\"xyz\"}}";
+    try std.testing.expectEqualStrings("video", extractMessageType(json).?);
+}
+
+test "extractMessageType audio" {
+    const json = "{\"type\":\"audio\",\"audio\":{\"id\":\"123\"}}";
+    try std.testing.expectEqualStrings("audio", extractMessageType(json).?);
+}
+
+test "extractMessageType document" {
+    const json = "{\"type\":\"document\",\"document\":{\"id\":\"doc\"}}";
+    try std.testing.expectEqualStrings("document", extractMessageType(json).?);
+}
+
+test "extractMessageType sticker" {
+    const json = "{\"type\":\"sticker\",\"sticker\":{\"id\":\"stk\"}}";
+    try std.testing.expectEqualStrings("sticker", extractMessageType(json).?);
+}
+
+test "extractMessageType location" {
+    const json = "{\"type\":\"location\",\"location\":{\"latitude\":40.7}}";
+    try std.testing.expectEqualStrings("location", extractMessageType(json).?);
+}
+
+test "extractMessageType reaction" {
+    const json = "{\"type\":\"reaction\",\"reaction\":{\"emoji\":\"👍\"}}";
+    try std.testing.expectEqualStrings("reaction", extractMessageType(json).?);
+}
+
+test "extractDisplayPhoneNumber" {
+    const json = "{\"display_phone_number\":\"+1 555 123 4567\"}";
+    try std.testing.expectEqualStrings("+1 555 123 4567", extractDisplayPhoneNumber(json).?);
+}
+
+test "extractDisplayPhoneNumber missing" {
+    const json = "{\"phone_number_id\":\"123\"}";
+    try std.testing.expect(extractDisplayPhoneNumber(json) == null);
+}
+
+test "extractProfileName from contacts" {
+    const json = "{\"contacts\":[{\"profile\":{\"name\":\"Alice Smith\"},\"wa_id\":\"15551234567\"}]}";
+    try std.testing.expectEqualStrings("Alice Smith", extractProfileName(json).?);
+}
+
+test "extractProfileName missing" {
+    const json = "{\"from\":\"123\",\"type\":\"text\"}";
+    try std.testing.expect(extractProfileName(json) == null);
+}
+
+// --- Group Detection Tests ---
+
+test "isGroupMessage with participant field" {
+    const json = "{\"from\":\"group-jid\",\"participant\":\"15551234567\",\"type\":\"text\"}";
+    try std.testing.expect(isGroupMessage(json));
+}
+
+test "isGroupMessage without participant is DM" {
+    const json = "{\"from\":\"15551234567\",\"type\":\"text\",\"text\":{\"body\":\"hi\"}}";
+    try std.testing.expect(!isGroupMessage(json));
+}
+
+test "isGroupMessage empty json" {
+    try std.testing.expect(!isGroupMessage("{}"));
+}
+
+// --- Incoming Message Parser Tests ---
+
+test "parseIncomingMessage full webhook message" {
+    const json =
+        \\{"from":"15551234567","id":"wamid.abc123","type":"text","text":{"body":"Hello!"},"contacts":[{"profile":{"name":"John Doe"}}]}
+    ;
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expectEqual(plugin.ChannelType.whatsapp, msg.channel);
+    try std.testing.expectEqualStrings("Hello!", msg.content);
+    try std.testing.expectEqualStrings("15551234567", msg.sender_id);
+    try std.testing.expectEqualStrings("15551234567", msg.chat_id); // DM uses sender as chat_id
+    try std.testing.expectEqualStrings("John Doe", msg.sender_name.?);
+    try std.testing.expect(!msg.is_group);
+}
+
+test "parseIncomingMessage group message with participant" {
+    const json = "{\"from\":\"group-jid\",\"participant\":\"15551234567\",\"text\":{\"body\":\"Group msg\"},\"id\":\"wamid.xyz\"}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expect(msg.is_group);
+    try std.testing.expectEqualStrings("Group msg", msg.content);
+}
+
+test "parseIncomingMessage image message no text returns null" {
+    const json = "{\"from\":\"123\",\"type\":\"image\",\"image\":{\"id\":\"abc\"}}";
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "parseIncomingMessage missing from returns null" {
+    const json = "{\"text\":{\"body\":\"hi\"},\"type\":\"text\"}";
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+// --- WaMessageType Tests ---
+
+test "WaMessageType all types roundtrip" {
+    const types = [_]WaMessageType{ .text, .image, .audio, .video, .document, .location, .sticker, .reaction, .interactive };
+    for (types) |t| {
+        const label_str = t.label();
+        const parsed = WaMessageType.fromString(label_str).?;
+        try std.testing.expectEqual(t, parsed);
+    }
+}
+
+test "WaMessageType fromString case sensitive" {
+    try std.testing.expect(WaMessageType.fromString("Text") == null);
+    try std.testing.expect(WaMessageType.fromString("IMAGE") == null);
+}
+
+// --- WhatsAppConfig Tests ---
+
+test "WhatsAppConfig with custom verify_token" {
+    const config = WhatsAppConfig{
+        .phone_number_id = "123",
+        .access_token = "tok",
+        .verify_token = "my-custom-verify",
+        .api_version = "v19.0",
+    };
+    try std.testing.expectEqualStrings("my-custom-verify", config.verify_token);
+    try std.testing.expectEqualStrings("v19.0", config.api_version);
+}
+
+// --- Status Webhook Detection ---
+
+test "extractMessageType status update" {
+    const json = "{\"type\":\"status\",\"status\":\"delivered\"}";
+    // The type field here is "status" not a message type
+    try std.testing.expectEqualStrings("status", extractMessageType(json).?);
+}

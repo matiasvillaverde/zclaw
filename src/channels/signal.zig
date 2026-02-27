@@ -341,3 +341,279 @@ test "SignalConfig defaults" {
     try std.testing.expect(config.config_dir == null);
     try std.testing.expect(!config.trust_all_keys);
 }
+
+// ======================================================================
+// Additional comprehensive tests
+// ======================================================================
+
+// --- JSON-RPC Request Builder Tests ---
+
+test "buildJsonRpcRequest list_groups method" {
+    var buf: [256]u8 = undefined;
+    const req = try buildJsonRpcRequest(&buf, 10, "list_groups", null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"id\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"method\":\"list_groups\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"params\":") == null);
+}
+
+test "buildJsonRpcRequest ends with newline" {
+    var buf: [256]u8 = undefined;
+    const req = try buildJsonRpcRequest(&buf, 1, "receive", null);
+    try std.testing.expect(std.mem.endsWith(u8, req, "\n"));
+}
+
+test "buildJsonRpcRequest with complex params" {
+    var buf: [512]u8 = undefined;
+    const req = try buildJsonRpcRequest(&buf, 3, "send", "{\"recipient\":[\"+1234\"],\"message\":\"hello\",\"attachments\":[\"file.png\"]}");
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"params\":{\"recipient\":[\"+1234\"]") != null);
+}
+
+test "buildJsonRpcRequest id zero" {
+    var buf: [256]u8 = undefined;
+    const req = try buildJsonRpcRequest(&buf, 0, "test", null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"id\":0") != null);
+}
+
+test "buildJsonRpcRequest large id" {
+    var buf: [256]u8 = undefined;
+    const req = try buildJsonRpcRequest(&buf, 999999, "test", null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"id\":999999") != null);
+}
+
+// --- Send Request Tests ---
+
+test "buildSendRequest escapes quotes in message" {
+    var buf: [512]u8 = undefined;
+    const req = try buildSendRequest(&buf, 1, "+1234", "He said \"hello\"");
+    try std.testing.expect(std.mem.indexOf(u8, req, "\\\"hello\\\"") != null);
+}
+
+test "buildSendRequest escapes newlines in message" {
+    var buf: [512]u8 = undefined;
+    const req = try buildSendRequest(&buf, 1, "+1234", "line1\nline2");
+    try std.testing.expect(std.mem.indexOf(u8, req, "\\n") != null);
+}
+
+test "buildSendRequest international number" {
+    var buf: [512]u8 = undefined;
+    const req = try buildSendRequest(&buf, 2, "+4915112345678", "Hallo!");
+    try std.testing.expect(std.mem.indexOf(u8, req, "+4915112345678") != null);
+}
+
+test "buildSendRequest ends with newline" {
+    var buf: [512]u8 = undefined;
+    const req = try buildSendRequest(&buf, 1, "+1234", "hi");
+    try std.testing.expect(std.mem.endsWith(u8, req, "\n"));
+}
+
+// --- Receive Request Tests ---
+
+test "buildReceiveRequest structure" {
+    var buf: [256]u8 = undefined;
+    const req = try buildReceiveRequest(&buf, 10);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"jsonrpc\":\"2.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"id\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"method\":\"receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"params\":") == null);
+}
+
+// --- CLI Args Tests ---
+
+test "buildCliArgs with all options" {
+    var buf: [512]u8 = undefined;
+    const args = try buildCliArgs(&buf, .{
+        .phone_number = "+15551234567",
+        .signal_cli_path = "/usr/local/bin/signal-cli",
+        .config_dir = "/home/user/.config/signal",
+        .trust_all_keys = true,
+    }, "send");
+    try std.testing.expect(std.mem.indexOf(u8, args, "/usr/local/bin/signal-cli") != null);
+    try std.testing.expect(std.mem.indexOf(u8, args, "--config /home/user/.config/signal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, args, "--trust-new-identities always") != null);
+    try std.testing.expect(std.mem.indexOf(u8, args, "-u +15551234567") != null);
+    try std.testing.expect(std.mem.indexOf(u8, args, "send") != null);
+}
+
+test "buildCliArgs without optional flags" {
+    var buf: [512]u8 = undefined;
+    const args = try buildCliArgs(&buf, .{ .phone_number = "+1" }, "receive");
+    try std.testing.expect(std.mem.indexOf(u8, args, "--config") == null);
+    try std.testing.expect(std.mem.indexOf(u8, args, "--trust-new-identities") == null);
+}
+
+test "buildCliArgs custom signal_cli_path" {
+    var buf: [512]u8 = undefined;
+    const args = try buildCliArgs(&buf, .{
+        .phone_number = "+1",
+        .signal_cli_path = "/opt/signal/signal-cli-0.12.0/bin/signal-cli",
+    }, "daemon");
+    try std.testing.expect(std.mem.startsWith(u8, args, "/opt/signal/signal-cli-0.12.0/bin/signal-cli"));
+}
+
+test "buildCliArgs register command" {
+    var buf: [512]u8 = undefined;
+    const args = try buildCliArgs(&buf, .{ .phone_number = "+15559999999" }, "register");
+    try std.testing.expect(std.mem.endsWith(u8, args, "register"));
+}
+
+test "buildCliArgs link command" {
+    var buf: [512]u8 = undefined;
+    const args = try buildCliArgs(&buf, .{ .phone_number = "+1" }, "link");
+    try std.testing.expect(std.mem.endsWith(u8, args, "link"));
+}
+
+// --- Response Parsing Tests ---
+
+test "extractMessageBody from data message" {
+    const json = "{\"envelope\":{\"source\":\"+1234\",\"dataMessage\":{\"timestamp\":1700000000,\"message\":\"Hello!\",\"expiresInSeconds\":0}}}";
+    try std.testing.expectEqualStrings("Hello!", extractMessageBody(json).?);
+}
+
+test "extractMessageBody missing" {
+    const json = "{\"envelope\":{\"source\":\"+1234\"}}";
+    try std.testing.expect(extractMessageBody(json) == null);
+}
+
+test "extractSourceNumber international" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+4915112345678\"}}";
+    try std.testing.expectEqualStrings("+4915112345678", extractSourceNumber(json).?);
+}
+
+test "extractSourceNumber missing" {
+    const json = "{\"envelope\":{\"timestamp\":123}}";
+    try std.testing.expect(extractSourceNumber(json) == null);
+}
+
+test "extractGroupId base64 encoded" {
+    const json = "{\"envelope\":{\"dataMessage\":{\"groupId\":\"ABCDEF1234567890==\"}}}";
+    try std.testing.expectEqualStrings("ABCDEF1234567890==", extractGroupId(json).?);
+}
+
+test "extractTimestamp large value" {
+    const json = "{\"envelope\":{\"timestamp\":1700000000000}}";
+    try std.testing.expectEqual(@as(i64, 1700000000000), extractTimestamp(json).?);
+}
+
+test "extractTimestamp missing" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+1\"}}";
+    try std.testing.expect(extractTimestamp(json) == null);
+}
+
+test "extractSourceName with spaces" {
+    const json = "{\"envelope\":{\"sourceName\":\"John Doe Smith\"}}";
+    try std.testing.expectEqualStrings("John Doe Smith", extractSourceName(json).?);
+}
+
+test "extractSourceName missing" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+1\"}}";
+    try std.testing.expect(extractSourceName(json) == null);
+}
+
+test "extractJsonRpcId" {
+    const json = "{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{}}";
+    try std.testing.expectEqual(@as(i64, 42), extractJsonRpcId(json).?);
+}
+
+test "extractJsonRpcId zero" {
+    const json = "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}";
+    try std.testing.expectEqual(@as(i64, 0), extractJsonRpcId(json).?);
+}
+
+test "extractJsonRpcError message" {
+    const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1,\"message\":\"User not registered\"}}";
+    try std.testing.expectEqualStrings("User not registered", extractJsonRpcError(json).?);
+}
+
+test "extractJsonRpcError missing" {
+    const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+    // extractJsonRpcError looks for "message" key which is also in error responses
+    // In success responses there's no "message" field so it should return null
+    try std.testing.expect(extractJsonRpcError(json) == null);
+}
+
+test "isJsonRpcError with nested error object" {
+    const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}";
+    try std.testing.expect(isJsonRpcError(json));
+}
+
+test "isJsonRpcError success response" {
+    const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"timestamp\":123}}";
+    try std.testing.expect(!isJsonRpcError(json));
+}
+
+// --- Incoming Message Parser Tests ---
+
+test "parseIncomingMessage full envelope" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+15551234567\",\"sourceName\":\"Alice\",\"timestamp\":1700000001,\"dataMessage\":{\"message\":\"Hi from Signal!\",\"groupId\":null}}}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expectEqual(plugin.ChannelType.signal, msg.channel);
+    try std.testing.expectEqualStrings("Hi from Signal!", msg.content);
+    try std.testing.expectEqualStrings("+15551234567", msg.sender_id);
+    try std.testing.expectEqualStrings("Alice", msg.sender_name.?);
+    try std.testing.expect(!msg.is_group);
+}
+
+test "parseIncomingMessage group with group ID as chat_id" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+1234\",\"dataMessage\":{\"message\":\"Group hello\",\"groupId\":\"group-abc\"}}}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expect(msg.is_group);
+    try std.testing.expectEqualStrings("group-abc", msg.chat_id);
+    try std.testing.expectEqualStrings("+1234", msg.sender_id);
+}
+
+test "parseIncomingMessage DM uses source as chat_id" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+5551234\",\"dataMessage\":{\"message\":\"DM\"}}}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expect(!msg.is_group);
+    try std.testing.expectEqualStrings("+5551234", msg.chat_id);
+}
+
+test "parseIncomingMessage reaction only has no message body" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+1234\",\"dataMessage\":{\"reaction\":{\"emoji\":\"👍\",\"targetTimestamp\":123}}}}";
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "parseIncomingMessage receipt only has no message body" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+1234\",\"receiptMessage\":{\"type\":\"DELIVERY\",\"timestamps\":[123]}}}";
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "parseIncomingMessage typing indicator has no message body" {
+    const json = "{\"envelope\":{\"sourceNumber\":\"+1234\",\"typingMessage\":{\"action\":\"STARTED\"}}}";
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+// --- SignalMessageType Tests ---
+
+test "SignalMessageType all types roundtrip" {
+    const types = [_]SignalMessageType{ .text, .attachment, .reaction, .receipt, .typing, .group_update };
+    for (types) |t| {
+        const label_str = t.label();
+        const parsed = SignalMessageType.fromString(label_str).?;
+        try std.testing.expectEqual(t, parsed);
+    }
+}
+
+test "SignalMessageType fromString case sensitive" {
+    try std.testing.expect(SignalMessageType.fromString("Text") == null);
+    try std.testing.expect(SignalMessageType.fromString("RECEIPT") == null);
+}
+
+test "SignalMessageType fromString empty" {
+    try std.testing.expect(SignalMessageType.fromString("") == null);
+}
+
+// --- SignalConfig Tests ---
+
+test "SignalConfig with all fields" {
+    const config = SignalConfig{
+        .phone_number = "+15551234567",
+        .signal_cli_path = "/usr/local/bin/signal-cli",
+        .config_dir = "/home/user/.config/signal",
+        .trust_all_keys = true,
+    };
+    try std.testing.expectEqualStrings("+15551234567", config.phone_number);
+    try std.testing.expectEqualStrings("/usr/local/bin/signal-cli", config.signal_cli_path);
+    try std.testing.expectEqualStrings("/home/user/.config/signal", config.config_dir.?);
+    try std.testing.expect(config.trust_all_keys);
+}

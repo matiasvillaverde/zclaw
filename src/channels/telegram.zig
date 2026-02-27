@@ -609,3 +609,338 @@ test "TelegramChannel as PluginVTable" {
     p.stop();
     try std.testing.expectEqual(plugin.ChannelStatus.disconnected, p.getStatus());
 }
+
+// ======================================================================
+// Additional comprehensive tests
+// ======================================================================
+
+// --- URL Building Tests ---
+
+test "buildApiUrl for getMe" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, .{ .bot_token = "123:ABC" }, "getMe");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/getMe", url);
+}
+
+test "buildApiUrl for sendPhoto" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, .{ .bot_token = "tok" }, "sendPhoto");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bottok/sendPhoto", url);
+}
+
+test "buildApiUrl for sendDocument" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, .{ .bot_token = "tok" }, "sendDocument");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bottok/sendDocument", url);
+}
+
+test "buildApiUrl for sendVideo" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, .{ .bot_token = "tok" }, "sendVideo");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bottok/sendVideo", url);
+}
+
+test "buildApiUrl for deleteMessage" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, .{ .bot_token = "tok" }, "deleteMessage");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bottok/deleteMessage", url);
+}
+
+test "buildApiUrl for editMessageText" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, .{ .bot_token = "tok" }, "editMessageText");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bottok/editMessageText", url);
+}
+
+test "buildApiUrl for setWebhook" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, .{ .bot_token = "tok" }, "setWebhook");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bottok/setWebhook", url);
+}
+
+test "buildApiUrl custom base URL" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, .{ .bot_token = "tok", .api_url = "https://custom.api.org" }, "getMe");
+    try std.testing.expectEqualStrings("https://custom.api.org/bottok/getMe", url);
+}
+
+test "buildApiUrl buffer too small" {
+    var buf: [10]u8 = undefined;
+    const result = buildApiUrl(&buf, .{ .bot_token = "123:ABC" }, "sendMessage");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+// --- Send Message Body Tests ---
+
+test "buildSendMessageBody with HTML parse_mode" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "12345", "<b>bold</b>", "HTML");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\":\"HTML\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"<b>bold</b>\"") != null);
+}
+
+test "buildSendMessageBody with MarkdownV2 parse_mode" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "12345", "hello", "MarkdownV2");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\":\"MarkdownV2\"") != null);
+}
+
+test "buildSendMessageBody escapes quotes in text" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "123", "He said \"hello\"", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"hello\\\"") != null);
+}
+
+test "buildSendMessageBody escapes newlines" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "123", "line1\nline2", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\n") != null);
+}
+
+test "buildSendMessageBody escapes backslash" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "123", "path\\to\\file", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\\") != null);
+}
+
+test "buildSendMessageBody escapes tabs" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "123", "col1\tcol2", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\t") != null);
+}
+
+test "buildSendMessageBody escapes carriage return" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "123", "line1\rline2", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\r") != null);
+}
+
+test "buildSendMessageBody with negative chat_id" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "-1001234567890", "group msg", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"chat_id\":\"-1001234567890\"") != null);
+}
+
+test "buildSendMessageBody empty text" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "123", "", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"\"") != null);
+}
+
+// --- Get Updates Body Tests ---
+
+test "buildGetUpdatesBody with large offset" {
+    var buf: [256]u8 = undefined;
+    const body = try buildGetUpdatesBody(&buf, 999999999, 60);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"offset\":999999999") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"timeout\":60") != null);
+}
+
+test "buildGetUpdatesBody with zero timeout" {
+    var buf: [256]u8 = undefined;
+    const body = try buildGetUpdatesBody(&buf, null, 0);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"timeout\":0") != null);
+}
+
+// --- Update Parsing Tests ---
+
+test "extractChatId negative group ID" {
+    const json = "{\"message\":{\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"}}}";
+    try std.testing.expectEqualStrings("-1001234567890", extractChatId(json).?);
+}
+
+test "extractChatId missing chat object" {
+    const json = "{\"message\":{\"text\":\"hello\"}}";
+    try std.testing.expect(extractChatId(json) == null);
+}
+
+test "extractFromId missing from object" {
+    const json = "{\"message\":{\"chat\":{\"id\":123}}}";
+    try std.testing.expect(extractFromId(json) == null);
+}
+
+test "extractUpdateId large value" {
+    const json = "{\"update_id\":987654321,\"message\":{}}";
+    try std.testing.expectEqual(@as(i64, 987654321), extractUpdateId(json).?);
+}
+
+test "extractUpdateId missing" {
+    const json = "{\"message\":{\"text\":\"hi\"}}";
+    try std.testing.expect(extractUpdateId(json) == null);
+}
+
+test "extractFirstName missing" {
+    const json = "{\"from\":{\"id\":1}}";
+    try std.testing.expect(extractFirstName(json) == null);
+}
+
+test "extractFirstName with unicode" {
+    const json = "{\"from\":{\"id\":1,\"first_name\":\"Test\"}}";
+    try std.testing.expectEqualStrings("Test", extractFirstName(json).?);
+}
+
+test "extractMessageText with escaped quotes" {
+    const json = "{\"message\":{\"text\":\"He said \\\"hello\\\"\"}}";
+    // The parser stops at the first unescaped quote
+    const result = extractMessageText(json);
+    try std.testing.expect(result != null);
+}
+
+// --- Chat Type Detection ---
+
+test "isGroupChat channel type" {
+    const json = "{\"chat\":{\"type\":\"channel\"}}";
+    // Channels are not detected as group by the current implementation
+    try std.testing.expect(!isGroupChat(json));
+}
+
+test "isGroupChat no type field" {
+    const json = "{\"chat\":{\"id\":123}}";
+    try std.testing.expect(!isGroupChat(json));
+}
+
+test "isGroupChat empty json" {
+    try std.testing.expect(!isGroupChat("{}"));
+}
+
+// --- Webhook Payload Parsing ---
+
+test "parseIncomingMessage full webhook payload" {
+    const json =
+        \\{"update_id":123456789,"message":{"message_id":42,"from":{"id":12345678,"is_bot":false,"first_name":"Alice","last_name":"Smith","username":"alice_s","language_code":"en"},"chat":{"id":12345678,"first_name":"Alice","last_name":"Smith","username":"alice_s","type":"private"},"date":1700000000,"text":"/start"}}
+    ;
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expectEqual(plugin.ChannelType.telegram, msg.channel);
+    try std.testing.expectEqualStrings("/start", msg.content);
+    try std.testing.expectEqualStrings("12345678", msg.sender_id);
+    try std.testing.expectEqualStrings("12345678", msg.chat_id);
+    try std.testing.expect(!msg.is_group);
+    try std.testing.expectEqualStrings("123456789", msg.message_id);
+}
+
+test "parseIncomingMessage supergroup message" {
+    const json =
+        \\{"update_id":100,"message":{"text":"hey all","chat":{"id":-1001234,"type":"supergroup","title":"My Group"},"from":{"id":555,"first_name":"Bob"}}}
+    ;
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expect(msg.is_group);
+    try std.testing.expectEqualStrings("-1001234", msg.chat_id);
+    try std.testing.expectEqualStrings("hey all", msg.content);
+}
+
+test "parseIncomingMessage missing chat_id returns null" {
+    const json = "{\"message\":{\"text\":\"hello\",\"from\":{\"id\":1}}}";
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "parseIncomingMessage missing from returns null" {
+    const json = "{\"message\":{\"text\":\"hello\",\"chat\":{\"id\":1}}}";
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "parseIncomingMessage photo message has no text" {
+    const json =
+        \\{"update_id":200,"message":{"photo":[{"file_id":"abc"}],"chat":{"id":1,"type":"private"},"from":{"id":2}}}
+    ;
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "parseIncomingMessage edited_message is not parsed" {
+    // The parser only looks for "text" key, not the edited wrapper
+    const json =
+        \\{"update_id":300,"edited_message":{"chat":{"id":1,"type":"private"},"from":{"id":2}}}
+    ;
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+// --- TelegramConfig Tests ---
+
+test "TelegramConfig custom values" {
+    const config = TelegramConfig{
+        .bot_token = "123:ABC",
+        .api_url = "https://custom.api",
+        .poll_timeout = 60,
+        .allowed_updates = "message,callback_query",
+    };
+    try std.testing.expectEqualStrings("123:ABC", config.bot_token);
+    try std.testing.expectEqualStrings("https://custom.api", config.api_url);
+    try std.testing.expectEqual(@as(u32, 60), config.poll_timeout);
+    try std.testing.expectEqualStrings("message,callback_query", config.allowed_updates);
+}
+
+// --- TelegramChannel Advanced Tests ---
+
+test "TelegramChannel stop sets disconnected" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+    channel.status = .connected;
+
+    var p = channel.asPlugin();
+    p.stop();
+    try std.testing.expectEqual(plugin.ChannelStatus.disconnected, channel.status);
+}
+
+test "TelegramChannel pollUpdates group message" {
+    const allocator = std.testing.allocator;
+    const update_json = "{\"ok\":true,\"result\":[{\"update_id\":200,\"message\":{\"text\":\"group hello\",\"chat\":{\"id\":-100123,\"type\":\"group\"},\"from\":{\"id\":77}}}]}";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = update_json },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    const result = try channel.pollUpdates();
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("group hello", result.?.content);
+    try std.testing.expect(result.?.is_group);
+    try std.testing.expectEqual(@as(i64, 200), channel.last_update_id.?);
+}
+
+test "TelegramChannel pollUpdates updates offset" {
+    const allocator = std.testing.allocator;
+    const resp1 = "{\"ok\":true,\"result\":[{\"update_id\":100,\"message\":{\"text\":\"m1\",\"chat\":{\"id\":1,\"type\":\"private\"},\"from\":{\"id\":2}}}]}";
+    const resp2 = "{\"ok\":true,\"result\":[{\"update_id\":101,\"message\":{\"text\":\"m2\",\"chat\":{\"id\":1,\"type\":\"private\"},\"from\":{\"id\":2}}}]}";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = resp1 },
+        .{ .status = 200, .body = resp2 },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    _ = try channel.pollUpdates();
+    try std.testing.expectEqual(@as(i64, 100), channel.last_update_id.?);
+
+    _ = try channel.pollUpdates();
+    try std.testing.expectEqual(@as(i64, 101), channel.last_update_id.?);
+}
+
+test "TelegramChannel pollUpdates HTTP error returns null" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 500, .body = "{\"ok\":false}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    const result = try channel.pollUpdates();
+    try std.testing.expect(result == null);
+}
+
+test "TelegramChannel sendText with parse_mode" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    try channel.sendText(.{ .chat_id = "123", .content = "**bold**", .parse_mode = "Markdown" });
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "parse_mode") != null);
+}

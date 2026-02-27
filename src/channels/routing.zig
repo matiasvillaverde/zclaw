@@ -125,3 +125,259 @@ test "resolveAgent channel-specific" {
     try std.testing.expectEqualStrings("tg-bot", resolveAgent("telegram", &config));
     try std.testing.expectEqualStrings("main", resolveAgent("discord", &config));
 }
+
+// ======================================================================
+// Additional comprehensive tests
+// ======================================================================
+
+// --- Session Key Builder Tests ---
+
+test "buildSessionKey slack direct" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "helper", .slack, .direct, "U12345");
+    try std.testing.expectEqualStrings("agent:helper:slack:direct:U12345", key);
+}
+
+test "buildSessionKey slack group" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "helper", .slack, .group, "C12345");
+    try std.testing.expectEqualStrings("agent:helper:slack:group:C12345", key);
+}
+
+test "buildSessionKey whatsapp direct" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "main", .whatsapp, .direct, "15551234567");
+    try std.testing.expectEqualStrings("agent:main:whatsapp:direct:15551234567", key);
+}
+
+test "buildSessionKey whatsapp group" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "main", .whatsapp, .group, "group-jid");
+    try std.testing.expectEqualStrings("agent:main:whatsapp:group:group-jid", key);
+}
+
+test "buildSessionKey signal direct" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "bot", .signal, .direct, "+15551234567");
+    try std.testing.expectEqualStrings("agent:bot:signal:direct:+15551234567", key);
+}
+
+test "buildSessionKey signal group" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "bot", .signal, .group, "group-abc");
+    try std.testing.expectEqualStrings("agent:bot:signal:group:group-abc", key);
+}
+
+test "buildSessionKey matrix direct" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "main", .matrix, .direct, "@user:matrix.org");
+    try std.testing.expectEqualStrings("agent:main:matrix:direct:@user:matrix.org", key);
+}
+
+test "buildSessionKey matrix group" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "main", .matrix, .group, "!room:matrix.org");
+    try std.testing.expectEqualStrings("agent:main:matrix:group:!room:matrix.org", key);
+}
+
+test "buildSessionKey buffer too small" {
+    var buf: [5]u8 = undefined;
+    const result = buildSessionKey(&buf, "main", .telegram, .direct, "user123");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "buildSessionKey telegram direct" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "main", .telegram, .direct, "12345");
+    try std.testing.expectEqualStrings("agent:main:telegram:direct:12345", key);
+}
+
+test "buildSessionKey telegram group" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "main", .telegram, .group, "-1001234567890");
+    try std.testing.expectEqualStrings("agent:main:telegram:group:-1001234567890", key);
+}
+
+test "buildSessionKey discord direct" {
+    var buf: [256]u8 = undefined;
+    const key = try buildSessionKey(&buf, "main", .discord, .direct, "user-snowflake-id");
+    try std.testing.expectEqualStrings("agent:main:discord:direct:user-snowflake-id", key);
+}
+
+// --- Resolve Session Key Tests ---
+
+test "resolveSessionKey telegram DM" {
+    var buf: [256]u8 = undefined;
+    const msg = plugin.IncomingMessage{
+        .channel = .telegram,
+        .message_id = "1",
+        .sender_id = "user42",
+        .chat_id = "chat42",
+        .content = "hi",
+        .is_group = false,
+    };
+    const key = try resolveSessionKey(&buf, "main", msg);
+    try std.testing.expectEqualStrings("agent:main:telegram:direct:user42", key);
+}
+
+test "resolveSessionKey telegram group" {
+    var buf: [256]u8 = undefined;
+    const msg = plugin.IncomingMessage{
+        .channel = .telegram,
+        .message_id = "1",
+        .sender_id = "user42",
+        .chat_id = "-1001234",
+        .content = "hi",
+        .is_group = true,
+    };
+    const key = try resolveSessionKey(&buf, "main", msg);
+    try std.testing.expectEqualStrings("agent:main:telegram:group:-1001234", key);
+}
+
+test "resolveSessionKey discord DM" {
+    var buf: [256]u8 = undefined;
+    const msg = plugin.IncomingMessage{
+        .channel = .discord,
+        .message_id = "1",
+        .sender_id = "user-disc",
+        .chat_id = "dm-ch",
+        .content = "hi",
+        .is_group = false,
+    };
+    const key = try resolveSessionKey(&buf, "helper", msg);
+    try std.testing.expectEqualStrings("agent:helper:discord:direct:user-disc", key);
+}
+
+test "resolveSessionKey discord guild" {
+    var buf: [256]u8 = undefined;
+    const msg = plugin.IncomingMessage{
+        .channel = .discord,
+        .message_id = "1",
+        .sender_id = "user-disc",
+        .chat_id = "guild-ch",
+        .content = "hi",
+        .is_group = true,
+    };
+    const key = try resolveSessionKey(&buf, "helper", msg);
+    try std.testing.expectEqualStrings("agent:helper:discord:group:guild-ch", key);
+}
+
+test "resolveSessionKey slack" {
+    var buf: [256]u8 = undefined;
+    const msg = plugin.IncomingMessage{
+        .channel = .slack,
+        .message_id = "1",
+        .sender_id = "U123",
+        .chat_id = "C456",
+        .content = "hi",
+        .is_group = true,
+    };
+    const key = try resolveSessionKey(&buf, "main", msg);
+    try std.testing.expectEqualStrings("agent:main:slack:group:C456", key);
+}
+
+test "resolveSessionKey whatsapp DM" {
+    var buf: [256]u8 = undefined;
+    const msg = plugin.IncomingMessage{
+        .channel = .whatsapp,
+        .message_id = "1",
+        .sender_id = "15551234567",
+        .chat_id = "15551234567",
+        .content = "hi",
+        .is_group = false,
+    };
+    const key = try resolveSessionKey(&buf, "main", msg);
+    try std.testing.expectEqualStrings("agent:main:whatsapp:direct:15551234567", key);
+}
+
+test "resolveSessionKey signal DM" {
+    var buf: [256]u8 = undefined;
+    const msg = plugin.IncomingMessage{
+        .channel = .signal,
+        .message_id = "1",
+        .sender_id = "+15551234567",
+        .chat_id = "+15551234567",
+        .content = "hi",
+        .is_group = false,
+    };
+    const key = try resolveSessionKey(&buf, "main", msg);
+    try std.testing.expectEqualStrings("agent:main:signal:direct:+15551234567", key);
+}
+
+test "resolveSessionKey matrix" {
+    var buf: [256]u8 = undefined;
+    const msg = plugin.IncomingMessage{
+        .channel = .matrix,
+        .message_id = "1",
+        .sender_id = "@bot:matrix.org",
+        .chat_id = "!room:matrix.org",
+        .content = "hi",
+        .is_group = true,
+    };
+    const key = try resolveSessionKey(&buf, "main", msg);
+    try std.testing.expectEqualStrings("agent:main:matrix:group:!room:matrix.org", key);
+}
+
+test "resolveSessionKey webchat" {
+    var buf: [256]u8 = undefined;
+    const msg = plugin.IncomingMessage{
+        .channel = .webchat,
+        .message_id = "1",
+        .sender_id = "session-xyz",
+        .chat_id = "session-xyz",
+        .content = "hi",
+        .is_group = false,
+    };
+    const key = try resolveSessionKey(&buf, "main", msg);
+    try std.testing.expectEqualStrings("agent:main:webchat:direct:session-xyz", key);
+}
+
+// --- Agent Routing Tests ---
+
+test "resolveAgent with multiple channel agents" {
+    const allocator = std.testing.allocator;
+    var agents = std.StringHashMapUnmanaged([]const u8){};
+    defer agents.deinit(allocator);
+    try agents.put(allocator, "telegram", "tg-agent");
+    try agents.put(allocator, "discord", "dc-agent");
+    try agents.put(allocator, "slack", "sl-agent");
+
+    const config = RouteConfig{
+        .default_agent = "fallback",
+        .channel_agents = agents,
+    };
+    try std.testing.expectEqualStrings("tg-agent", resolveAgent("telegram", &config));
+    try std.testing.expectEqualStrings("dc-agent", resolveAgent("discord", &config));
+    try std.testing.expectEqualStrings("sl-agent", resolveAgent("slack", &config));
+    try std.testing.expectEqualStrings("fallback", resolveAgent("whatsapp", &config));
+    try std.testing.expectEqualStrings("fallback", resolveAgent("signal", &config));
+    try std.testing.expectEqualStrings("fallback", resolveAgent("matrix", &config));
+}
+
+test "resolveAgent unknown channel falls back to default" {
+    const config = RouteConfig{ .default_agent = "default-bot" };
+    try std.testing.expectEqualStrings("default-bot", resolveAgent("unknown", &config));
+}
+
+test "resolveAgent empty channel name falls back" {
+    const config = RouteConfig{};
+    try std.testing.expectEqualStrings("main", resolveAgent("", &config));
+}
+
+// --- RouteConfig Defaults ---
+
+test "RouteConfig defaults" {
+    const config = RouteConfig{};
+    try std.testing.expectEqualStrings("main", config.default_agent);
+    try std.testing.expectEqual(@as(usize, 0), config.channel_agents.count());
+}
+
+// --- Scope Tests ---
+
+test "Scope direct label" {
+    try std.testing.expectEqualStrings("direct", Scope.direct.label());
+}
+
+test "Scope group label" {
+    try std.testing.expectEqualStrings("group", Scope.group.label());
+}
