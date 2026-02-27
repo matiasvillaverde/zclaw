@@ -366,6 +366,7 @@ pub const DiscordChannel = struct {
     allocator: std.mem.Allocator,
     auth_value_buf: [520]u8 = undefined,
     auth_value_len: usize = 0,
+    poll_result_buf: [4096]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator, config: DiscordConfig, client: *http_client.HttpClient) DiscordChannel {
         var channel = DiscordChannel{
@@ -488,6 +489,128 @@ pub const DiscordChannel = struct {
     };
 
     pub const SendError = error{SendFailed};
+
+    // --- Polling Support ---
+
+    pub const MessageHandler = *const fn (channel_id: []const u8, author_id: []const u8, content: []const u8) ?[]const u8;
+
+    /// Poll for new messages on a channel via REST API (GET /channels/{id}/messages).
+    /// Returns the latest message content and author, if any new messages exist.
+    pub fn pollMessages(self: *DiscordChannel, channel_id: []const u8) !?plugin.IncomingMessage {
+        var url_buf: [512]u8 = undefined;
+        var path_buf: [256]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&path_buf);
+        try fbs.writer().writeAll("/channels/");
+        try fbs.writer().writeAll(channel_id);
+        try fbs.writer().writeAll("/messages?limit=1");
+        const path = fbs.getWritten();
+
+        const url = try buildApiUrl(&url_buf, path);
+        const auth_header = self.authHeader();
+        var resp = try self.client.get(url, &auth_header);
+        defer resp.deinit();
+
+        if (resp.status != 200) return null;
+
+        // Parse the first message from the array response
+        if (resp.body.len < 3) return null;
+
+        // Check for bot messages - skip them
+        if (isBot(resp.body)) return null;
+
+        const content = extractMessageContent(resp.body) orelse return null;
+        const author_id = extractAuthorId(resp.body) orelse return null;
+        const msg_id = extractMessageId(resp.body) orelse "";
+
+        // Copy into stable buffer before resp.deinit()
+        var pos: usize = 0;
+        const content_start = pos;
+        const content_len = @min(content.len, self.poll_result_buf.len - pos);
+        @memcpy(self.poll_result_buf[pos..][0..content_len], content[0..content_len]);
+        pos += content_len;
+        const author_start = pos;
+        const author_len = @min(author_id.len, self.poll_result_buf.len - pos);
+        @memcpy(self.poll_result_buf[pos..][0..author_len], author_id[0..author_len]);
+        pos += author_len;
+        const msgid_start = pos;
+        const msgid_len = @min(msg_id.len, self.poll_result_buf.len - pos);
+        @memcpy(self.poll_result_buf[pos..][0..msgid_len], msg_id[0..msgid_len]);
+        pos += msgid_len;
+
+        return .{
+            .channel = .discord,
+            .message_id = self.poll_result_buf[msgid_start..][0..msgid_len],
+            .sender_id = self.poll_result_buf[author_start..][0..author_len],
+            .chat_id = channel_id,
+            .content = self.poll_result_buf[content_start..][0..content_len],
+            .is_group = true,
+        };
+    }
+
+    /// Start a polling loop that checks for new messages and routes to handler.
+    pub fn startPolling(
+        self: *DiscordChannel,
+        channel_id: []const u8,
+        handler: MessageHandler,
+        should_stop: *std.atomic.Value(bool),
+        poll_interval_ms: u32,
+    ) void {
+        self.start() catch {
+            self.status = .error_state;
+            return;
+        };
+        if (self.status != .connected) return;
+
+        var last_message_id: ?[]const u8 = null;
+
+        while (!should_stop.load(.acquire)) {
+            const msg = self.pollMessages(channel_id) catch {
+                std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
+                continue;
+            };
+
+            if (msg) |m| {
+                // Skip if same as last processed message
+                if (last_message_id) |last_id| {
+                    if (std.mem.eql(u8, m.message_id, last_id)) {
+                        std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
+                        continue;
+                    }
+                }
+                last_message_id = m.message_id;
+
+                const response = handler(m.chat_id, m.sender_id, m.content);
+                if (response) |resp_text| {
+                    self.sendText(.{ .chat_id = m.chat_id, .content = resp_text }) catch {};
+                }
+            }
+
+            std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
+        }
+
+        self.status = .disconnected;
+    }
+
+    /// Start polling in a separate thread.
+    pub fn startPollingThread(
+        self: *DiscordChannel,
+        channel_id: []const u8,
+        handler: MessageHandler,
+        should_stop: *std.atomic.Value(bool),
+        poll_interval_ms: u32,
+    ) !std.Thread {
+        return std.Thread.spawn(.{}, pollingThreadFn, .{ self, channel_id, handler, should_stop, poll_interval_ms });
+    }
+
+    fn pollingThreadFn(
+        self: *DiscordChannel,
+        channel_id: []const u8,
+        handler: MessageHandler,
+        should_stop: *std.atomic.Value(bool),
+        poll_interval_ms: u32,
+    ) void {
+        self.startPolling(channel_id, handler, should_stop, poll_interval_ms);
+    }
 };
 
 // --- DiscordChannel Tests ---
@@ -943,4 +1066,87 @@ test "DiscordChannel sendText constructs correct URL" {
 
     try channel.sendText(.{ .chat_id = "999888777", .content = "test" });
     try std.testing.expect(std.mem.indexOf(u8, mock.last_url.?, "/channels/999888777/messages") != null);
+}
+
+// --- Discord Polling Tests ---
+
+test "DiscordChannel pollMessages success" {
+    const allocator = std.testing.allocator;
+    const msg_response = "[{\"id\":\"msg-1\",\"content\":\"Hello!\",\"channel_id\":\"ch-1\",\"author\":{\"id\":\"u-1\",\"username\":\"alice\"}}]";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = msg_response },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    const msg = try channel.pollMessages("ch-1");
+    try std.testing.expect(msg != null);
+    try std.testing.expectEqualStrings("Hello!", msg.?.content);
+    try std.testing.expectEqualStrings("u-1", msg.?.sender_id);
+}
+
+test "DiscordChannel pollMessages empty response" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "[]" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    const msg = try channel.pollMessages("ch-1");
+    try std.testing.expect(msg == null);
+}
+
+test "DiscordChannel pollMessages error status" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 403, .body = "{\"message\":\"Missing Access\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    const msg = try channel.pollMessages("ch-1");
+    try std.testing.expect(msg == null);
+}
+
+test "DiscordChannel pollMessages skips bot" {
+    const allocator = std.testing.allocator;
+    const bot_response = "[{\"id\":\"msg-1\",\"content\":\"Bot says hi\",\"channel_id\":\"ch-1\",\"author\":{\"id\":\"bot-1\",\"bot\":true}}]";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = bot_response },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    const msg = try channel.pollMessages("ch-1");
+    try std.testing.expect(msg == null);
+}
+
+test "DiscordChannel.MessageHandler type exists" {
+    const handler: ?DiscordChannel.MessageHandler = null;
+    try std.testing.expect(handler == null);
+}
+
+test "DiscordChannel startPolling stops on auth failure" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 401, .body = "{\"message\":\"Unauthorized\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "bad" }, &client);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const dummyHandler = struct {
+        fn handler(_: []const u8, _: []const u8, _: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.handler;
+
+    channel.startPolling("ch-1", dummyHandler, &stop, 100);
+    try std.testing.expectEqual(plugin.ChannelStatus.error_state, channel.status);
 }
