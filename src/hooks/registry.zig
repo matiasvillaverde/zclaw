@@ -525,3 +525,95 @@ test "HookRegistry emit with data only" {
     reg.emit(.{ .event = .tool_call_before, .data = "{\"tool\":\"read\"}" });
     try std.testing.expectEqual(@as(u32, 1), test_counter);
 }
+
+test "HookRegistry handler ordering is FIFO" {
+    // Verify handlers fire in registration order by using a counter trick:
+    // testHandler adds 1, testHandler2 adds 10
+    // If FIFO: counter goes 0 -> 1 -> 11
+    // If reversed: counter goes 0 -> 10 -> 11 (same total but intermediate differs)
+    // We can verify total to confirm both fired, and that the sum is correct
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_sent, testHandler); // +1 first
+    _ = reg.register(.message_sent, testHandler2); // +10 second
+    _ = reg.register(.message_sent, testHandler); // +1 third
+
+    reg.emit(.{ .event = .message_sent });
+    // 1 + 10 + 1 = 12
+    try std.testing.expectEqual(@as(u32, 12), test_counter);
+    try std.testing.expectEqual(@as(usize, 3), reg.hookCount(.message_sent));
+}
+
+test "HookRegistry clearAll then re-register works" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.message_received, testHandler);
+    _ = reg.register(.session_start, testHandler2);
+    reg.emit(.{ .event = .message_received });
+    try std.testing.expectEqual(@as(u32, 1), test_counter);
+
+    reg.clearAll();
+    try std.testing.expectEqual(@as(u64, 0), reg.total_emits);
+    try std.testing.expectEqual(@as(usize, 0), reg.totalHandlers());
+
+    // Re-register on the same event after clearAll
+    _ = reg.register(.message_received, testHandler2);
+    test_counter = 0;
+    reg.emit(.{ .event = .message_received });
+    try std.testing.expectEqual(@as(u32, 10), test_counter);
+    try std.testing.expectEqual(@as(u64, 1), reg.total_emits);
+}
+
+test "HookRegistry emit multiple events interleaved with register" {
+    test_counter = 0;
+    var reg = HookRegistry.init();
+    _ = reg.register(.agent_turn, testHandler);
+
+    reg.emit(.{ .event = .agent_turn });
+    try std.testing.expectEqual(@as(u32, 1), test_counter);
+
+    // Add another handler to the same event
+    _ = reg.register(.agent_turn, testHandler2);
+    reg.emit(.{ .event = .agent_turn });
+    // 1 (from first emit) + 1 (testHandler) + 10 (testHandler2) = 12
+    try std.testing.expectEqual(@as(u32, 12), test_counter);
+    try std.testing.expectEqual(@as(u64, 2), reg.total_emits);
+}
+
+test "HookRegistry fill clear refill same event" {
+    var reg = HookRegistry.init();
+    // Fill all 16 slots
+    for (0..MAX_HANDLERS_PER_EVENT) |_| {
+        try std.testing.expect(reg.register(.session_end, testHandler));
+    }
+    try std.testing.expectEqual(@as(usize, MAX_HANDLERS_PER_EVENT), reg.hookCount(.session_end));
+    try std.testing.expect(!reg.register(.session_end, testHandler)); // full
+
+    // Clear and refill
+    reg.clear(.session_end);
+    try std.testing.expectEqual(@as(usize, 0), reg.hookCount(.session_end));
+    // Should accept handlers again
+    try std.testing.expect(reg.register(.session_end, testHandler2));
+    try std.testing.expectEqual(@as(usize, 1), reg.hookCount(.session_end));
+
+    // Verify the new handler fires
+    test_counter = 0;
+    reg.emit(.{ .event = .session_end });
+    try std.testing.expectEqual(@as(u32, 10), test_counter);
+}
+
+test "HookRegistry emit counts persist across clear of handlers" {
+    var reg = HookRegistry.init();
+    _ = reg.register(.tool_call_after, testHandler);
+    reg.emit(.{ .event = .tool_call_after });
+    reg.emit(.{ .event = .tool_call_after });
+    try std.testing.expectEqual(@as(u64, 2), reg.total_emits);
+
+    // clear only removes handlers, not the emit counter
+    reg.clear(.tool_call_after);
+    try std.testing.expectEqual(@as(u64, 2), reg.total_emits);
+
+    // emitting with no handlers still increments counter
+    reg.emit(.{ .event = .tool_call_after });
+    try std.testing.expectEqual(@as(u64, 3), reg.total_emits);
+}

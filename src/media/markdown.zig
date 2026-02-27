@@ -503,3 +503,53 @@ test "stripMarkdown plain text with numbers" {
     const result = stripMarkdown("Version 2.0 released", &buf);
     try std.testing.expectEqualStrings("Version 2.0 released", result);
 }
+
+test "stripMarkdown nested bold and italic" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("***bold italic***", &buf);
+    // *** = ** + * (2 stars stripped then 1 star stripped)
+    try std.testing.expectEqualStrings("bold italic", result);
+}
+
+test "stripMarkdown link with no url part" {
+    var buf: [1024]u8 = undefined;
+    // [text] without (url) -- should output the text inside brackets
+    const result = stripMarkdown("[just brackets]", &buf);
+    try std.testing.expectEqualStrings("just brackets", result);
+}
+
+test "escapeForTelegram preserves unicode text" {
+    var buf: [1024]u8 = undefined;
+    const result = escapeForTelegram("Hello \xC3\xA9\xC3\xA0\xC3\xBC", &buf);
+    // Unicode bytes are not special chars, should pass through unchanged
+    try std.testing.expectEqualStrings("Hello \xC3\xA9\xC3\xA0\xC3\xBC", result);
+}
+
+test "render plain strips nested markdown in paragraph" {
+    var buf: [2048]u8 = undefined;
+    const input = "# Title\n\n**Bold text** with _emphasis_ and `inline code`.\n\n> A blockquote\n\n[Link](http://example.com)";
+    const result = render(input, &buf, .plain);
+    // No markdown markers should remain
+    try std.testing.expect(std.mem.indexOf(u8, result, "#") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "](") == null);
+    // Actual text content should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, result, "Title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Bold text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "emphasis") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "inline code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "A blockquote") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Link") != null);
+}
+
+test "render telegram escapes markdown link syntax" {
+    var buf: [1024]u8 = undefined;
+    const result = render("[click](http://example.com)", &buf, .telegram);
+    // Telegram escaping should escape [, ], (, )
+    try std.testing.expect(std.mem.indexOf(u8, result, "\\[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\\]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\\(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\\)") != null);
+}

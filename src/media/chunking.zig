@@ -451,3 +451,64 @@ test "freeChunks with empty array" {
     const chunks = try allocator.alloc([]const u8, 0);
     freeChunks(allocator, chunks);
 }
+
+test "chunkMessage unicode multibyte characters preserved" {
+    const allocator = std.testing.allocator;
+    // Each emoji is 4 bytes in UTF-8
+    const text = "\xF0\x9F\x98\x80\xF0\x9F\x98\x81\xF0\x9F\x98\x82\xF0\x9F\x98\x83\xF0\x9F\x98\x84";
+    const chunks = try chunkMessage(allocator, text, 100);
+    defer freeChunks(allocator, chunks);
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqual(text.len, chunks[0].len);
+    try std.testing.expectEqualStrings(text, chunks[0]);
+}
+
+test "chunkMessage splits unicode text without corrupting bytes" {
+    const allocator = std.testing.allocator;
+    // Build a string of repeated 2-byte UTF-8 chars (e.g. 'e' with accent: \xC3\xA9)
+    const text = "\xC3\xA9 " ** 40; // 120 bytes total, each unit is 3 bytes
+    const chunks = try chunkMessage(allocator, text, 50);
+    defer freeChunks(allocator, chunks);
+    // Verify total bytes are preserved across all chunks
+    var total: usize = 0;
+    for (chunks) |chunk| {
+        total += chunk.len;
+        try std.testing.expect(chunk.len <= 50);
+    }
+    try std.testing.expectEqual(text.len, total);
+}
+
+test "isInsideCodeFence with back-to-back fences" {
+    // Four consecutive fences: open, close, open, close
+    const text = "```a``````b```";
+    // After 4 fences (positions 0-2, 4-6, 7-9, 11-13), count is 4 (even) = outside
+    try std.testing.expect(!isInsideCodeFence(text, 14));
+    // After first fence only, count is 1 (odd) = inside
+    try std.testing.expect(isInsideCodeFence(text, 4));
+}
+
+test "findSplitPoint prefers paragraph break over space" {
+    const text = "aaa bbb\n\nccc ddd eee fff ggg";
+    // max_len 15: paragraph break \n\n is at index 7, within search window
+    const split = findSplitPoint(text, 15);
+    // Should choose paragraph break at index 9 (after \n\n)
+    try std.testing.expectEqual(@as(usize, 9), split);
+}
+
+test "chunkMessage respects code fence by splitting before it" {
+    const allocator = std.testing.allocator;
+    // Build text where the code fence straddles the chunk boundary
+    const text = "A" ** 18 ++ "\n```\ncode\n```\nAfter";
+    const chunks = try chunkMessage(allocator, text, 22);
+    defer freeChunks(allocator, chunks);
+    // Verify no chunk exceeds the limit
+    for (chunks) |chunk| {
+        try std.testing.expect(chunk.len <= 22);
+    }
+    // Verify all content is preserved
+    var total: usize = 0;
+    for (chunks) |chunk| {
+        total += chunk.len;
+    }
+    try std.testing.expectEqual(text.len, total);
+}

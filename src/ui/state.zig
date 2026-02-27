@@ -471,3 +471,54 @@ test "serializeState disconnected" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"connection\":\"Disconnected\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"sidebar\":true") != null);
 }
+
+test "AppState view transition resets to dashboard from any view" {
+    var state = AppState{};
+    const all_views = [_]View{ .chat, .channels, .sessions, .memory, .config, .agents, .logs };
+    for (all_views) |v| {
+        state.navigateTo(v);
+        try std.testing.expectEqual(v, state.current_view);
+        state.navigateTo(.dashboard);
+        try std.testing.expectEqual(View.dashboard, state.current_view);
+    }
+}
+
+test "AppState connection state does not affect navigation" {
+    var state = AppState{};
+    state.setError();
+    state.navigateTo(.chat);
+    try std.testing.expectEqual(View.chat, state.current_view);
+    try std.testing.expectEqual(ConnectionState.error_state, state.connection);
+    // Navigation works independently of connection state
+    state.setConnected();
+    try std.testing.expectEqual(View.chat, state.current_view);
+    try std.testing.expectEqual(ConnectionState.connected, state.connection);
+}
+
+test "AppState setDisconnected preserves agent_count" {
+    var state = AppState{};
+    state.updateCounts(5, 10, 7);
+    try std.testing.expectEqual(@as(u32, 7), state.agent_count);
+    state.setDisconnected();
+    // setDisconnected only resets channel_count and session_count
+    try std.testing.expectEqual(@as(u32, 0), state.channel_count);
+    try std.testing.expectEqual(@as(u32, 0), state.session_count);
+    try std.testing.expectEqual(@as(u32, 7), state.agent_count);
+}
+
+test "serializeState after navigating to chat view" {
+    var state = AppState{};
+    state.navigateTo(.chat);
+    state.connection = .authenticating;
+    var buf: [1024]u8 = undefined;
+    const json = try serializeState(&buf, &state);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"view\":\"Chat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"connection\":\"Authenticating...\"") != null);
+}
+
+test "serializeState buffer too small returns error" {
+    const state = AppState{};
+    var buf: [10]u8 = undefined;
+    const result = serializeState(&buf, &state);
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}

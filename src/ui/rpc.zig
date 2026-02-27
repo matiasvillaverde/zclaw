@@ -435,3 +435,44 @@ test "ParsedFrame defaults" {
     try std.testing.expect(frame.event_name == null);
     try std.testing.expect(frame.payload_start == null);
 }
+
+test "buildRequest buffer too small returns error" {
+    var buf: [5]u8 = undefined;
+    const result = buildRequest(&buf, "1", "health", null);
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "parseFrame response ok true stays ok" {
+    // Verify that responses without "ok":false are correctly parsed as ok=true
+    const json = "{\"type\":\"res\",\"id\":\"42\",\"ok\":true,\"payload\":{}}";
+    const frame = parseFrame(json).?;
+    try std.testing.expectEqual(FrameType.res, frame.frame_type);
+    try std.testing.expect(frame.ok);
+    try std.testing.expectEqualStrings("42", frame.id.?);
+}
+
+test "buildChatRequest escapes backslash in message" {
+    var buf: [1024]u8 = undefined;
+    const frame = try buildChatRequest(&buf, "7", "path\\to\\file", "default");
+    // Backslashes in the message should be escaped to \\
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\\\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"agent\":\"default\"") != null);
+}
+
+test "parseFrame payload_start points to correct offset" {
+    const json = "{\"type\":\"res\",\"id\":\"1\",\"ok\":true,\"payload\":{\"key\":\"val\"}}";
+    const frame = parseFrame(json).?;
+    const start = frame.payload_start.?;
+    // The character at payload_start should be the beginning of the payload value
+    try std.testing.expectEqual(@as(u8, '{'), json[start]);
+}
+
+test "buildConnectRequest with token contains auth block" {
+    var buf: [512]u8 = undefined;
+    const frame = try buildConnectRequest(&buf, "c1", "secret123");
+    // Verify the full auth structure
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"auth\":{\"type\":\"token\",\"token\":\"secret123\"}") != null);
+    // Verify it ends with }}
+    try std.testing.expect(frame.len > 2);
+    try std.testing.expectEqualStrings("}}", frame[frame.len - 2 ..]);
+}
