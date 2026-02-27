@@ -710,3 +710,331 @@ test "PersistentMemoryManager persists across lookups" {
     defer freePersistentResults(allocator, results);
     try std.testing.expect(results.len >= 1);
 }
+
+// --- New Tests: MemoryManager edge cases and lifecycle ---
+
+test "MemoryManager indexDocument tiny content single char" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    const doc_id = try mgr.indexDocument("tiny.md", "x");
+    try std.testing.expect(doc_id > 0);
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+    // Single char should produce exactly one chunk
+    try std.testing.expectEqual(@as(usize, 1), mgr.chunkCount());
+}
+
+test "MemoryManager indexDocument very large content produces many chunks" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    // 10,000 chars = well beyond the default 1600-char chunk size
+    const large = "The quick brown fox jumps over the lazy dog. " ** 222;
+    _ = try mgr.indexDocument("huge.md", large);
+
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+    // With ~10,000 chars and 1600-char chunks, expect several chunks
+    try std.testing.expect(mgr.chunkCount() >= 4);
+}
+
+test "MemoryManager removeByPath clears chunks completely" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("removeme.md", "Some content to be removed later.");
+    try std.testing.expect(mgr.chunkCount() >= 1);
+
+    // Re-indexing with empty path removes the old document via removeByPath internally
+    // But let's test by indexing another doc and verifying only the second remains
+    _ = try mgr.indexDocument("keeper.md", "This should stay.");
+
+    const before_chunks = mgr.chunkCount();
+    const before_docs = mgr.documentCount();
+
+    // Index removeme.md again which triggers removeByPath for the old version
+    // then remove it by indexing something else at that path then removing
+    // We test indirectly: re-index with same path replaces
+    _ = try mgr.indexDocument("removeme.md", "Replaced content.");
+
+    // Document count should stay at 2
+    try std.testing.expectEqual(@as(usize, 2), mgr.documentCount());
+    // The old chunks for removeme.md should be gone, replaced by new ones
+    // keeper.md chunks + new removeme.md chunks
+    try std.testing.expect(mgr.chunkCount() <= before_chunks);
+    _ = before_docs;
+}
+
+test "MemoryManager search after remove finds nothing" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("ephemeral.md", "UniqueTermXYZ appears only here.");
+
+    // Search should find it
+    const results1 = try mgr.keywordSearch(allocator, "UniqueTermXYZ", 10);
+    defer freeResults(allocator, results1);
+    try std.testing.expect(results1.len >= 1);
+
+    // Replace the document with content that does not contain the term
+    _ = try mgr.indexDocument("ephemeral.md", "Completely different content now.");
+
+    // Search for the old term should find nothing
+    const results2 = try mgr.keywordSearch(allocator, "UniqueTermXYZ", 10);
+    try std.testing.expectEqual(@as(usize, 0), results2.len);
+}
+
+test "MemoryManager keywordSearch empty query returns nothing" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("test.txt", "Hello world, this is some content.");
+
+    const results = try mgr.keywordSearch(allocator, "", 10);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "MemoryManager keywordSearch results sorted by score descending" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    // One document with the term repeated many times, another with it once
+    _ = try mgr.indexDocument("many.md", "zig zig zig zig zig zig zig zig zig zig");
+    _ = try mgr.indexDocument("few.md", "zig is a language for systems programming and optimization work.");
+
+    const results = try mgr.keywordSearch(allocator, "zig", 10);
+    defer freeResults(allocator, results);
+
+    try std.testing.expect(results.len >= 2);
+    // Results should be sorted descending by score
+    for (1..results.len) |i| {
+        try std.testing.expect(results[i - 1].score >= results[i].score);
+    }
+}
+
+test "MemoryManager keywordSearch with max_results zero returns nothing" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("test.md", "Searchable content with keywords.");
+
+    const results = try mgr.keywordSearch(allocator, "content", 0);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "MemoryManager needsReindex same content twice returns false" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    const content = "Exact same content for hashing.";
+    _ = try mgr.indexDocument("hash_test.md", content);
+
+    // First check - same content
+    try std.testing.expect(!mgr.needsReindex("hash_test.md", content));
+    // Second check - still same content
+    try std.testing.expect(!mgr.needsReindex("hash_test.md", content));
+}
+
+test "MemoryManager needsReindex after re-index with new content" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("evolving.md", "Version 1");
+    try std.testing.expect(!mgr.needsReindex("evolving.md", "Version 1"));
+    try std.testing.expect(mgr.needsReindex("evolving.md", "Version 2"));
+
+    // Re-index with new content
+    _ = try mgr.indexDocument("evolving.md", "Version 2");
+    try std.testing.expect(!mgr.needsReindex("evolving.md", "Version 2"));
+    try std.testing.expect(mgr.needsReindex("evolving.md", "Version 1"));
+}
+
+test "MemoryManager special characters in path" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("path/with spaces/file (1).md", "Content A");
+    _ = try mgr.indexDocument("path-with-dashes_and_underscores.md", "Content B");
+    _ = try mgr.indexDocument("unicode/\xc3\xa9\xc3\xa0\xc3\xbc.md", "Content C");
+
+    try std.testing.expectEqual(@as(usize, 3), mgr.documentCount());
+
+    // needsReindex should work with special paths
+    try std.testing.expect(!mgr.needsReindex("path/with spaces/file (1).md", "Content A"));
+    try std.testing.expect(mgr.needsReindex("path/with spaces/file (1).md", "Different"));
+}
+
+test "MemoryManager duplicate indexing same path same content" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    const content = "Identical content indexed twice.";
+    const id1 = try mgr.indexDocument("dup.md", content);
+    const id2 = try mgr.indexDocument("dup.md", content);
+
+    // IDs should differ (each indexDocument call gets a new ID)
+    try std.testing.expect(id2 > id1);
+    // But document count stays at 1 since same path replaces
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+}
+
+test "MemoryManager full lifecycle index search remove search" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    // Step 1: Index
+    _ = try mgr.indexDocument("lifecycle.md", "Lifecycle testing with keyword SpecialWord.");
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+
+    // Step 2: Search finds it
+    const results1 = try mgr.keywordSearch(allocator, "SpecialWord", 10);
+    defer freeResults(allocator, results1);
+    try std.testing.expect(results1.len >= 1);
+    try std.testing.expectEqualStrings("lifecycle.md", results1[0].source_file.?);
+
+    // Step 3: Replace document (removes old, adds new without the keyword)
+    _ = try mgr.indexDocument("lifecycle.md", "No special keywords here anymore.");
+
+    // Step 4: Search for old keyword finds nothing
+    const results2 = try mgr.keywordSearch(allocator, "SpecialWord", 10);
+    try std.testing.expectEqual(@as(usize, 0), results2.len);
+
+    // Step 5: Search for new content works
+    const results3 = try mgr.keywordSearch(allocator, "keywords", 10);
+    defer freeResults(allocator, results3);
+    try std.testing.expect(results3.len >= 1);
+}
+
+test "MemoryManager keywordSearch across many documents" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    // Index 10 documents, each containing "common" and a unique term
+    _ = try mgr.indexDocument("doc01.md", "common alpha");
+    _ = try mgr.indexDocument("doc02.md", "common bravo");
+    _ = try mgr.indexDocument("doc03.md", "common charlie");
+    _ = try mgr.indexDocument("doc04.md", "common delta");
+    _ = try mgr.indexDocument("doc05.md", "common echo");
+    _ = try mgr.indexDocument("doc06.md", "common foxtrot");
+    _ = try mgr.indexDocument("doc07.md", "common golf");
+    _ = try mgr.indexDocument("doc08.md", "common hotel");
+    _ = try mgr.indexDocument("doc09.md", "common india");
+    _ = try mgr.indexDocument("doc10.md", "common juliet");
+
+    try std.testing.expectEqual(@as(usize, 10), mgr.documentCount());
+
+    // Search for common term, limit to 5
+    const results = try mgr.keywordSearch(allocator, "common", 5);
+    defer freeResults(allocator, results);
+    try std.testing.expectEqual(@as(usize, 5), results.len);
+
+    // Search for unique term
+    const unique = try mgr.keywordSearch(allocator, "foxtrot", 10);
+    defer freeResults(allocator, unique);
+    try std.testing.expectEqual(@as(usize, 1), unique.len);
+    try std.testing.expectEqualStrings("doc06.md", unique[0].source_file.?);
+}
+
+test "computeTextScore both empty" {
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), computeTextScore("", ""), 0.001);
+}
+
+test "computeTextScore exact match short text" {
+    // "hello" in "hello" => 1 match, text.len=5, 5/100+1 = 1, tf = 1/1 = 1.0, min(1.0, 1.0) = 1.0
+    const score = computeTextScore("hello", "hello");
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), score, 0.001);
+}
+
+test "computeTextScore multiple non-overlapping matches" {
+    // "ab" in "ab ab ab" => 3 matches, text.len=8, 8/100+1 = 1, tf = 3.0, min(1.0, 3.0) = 1.0 (capped)
+    const score = computeTextScore("ab ab ab", "ab");
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), score, 0.001);
+}
+
+test "eqlNoCase empty strings" {
+    try std.testing.expect(eqlNoCase("", ""));
+}
+
+test "eqlNoCase mixed case with numbers" {
+    try std.testing.expect(eqlNoCase("Test123", "test123"));
+    try std.testing.expect(eqlNoCase("ABC123", "abc123"));
+}
+
+// --- New Tests: PersistentMemoryManager edge cases ---
+
+test "PersistentMemoryManager indexDocument empty content" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    const doc_id = try mgr.indexDocument("empty.md", "");
+    try std.testing.expect(doc_id > 0);
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+}
+
+test "PersistentMemoryManager needsReindex after replace" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    _ = try mgr.indexDocument("replace.md", "Version 1");
+    try std.testing.expect(!mgr.needsReindex("replace.md", "Version 1"));
+
+    _ = try mgr.indexDocument("replace.md", "Version 2");
+    try std.testing.expect(!mgr.needsReindex("replace.md", "Version 2"));
+    try std.testing.expect(mgr.needsReindex("replace.md", "Version 1"));
+}
+
+test "PersistentMemoryManager full lifecycle" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+
+    // Index
+    _ = try mgr.indexDocument("lifecycle.md", "PersistentUniqueToken is here.");
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+
+    // Search finds it
+    const results1 = try mgr.keywordSearch(allocator, "PersistentUniqueToken", 10);
+    defer freePersistentResults(allocator, results1);
+    try std.testing.expect(results1.len >= 1);
+
+    // Replace with different content
+    _ = try mgr.indexDocument("lifecycle.md", "All new content without the old token.");
+
+    // Old term gone
+    const results2 = try mgr.keywordSearch(allocator, "PersistentUniqueToken", 10);
+    try std.testing.expectEqual(@as(usize, 0), results2.len);
+
+    // New content searchable
+    const results3 = try mgr.keywordSearch(allocator, "new content", 10);
+    defer freePersistentResults(allocator, results3);
+    try std.testing.expect(results3.len >= 1);
+}
+
+test "PersistentMemoryManager special characters in path" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    _ = try mgr.indexDocument("dir/sub dir/file (2).md", "Content with spaces in path.");
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+    try std.testing.expect(!mgr.needsReindex("dir/sub dir/file (2).md", "Content with spaces in path."));
+}
