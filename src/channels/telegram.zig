@@ -457,6 +457,74 @@ pub const TelegramChannel = struct {
     };
 
     pub const SendError = error{SendFailed};
+
+    // --- Polling Loop ---
+
+    /// Callback type for handling incoming messages.
+    /// Receives chat_id, sender_id, message text; returns response text or null.
+    pub const MessageHandler = *const fn (chat_id: []const u8, sender_id: []const u8, text: []const u8) ?[]const u8;
+
+    /// Run a continuous polling loop. Calls handler for each message and sends the response.
+    /// Stops when `should_stop` is set to true or when an unrecoverable error occurs.
+    /// `poll_interval_ms` controls the sleep between polls when no updates are received.
+    pub fn startPolling(
+        self: *TelegramChannel,
+        handler: MessageHandler,
+        should_stop: *std.atomic.Value(bool),
+        poll_interval_ms: u32,
+    ) void {
+        // Verify the bot token first
+        self.start() catch {
+            self.status = .error_state;
+            return;
+        };
+
+        if (self.status != .connected) return;
+
+        while (!should_stop.load(.acquire)) {
+            const poll_result = self.pollUpdates() catch {
+                // Transient error — sleep and retry
+                std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
+                continue;
+            };
+
+            if (poll_result) |msg| {
+                // Dispatch to handler
+                const response = handler(msg.chat_id, msg.sender_id, msg.content);
+
+                if (response) |resp_text| {
+                    self.sendText(.{
+                        .chat_id = msg.chat_id,
+                        .content = resp_text,
+                    }) catch {};
+                }
+            } else {
+                // No updates — brief sleep before next poll
+                std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
+            }
+        }
+
+        self.status = .disconnected;
+    }
+
+    /// Start polling in a new thread. Returns the thread handle for joining later.
+    pub fn startPollingThread(
+        self: *TelegramChannel,
+        handler: MessageHandler,
+        should_stop: *std.atomic.Value(bool),
+        poll_interval_ms: u32,
+    ) !std.Thread {
+        return std.Thread.spawn(.{}, pollingThreadFn, .{ self, handler, should_stop, poll_interval_ms });
+    }
+
+    fn pollingThreadFn(
+        self: *TelegramChannel,
+        handler: MessageHandler,
+        should_stop: *std.atomic.Value(bool),
+        poll_interval_ms: u32,
+    ) void {
+        self.startPolling(handler, should_stop, poll_interval_ms);
+    }
 };
 
 // --- TelegramChannel Tests ---
@@ -943,4 +1011,112 @@ test "TelegramChannel sendText with parse_mode" {
 
     try channel.sendText(.{ .chat_id = "123", .content = "**bold**", .parse_mode = "Markdown" });
     try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "parse_mode") != null);
+}
+
+// --- Polling Loop Tests ---
+
+fn echoHandler(_: []const u8, _: []const u8, text: []const u8) ?[]const u8 {
+    // Return the same text as the response (echo)
+    return text;
+}
+
+fn nullHandler(_: []const u8, _: []const u8, _: []const u8) ?[]const u8 {
+    return null;
+}
+
+test "TelegramChannel startPolling processes message and stops" {
+    const allocator = std.testing.allocator;
+    // Response 1: getMe (start verification)
+    // Response 2: getUpdates returns a message
+    // Response 3: sendMessage for the echo reply
+    // Response 4: getUpdates returns empty (loop will sleep then check should_stop)
+    const update_json = "{\"ok\":true,\"result\":[{\"update_id\":500,\"message\":{\"text\":\"ping\",\"chat\":{\"id\":42,\"type\":\"private\"},\"from\":{\"id\":7}}}]}";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true,\"result\":{\"id\":1,\"is_bot\":true}}" }, // getMe
+        .{ .status = 200, .body = update_json }, // getUpdates
+        .{ .status = 200, .body = "{\"ok\":true}" }, // sendMessage
+        .{ .status = 200, .body = "{\"ok\":true,\"result\":[]}" }, // getUpdates (empty)
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "test-bot" }, &client);
+
+    var should_stop = std.atomic.Value(bool).init(false);
+
+    // Start polling in a thread
+    const thread = try channel.startPollingThread(echoHandler, &should_stop, 10);
+
+    // Wait for the mock to be exhausted (all responses consumed)
+    var wait_count: u32 = 0;
+    while (mock.call_count < 4 and wait_count < 100) : (wait_count += 1) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    // Signal stop
+    should_stop.store(true, .release);
+    thread.join();
+
+    // Verify: getMe + getUpdates + sendMessage + getUpdates = 4 calls
+    try std.testing.expect(mock.call_count >= 3); // At least getMe + getUpdates + sendMessage
+    try std.testing.expectEqual(@as(i64, 500), channel.last_update_id.?);
+    try std.testing.expectEqual(plugin.ChannelStatus.disconnected, channel.status);
+}
+
+test "TelegramChannel startPolling stops immediately on auth failure" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 401, .body = "{\"ok\":false}" }, // getMe fails
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "bad-token" }, &client);
+
+    var should_stop = std.atomic.Value(bool).init(false);
+    const thread = try channel.startPollingThread(echoHandler, &should_stop, 10);
+
+    // Should exit quickly due to auth failure
+    thread.join();
+
+    try std.testing.expectEqual(plugin.ChannelStatus.error_state, channel.status);
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count); // Only getMe was called
+}
+
+test "TelegramChannel startPolling with null handler skips reply" {
+    const allocator = std.testing.allocator;
+    const update_json = "{\"ok\":true,\"result\":[{\"update_id\":600,\"message\":{\"text\":\"hello\",\"chat\":{\"id\":10,\"type\":\"private\"},\"from\":{\"id\":20}}}]}";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true,\"result\":{\"id\":1,\"is_bot\":true}}" }, // getMe
+        .{ .status = 200, .body = update_json }, // getUpdates
+        // No sendMessage expected since handler returns null
+        .{ .status = 200, .body = "{\"ok\":true,\"result\":[]}" }, // getUpdates (empty)
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    var should_stop = std.atomic.Value(bool).init(false);
+    const thread = try channel.startPollingThread(nullHandler, &should_stop, 10);
+
+    var wait_count: u32 = 0;
+    while (mock.call_count < 3 and wait_count < 100) : (wait_count += 1) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    should_stop.store(true, .release);
+    thread.join();
+
+    // getMe + getUpdates + getUpdates(empty) = 3 calls, no sendMessage
+    try std.testing.expect(mock.call_count >= 2);
+    try std.testing.expectEqual(@as(i64, 600), channel.last_update_id.?);
+}
+
+test "MessageHandler type is correct" {
+    // Verify the handler type compiles and works
+    const handler: TelegramChannel.MessageHandler = echoHandler;
+    const result = handler("chat", "sender", "hello");
+    try std.testing.expectEqualStrings("hello", result.?);
+
+    const null_handler: TelegramChannel.MessageHandler = nullHandler;
+    const null_result = null_handler("chat", "sender", "hello");
+    try std.testing.expect(null_result == null);
 }
