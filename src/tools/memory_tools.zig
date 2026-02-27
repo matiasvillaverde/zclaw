@@ -321,3 +321,319 @@ test "memoryIndexHandler then search roundtrip" {
     try std.testing.expect(search_result.success);
     try std.testing.expect(std.mem.indexOf(u8, search_result.output, "comptime") != null);
 }
+
+// --- Additional Tests ---
+
+test "memoryIndexHandler output contains tag" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    defer clearManager();
+
+    var buf: [4096]u8 = undefined;
+    const result = memoryIndexHandler("{\"content\":\"Test content\",\"tag\":\"custom-tag\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "tag: custom-tag") != null);
+}
+
+test "memoryIndexHandler output contains char count" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    defer clearManager();
+
+    var buf: [4096]u8 = undefined;
+    const result = memoryIndexHandler("{\"content\":\"Hello\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "5 chars") != null);
+}
+
+test "memorySearchHandler output format with scores" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("test.md", "Zig safety features are great");
+
+    setManager(&mgr);
+    setAllocator(allocator);
+    defer clearManager();
+    defer clearAllocator();
+
+    var buf: [4096]u8 = undefined;
+    const result = memorySearchHandler("{\"query\":\"zig\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "score:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "1.") != null);
+}
+
+test "BUILTIN_MEMORY_SEARCH parameters contain query" {
+    const params = BUILTIN_MEMORY_SEARCH.parameters_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, params, "query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "required") != null);
+}
+
+test "BUILTIN_MEMORY_INDEX parameters contain content" {
+    const params = BUILTIN_MEMORY_INDEX.parameters_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, params, "content") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "tag") != null);
+}
+
+test "memoryIndexHandler multiple documents" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    defer clearManager();
+
+    var buf1: [4096]u8 = undefined;
+    const r1 = memoryIndexHandler("{\"content\":\"First document\",\"tag\":\"doc1\"}", &buf1);
+    try std.testing.expect(r1.success);
+
+    var buf2: [4096]u8 = undefined;
+    const r2 = memoryIndexHandler("{\"content\":\"Second document\",\"tag\":\"doc2\"}", &buf2);
+    try std.testing.expect(r2.success);
+
+    try std.testing.expectEqual(@as(usize, 2), mgr.documentCount());
+}
+
+test "setAllocator and clearAllocator" {
+    clearAllocator();
+    try std.testing.expect(global_allocator == null);
+    setAllocator(std.testing.allocator);
+    try std.testing.expect(global_allocator != null);
+    clearAllocator();
+    try std.testing.expect(global_allocator == null);
+}
+
+test "memorySearchHandler uses page allocator when no allocator set" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    clearAllocator(); // no allocator set -> should use page_allocator
+    defer clearManager();
+
+    var buf: [4096]u8 = undefined;
+    const result = memorySearchHandler("{\"query\":\"nonexistent\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("No matching memories found.", result.output);
+}
+
+test "memoryIndexHandler chunks stored count" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    defer clearManager();
+
+    var buf: [4096]u8 = undefined;
+    const result = memoryIndexHandler("{\"content\":\"Some content here.\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "chunks stored") != null);
+}
+
+// === New Tests (batch 2) ===
+
+test "memorySearchHandler invalid JSON no match" {
+    clearManager();
+    var buf: [4096]u8 = undefined;
+    const result = memorySearchHandler("not json", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("missing 'query' parameter", result.error_message.?);
+}
+
+test "memoryIndexHandler invalid JSON no match" {
+    clearManager();
+    var buf: [4096]u8 = undefined;
+    const result = memoryIndexHandler("not json", &buf);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("missing 'content' parameter", result.error_message.?);
+}
+
+test "memorySearchHandler with special chars in query" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("doc.md", "Special content with punctuation and symbols!");
+
+    setManager(&mgr);
+    setAllocator(allocator);
+    defer clearManager();
+    defer clearAllocator();
+
+    var buf: [4096]u8 = undefined;
+    const result = memorySearchHandler("{\"query\":\"special content\"}", &buf);
+    try std.testing.expect(result.success);
+}
+
+test "memoryIndexHandler increments document count" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    defer clearManager();
+
+    // Use different tags so they don't overwrite each other (same tag = same path = replace)
+    var buf1: [4096]u8 = undefined;
+    _ = memoryIndexHandler("{\"content\":\"First doc\",\"tag\":\"doc1\"}", &buf1);
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+
+    var buf2: [4096]u8 = undefined;
+    _ = memoryIndexHandler("{\"content\":\"Second doc\",\"tag\":\"doc2\"}", &buf2);
+    try std.testing.expectEqual(@as(usize, 2), mgr.documentCount());
+
+    var buf3: [4096]u8 = undefined;
+    _ = memoryIndexHandler("{\"content\":\"Third doc\",\"tag\":\"doc3\"}", &buf3);
+    try std.testing.expectEqual(@as(usize, 3), mgr.documentCount());
+}
+
+test "memoryIndexHandler output includes document id" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    defer clearManager();
+
+    var buf: [4096]u8 = undefined;
+    const result = memoryIndexHandler("{\"content\":\"Some data\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "document 1") != null);
+}
+
+test "memorySearchHandler with source file in output" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("myfile.md", "Zig comptime features are amazing for metaprogramming");
+
+    setManager(&mgr);
+    setAllocator(allocator);
+    defer clearManager();
+    defer clearAllocator();
+
+    var buf: [4096]u8 = undefined;
+    const result = memorySearchHandler("{\"query\":\"zig comptime\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[myfile.md]") != null);
+}
+
+test "registerMemoryTools categories" {
+    const allocator = std.testing.allocator;
+    var reg = registry.ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    try registerMemoryTools(&reg);
+
+    try std.testing.expectEqual(registry.ToolCategory.memory, reg.get("memory_search").?.def.category);
+    try std.testing.expectEqual(registry.ToolCategory.memory, reg.get("memory_index").?.def.category);
+}
+
+test "registerMemoryTools all enabled" {
+    const allocator = std.testing.allocator;
+    var reg = registry.ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    try registerMemoryTools(&reg);
+
+    try std.testing.expect(reg.get("memory_search").?.enabled);
+    try std.testing.expect(reg.get("memory_index").?.enabled);
+}
+
+test "BUILTIN_MEMORY_SEARCH description non-empty" {
+    try std.testing.expect(BUILTIN_MEMORY_SEARCH.description.len > 0);
+}
+
+test "BUILTIN_MEMORY_INDEX description non-empty" {
+    try std.testing.expect(BUILTIN_MEMORY_INDEX.description.len > 0);
+}
+
+test "BUILTIN_MEMORY_SEARCH not sandboxed" {
+    try std.testing.expect(!BUILTIN_MEMORY_SEARCH.sandboxed);
+    try std.testing.expect(!BUILTIN_MEMORY_SEARCH.requires_approval);
+}
+
+test "BUILTIN_MEMORY_INDEX not sandboxed" {
+    try std.testing.expect(!BUILTIN_MEMORY_INDEX.sandboxed);
+    try std.testing.expect(!BUILTIN_MEMORY_INDEX.requires_approval);
+}
+
+test "memorySearchHandler no matching memories message" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    // Index something unrelated
+    _ = try mgr.indexDocument("doc.md", "apple banana cherry");
+
+    setManager(&mgr);
+    setAllocator(allocator);
+    defer clearManager();
+    defer clearAllocator();
+
+    var buf: [4096]u8 = undefined;
+    const result = memorySearchHandler("{\"query\":\"xyznonexistent\"}", &buf);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("No matching memories found.", result.output);
+}
+
+test "memoryIndexHandler with custom tag then search" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    setAllocator(allocator);
+    defer clearManager();
+    defer clearAllocator();
+
+    var idx_buf: [4096]u8 = undefined;
+    const idx_result = memoryIndexHandler("{\"content\":\"Zig build system uses build.zig\",\"tag\":\"build-notes\"}", &idx_buf);
+    try std.testing.expect(idx_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, idx_result.output, "tag: build-notes") != null);
+
+    var search_buf: [4096]u8 = undefined;
+    const search_result = memorySearchHandler("{\"query\":\"build system\"}", &search_buf);
+    try std.testing.expect(search_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, search_result.output, "build") != null);
+}
+
+test "memoryIndexHandler same tag replaces document" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    setManager(&mgr);
+    defer clearManager();
+
+    var buf1: [4096]u8 = undefined;
+    _ = memoryIndexHandler("{\"content\":\"Version 1\",\"tag\":\"notes\"}", &buf1);
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+
+    // Same tag should replace, not add
+    var buf2: [4096]u8 = undefined;
+    _ = memoryIndexHandler("{\"content\":\"Version 2\",\"tag\":\"notes\"}", &buf2);
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+}
+
+test "registerMemoryTools descriptions non-empty" {
+    const allocator = std.testing.allocator;
+    var reg = registry.ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    try registerMemoryTools(&reg);
+
+    try std.testing.expect(reg.get("memory_search").?.def.description.len > 0);
+    try std.testing.expect(reg.get("memory_index").?.def.description.len > 0);
+}

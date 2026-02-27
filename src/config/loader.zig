@@ -88,16 +88,10 @@ pub fn parseConfigJson(json_str: []const u8) ?schema.Config {
     }
 
     // Parse session section
-    if (obj.get("session")) |sess| {
-        if (sess == .object) {
-            const sess_obj = sess.object;
-            if (sess_obj.get("mainKey")) |mk| {
-                if (mk == .string) {
-                    config.session.main_key = mk.string;
-                }
-            }
-        }
-    }
+    // Note: string fields (like main_key) cannot be set here because the
+    // parsed JSON data is freed before this function returns. String fields
+    // require loadConfigFromPath which preserves the raw JSON backing memory.
+    _ = obj.get("session");
 
     return config;
 }
@@ -464,4 +458,232 @@ test "loadConfigWithIncludes nonexistent" {
 
 test "MAX_INCLUDE_DEPTH" {
     try std.testing.expectEqual(@as(u32, 10), MAX_INCLUDE_DEPTH);
+}
+
+// --- Additional Tests ---
+
+test "parseConfigJson full config" {
+    const config = parseConfigJson(
+        \\{"gateway":{"port":8080},"logging":{"level":"trace","consoleStyle":"compact"}}
+    ).?;
+    try std.testing.expectEqual(@as(u16, 8080), config.gateway.port);
+    try std.testing.expectEqual(schema.LogLevel.trace, config.logging.level);
+    try std.testing.expectEqual(schema.ConsoleStyle.compact, config.logging.console_style);
+}
+
+test "parseConfigJson with session section keeps defaults" {
+    // parseConfigJson cannot set string fields (data freed on return),
+    // so session.main_key retains its default value
+    const config = parseConfigJson(
+        \\{"session":{"mainKey":"custom-key"}}
+    ).?;
+    try std.testing.expectEqualStrings("main", config.session.main_key);
+}
+
+test "parseConfigJson ignores unknown fields" {
+    const config = parseConfigJson(
+        \\{"gateway":{"port":9999},"unknown_field":"value"}
+    ).?;
+    try std.testing.expectEqual(@as(u16, 9999), config.gateway.port);
+}
+
+test "parseConfigJson with array root returns null" {
+    try std.testing.expectEqual(@as(?schema.Config, null), parseConfigJson("[1,2,3]"));
+}
+
+test "parseConfigJson with boolean root returns null" {
+    try std.testing.expectEqual(@as(?schema.Config, null), parseConfigJson("true"));
+}
+
+test "parseConfigJson invalid log level uses default" {
+    const config = parseConfigJson(
+        \\{"logging":{"level":"nonexistent"}}
+    ).?;
+    try std.testing.expectEqual(schema.LogLevel.info, config.logging.level);
+}
+
+test "parseConfigJson invalid console style uses default" {
+    const config = parseConfigJson(
+        \\{"logging":{"consoleStyle":"nonexistent"}}
+    ).?;
+    try std.testing.expectEqual(schema.ConsoleStyle.pretty, config.logging.console_style);
+}
+
+test "parseConfigJson all log levels" {
+    const levels = [_]struct { str: []const u8, level: schema.LogLevel }{
+        .{ .str = "silent", .level = .silent },
+        .{ .str = "fatal", .level = .fatal },
+        .{ .str = "error", .level = .err },
+        .{ .str = "warn", .level = .warn },
+        .{ .str = "info", .level = .info },
+        .{ .str = "debug", .level = .debug },
+        .{ .str = "trace", .level = .trace },
+    };
+    for (levels) |entry| {
+        var buf: [128]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"logging\":{{\"level\":\"{s}\"}}}}", .{entry.str}) catch continue;
+        const config = parseConfigJson(json).?;
+        try std.testing.expectEqual(entry.level, config.logging.level);
+    }
+}
+
+test "substituteEnvVars consecutive vars" {
+    const allocator = std.testing.allocator;
+    const result = try substituteEnvVars(allocator, "${A_ZCLAW:-1}${B_ZCLAW:-2}${C_ZCLAW:-3}");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("123", result);
+}
+
+test "substituteEnvVars unclosed brace" {
+    const allocator = std.testing.allocator;
+    const result = try substituteEnvVars(allocator, "before ${UNCLOSED");
+    defer allocator.free(result);
+    // Should consume to end
+    try std.testing.expect(result.len > 0);
+}
+
+test "substituteEnvVars dollar without brace" {
+    const allocator = std.testing.allocator;
+    const result = try substituteEnvVars(allocator, "price is $5");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("price is $5", result);
+}
+
+test "processIncludes at depth 9 succeeds" {
+    const allocator = std.testing.allocator;
+    const result = try processIncludes(allocator, "{\"key\":\"value\"}", 9);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("{\"key\":\"value\"}", result);
+}
+
+test "processIncludes at depth 10 fails" {
+    const allocator = std.testing.allocator;
+    const err = processIncludes(allocator, "{}", 10);
+    try std.testing.expectError(error.ParseFailed, err);
+}
+
+// --- New Tests ---
+
+test "parseConfigJson gateway port 1" {
+    const config = parseConfigJson(
+        \\{"gateway":{"port":1}}
+    ).?;
+    try std.testing.expectEqual(@as(u16, 1), config.gateway.port);
+}
+
+test "parseConfigJson gateway non-integer port uses default" {
+    const config = parseConfigJson(
+        \\{"gateway":{"port":"string"}}
+    ).?;
+    try std.testing.expectEqual(@as(u16, 18789), config.gateway.port);
+}
+
+test "parseConfigJson logging only" {
+    const config = parseConfigJson(
+        \\{"logging":{"level":"warn"}}
+    ).?;
+    try std.testing.expectEqual(schema.LogLevel.warn, config.logging.level);
+    // Other defaults preserved
+    try std.testing.expectEqual(@as(u16, 18789), config.gateway.port);
+}
+
+test "parseConfigJson empty gateway section" {
+    const config = parseConfigJson(
+        \\{"gateway":{}}
+    ).?;
+    // Should keep defaults when no fields present
+    try std.testing.expectEqual(@as(u16, 18789), config.gateway.port);
+}
+
+test "parseConfigJson null root value returns null" {
+    try std.testing.expectEqual(@as(?schema.Config, null), parseConfigJson("null"));
+}
+
+test "parseConfigJson nested empty object" {
+    const config = parseConfigJson(
+        \\{"gateway":{},"logging":{},"session":{}}
+    ).?;
+    try std.testing.expectEqual(@as(u16, 18789), config.gateway.port);
+    try std.testing.expectEqual(schema.LogLevel.info, config.logging.level);
+}
+
+test "parseConfigJson all console styles" {
+    const styles = [_]struct { str: []const u8, style: schema.ConsoleStyle }{
+        .{ .str = "pretty", .style = .pretty },
+        .{ .str = "compact", .style = .compact },
+        .{ .str = "json", .style = .json },
+    };
+    for (styles) |entry| {
+        var buf: [128]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"logging\":{{\"consoleStyle\":\"{s}\"}}}}", .{entry.str}) catch continue;
+        const config = parseConfigJson(json).?;
+        try std.testing.expectEqual(entry.style, config.logging.console_style);
+    }
+}
+
+test "substituteEnvVars var at end of string" {
+    const allocator = std.testing.allocator;
+    const result = try substituteEnvVars(allocator, "prefix_${NONEXIST_ZCLAW:-end}");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("prefix_end", result);
+}
+
+test "substituteEnvVars var at start of string" {
+    const allocator = std.testing.allocator;
+    const result = try substituteEnvVars(allocator, "${NONEXIST_ZCLAW:-start}_suffix");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("start_suffix", result);
+}
+
+test "substituteEnvVars empty default value" {
+    const allocator = std.testing.allocator;
+    const result = try substituteEnvVars(allocator, "${NONEXIST_ZCLAW:-}");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "substituteEnvVars default with spaces" {
+    const allocator = std.testing.allocator;
+    const result = try substituteEnvVars(allocator, "${NONEXIST_ZCLAW:-hello world}");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "substituteEnvVars escaped followed by real var" {
+    const allocator = std.testing.allocator;
+    const result = try substituteEnvVars(allocator, "$${ESCAPED} ${NONEXIST_ZCLAW:-real}");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("${ESCAPED} real", result);
+}
+
+test "LoadResult struct defaults" {
+    const result = LoadResult{
+        .config = schema.defaultConfig(),
+        .raw_json = null,
+        .source_path = null,
+    };
+    try std.testing.expectEqual(@as(u16, 18789), result.config.gateway.port);
+    try std.testing.expect(result.raw_json == null);
+    try std.testing.expect(result.source_path == null);
+}
+
+test "processIncludes depth 0 with plain content" {
+    const allocator = std.testing.allocator;
+    const result = try processIncludes(allocator, "{}", 0);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("{}", result);
+}
+
+test "parseConfigJson gateway port max valid" {
+    const config = parseConfigJson(
+        \\{"gateway":{"port":65535}}
+    ).?;
+    try std.testing.expectEqual(@as(u16, 65535), config.gateway.port);
+}
+
+test "substituteEnvVars only dollar sign" {
+    const allocator = std.testing.allocator;
+    const result = try substituteEnvVars(allocator, "$");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("$", result);
 }

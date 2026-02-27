@@ -215,3 +215,111 @@ test "constants" {
     try std.testing.expectEqual(@as(u32, 80), DEFAULT_OVERLAP);
     try std.testing.expectEqual(@as(u32, 4), CHARS_PER_TOKEN);
 }
+
+// --- Additional Tests ---
+
+test "chunkText single word" {
+    const allocator = std.testing.allocator;
+    const chunks = try chunkText(allocator, "hello", DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP);
+    defer freeChunks(allocator, chunks);
+
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqualStrings("hello", chunks[0].text);
+    try std.testing.expectEqual(@as(u32, 1), chunks[0].estimated_tokens);
+}
+
+test "chunkText exactly one chunk size" {
+    const allocator = std.testing.allocator;
+    // 400 tokens * 4 chars = 1600 chars
+    const text = "a" ** 1600;
+    const chunks = try chunkText(allocator, text, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP);
+    defer freeChunks(allocator, chunks);
+
+    // With overlap-based stride (1280 < 1600), a second chunk is created
+    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expectEqualStrings(text, chunks[0].text);
+}
+
+test "chunkText indices are sequential" {
+    const allocator = std.testing.allocator;
+    const text = "word " ** 500;
+    const chunks = try chunkText(allocator, text, 50, 10);
+    defer freeChunks(allocator, chunks);
+
+    for (chunks, 0..) |chunk, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), chunk.index);
+    }
+}
+
+test "chunkText offsets are non-decreasing" {
+    const allocator = std.testing.allocator;
+    const text = "sentence. " ** 200;
+    const chunks = try chunkText(allocator, text, 100, 20);
+    defer freeChunks(allocator, chunks);
+
+    if (chunks.len >= 2) {
+        for (1..chunks.len) |i| {
+            try std.testing.expect(chunks[i].start_offset >= chunks[i - 1].start_offset);
+        }
+    }
+}
+
+test "chunkText very small chunk size" {
+    const allocator = std.testing.allocator;
+    const text = "Hello world, this is a test.";
+    // 1 token * 4 chars = 4 chars per chunk
+    const chunks = try chunkText(allocator, text, 1, 0);
+    defer freeChunks(allocator, chunks);
+
+    try std.testing.expect(chunks.len >= 1);
+    for (chunks) |chunk| {
+        try std.testing.expect(chunk.text.len > 0);
+    }
+}
+
+test "chunkText no overlap" {
+    const allocator = std.testing.allocator;
+    const text = "word " ** 300;
+    const chunks = try chunkText(allocator, text, 50, 0);
+    defer freeChunks(allocator, chunks);
+
+    // Without overlap, chunks should not overlap
+    if (chunks.len >= 2) {
+        try std.testing.expect(chunks[1].start_offset >= chunks[0].end_offset);
+    }
+}
+
+test "Chunk struct fields" {
+    const chunk = Chunk{
+        .text = "test text",
+        .start_offset = 100,
+        .end_offset = 109,
+        .index = 5,
+        .estimated_tokens = 2,
+    };
+    try std.testing.expectEqualStrings("test text", chunk.text);
+    try std.testing.expectEqual(@as(usize, 100), chunk.start_offset);
+    try std.testing.expectEqual(@as(usize, 109), chunk.end_offset);
+    try std.testing.expectEqual(@as(u32, 5), chunk.index);
+    try std.testing.expectEqual(@as(u32, 2), chunk.estimated_tokens);
+}
+
+test "findBoundary falls back to target when no break found" {
+    const text = "abcdefghijklmnopqrstuvwxyz";
+    const boundary = findBoundary(text, 0, 15);
+    // No whitespace, newlines, or punctuation, should return target
+    try std.testing.expectEqual(@as(usize, 15), boundary);
+}
+
+test "findBoundary at word break" {
+    const text = "hello world foo bar";
+    const boundary = findBoundary(text, 0, 15);
+    // findBoundary returns position after the space (start of next word)
+    try std.testing.expect(boundary > 0 and boundary <= text.len);
+}
+
+test "freeChunks empty slice" {
+    const allocator = std.testing.allocator;
+    const chunks = try allocator.alloc(Chunk, 0);
+    freeChunks(allocator, chunks);
+}

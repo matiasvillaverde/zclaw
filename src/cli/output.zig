@@ -353,3 +353,144 @@ test "OutputWriter newline" {
     try out.newline();
     try std.testing.expectEqualStrings("\n", fbs.getWritten());
 }
+
+// --- Additional Tests ---
+
+test "OutputMode all labels non-empty" {
+    for (std.meta.tags(OutputMode)) |m| {
+        try std.testing.expect(m.label().len > 0);
+    }
+}
+
+test "OutputMode fromString all valid" {
+    try std.testing.expectEqual(OutputMode.rich, OutputMode.fromString("rich").?);
+    try std.testing.expectEqual(OutputMode.plain, OutputMode.fromString("plain").?);
+    try std.testing.expectEqual(OutputMode.json, OutputMode.fromString("json").?);
+}
+
+test "OutputMode fromString empty" {
+    try std.testing.expect(OutputMode.fromString("") == null);
+}
+
+test "Color all codes non-empty" {
+    for (std.meta.tags(Color)) |c| {
+        try std.testing.expect(c.code().len > 0);
+    }
+}
+
+test "Color dim code" {
+    try std.testing.expectEqualStrings("\x1b[2m", Color.dim.code());
+}
+
+test "Color yellow code" {
+    try std.testing.expectEqualStrings("\x1b[33m", Color.yellow.code());
+}
+
+test "Color blue code" {
+    try std.testing.expectEqualStrings("\x1b[34m", Color.blue.code());
+}
+
+test "Color magenta code" {
+    try std.testing.expectEqualStrings("\x1b[35m", Color.magenta.code());
+}
+
+test "Color cyan code" {
+    try std.testing.expectEqualStrings("\x1b[36m", Color.cyan.code());
+}
+
+test "Color white code" {
+    try std.testing.expectEqualStrings("\x1b[37m", Color.white.code());
+}
+
+test "OutputWriter write" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const out = OutputWriter.init(fbs.writer().any(), .plain);
+    try out.write("hello world");
+    try std.testing.expectEqualStrings("hello world", fbs.getWritten());
+}
+
+test "OutputWriter heading rich mode has ANSI" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const out = OutputWriter.init(fbs.writer().any(), .rich);
+    try out.heading("Title");
+    const written = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[1m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[36m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Title") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\n"));
+}
+
+test "OutputWriter success rich mode" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const out = OutputWriter.init(fbs.writer().any(), .rich);
+    try out.success("all good");
+    const written = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[32m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "all good") != null);
+}
+
+test "OutputWriter warning rich mode" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const out = OutputWriter.init(fbs.writer().any(), .rich);
+    try out.warning("caution");
+    const written = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[33m") != null);
+}
+
+test "OutputWriter err rich mode" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const out = OutputWriter.init(fbs.writer().any(), .rich);
+    try out.err("failure");
+    const written = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[31m") != null);
+}
+
+test "OutputWriter jsonField" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const out = OutputWriter.init(fbs.writer().any(), .json);
+    var field_buf: [64]u8 = undefined;
+    try out.jsonField(&field_buf, "name", "zclaw");
+    const written = fbs.getWritten();
+    try std.testing.expectEqualStrings("\"name\": \"zclaw\"", written);
+}
+
+test "detectOutputMode empty args" {
+    const args = [_][]const u8{};
+    const mode = detectOutputMode(&args);
+    try std.testing.expect(mode == .rich or mode == .plain);
+}
+
+test "detectOutputMode first flag wins" {
+    // detectOutputMode returns the first matching flag
+    const args = [_][]const u8{ "--plain", "--json" };
+    try std.testing.expectEqual(OutputMode.plain, detectOutputMode(&args));
+    const args2 = [_][]const u8{ "--json", "--plain" };
+    try std.testing.expectEqual(OutputMode.json, detectOutputMode(&args2));
+}
+
+test "BANNER is non-empty" {
+    try std.testing.expect(BANNER.len > 0);
+}
+
+test "VERSION constant" {
+    try std.testing.expectEqualStrings("0.1.0", VERSION);
+}
+
+test "DESCRIPTION constant" {
+    try std.testing.expectEqualStrings("Multi-channel AI gateway", DESCRIPTION);
+}
+
+test "printVersion rich mode" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const out = OutputWriter.init(fbs.writer().any(), .rich);
+    try printVersion(&out);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "zclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), VERSION) != null);
+}

@@ -289,3 +289,99 @@ test "messageSendHandler send failure" {
     try std.testing.expect(!result.success);
     try std.testing.expectEqualStrings("send failed", result.error_message.?);
 }
+
+// --- Additional Tests ---
+
+test "extractParam basic extraction" {
+    const json = "{\"channel\":\"telegram\",\"chat_id\":\"123\"}";
+    try std.testing.expectEqualStrings("telegram", extractParam(json, "channel").?);
+    try std.testing.expectEqualStrings("123", extractParam(json, "chat_id").?);
+}
+
+test "extractParam missing key" {
+    const json = "{\"channel\":\"telegram\"}";
+    try std.testing.expect(extractParam(json, "missing") == null);
+}
+
+test "extractParam empty value" {
+    const json = "{\"channel\":\"\"}";
+    try std.testing.expectEqualStrings("", extractParam(json, "channel").?);
+}
+
+test "extractParam with spaces in value" {
+    const json = "{\"content\":\"hello world\"}";
+    try std.testing.expectEqualStrings("hello world", extractParam(json, "content").?);
+}
+
+test "messageSendHandler whitespace content" {
+    var buf: [4096]u8 = undefined;
+    const result = messageSendHandler("{\"channel\":\"telegram\",\"chat_id\":\"1\",\"content\":\" \"}", &buf);
+    // Single space is not empty, so it should proceed to check registry
+    try std.testing.expect(!result.success);
+    // Will fail due to no registry set
+    try std.testing.expectEqualStrings("channel registry not initialized", result.error_message.?);
+}
+
+test "messageSendHandler output contains char count" {
+    const allocator = std.testing.allocator;
+    var chan_reg = plugin_mod.ChannelRegistry.init(allocator);
+    defer chan_reg.deinit();
+
+    var mock_channel = TestMockChannel{};
+    try chan_reg.register("telegram", mock_channel.asPlugin());
+
+    setChannelRegistry(&chan_reg);
+    defer clearChannelRegistry();
+
+    var buf: [4096]u8 = undefined;
+    const result = messageSendHandler("{\"channel\":\"telegram\",\"chat_id\":\"1\",\"content\":\"test\"}", &buf);
+    try std.testing.expect(result.success);
+    // "test" is 4 chars
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "4 chars") != null);
+}
+
+test "messageSendHandler multiple sends to mock" {
+    const allocator = std.testing.allocator;
+    var chan_reg = plugin_mod.ChannelRegistry.init(allocator);
+    defer chan_reg.deinit();
+
+    var mock_channel = TestMockChannel{};
+    try chan_reg.register("telegram", mock_channel.asPlugin());
+
+    setChannelRegistry(&chan_reg);
+    defer clearChannelRegistry();
+
+    var buf: [4096]u8 = undefined;
+    _ = messageSendHandler("{\"channel\":\"telegram\",\"chat_id\":\"1\",\"content\":\"first\"}", &buf);
+    _ = messageSendHandler("{\"channel\":\"telegram\",\"chat_id\":\"2\",\"content\":\"second\"}", &buf);
+
+    try std.testing.expectEqual(@as(u32, 2), mock_channel.sent_count);
+    try std.testing.expectEqualStrings("2", mock_channel.last_chat_id.?);
+    try std.testing.expectEqualStrings("second", mock_channel.last_content.?);
+}
+
+test "BUILTIN_MESSAGE_SEND parameters contain required fields" {
+    const params = BUILTIN_MESSAGE_SEND.parameters_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, params, "channel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "chat_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "content") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "required") != null);
+}
+
+test "TestMockChannel vtable operations" {
+    var mock = TestMockChannel{};
+    try std.testing.expectEqual(plugin_mod.ChannelStatus.connected, mock.status);
+
+    var plugin = mock.asPlugin();
+    plugin.stop();
+    try std.testing.expectEqual(plugin_mod.ChannelStatus.disconnected, mock.status);
+
+    try plugin.start();
+    try std.testing.expectEqual(plugin_mod.ChannelStatus.connected, mock.status);
+}
+
+test "TestMockChannel getType returns telegram" {
+    var mock = TestMockChannel{};
+    var plugin = mock.asPlugin();
+    try std.testing.expectEqual(plugin_mod.ChannelType.telegram, plugin.getType());
+}

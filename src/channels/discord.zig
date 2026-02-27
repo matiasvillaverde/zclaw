@@ -43,8 +43,10 @@ pub const GatewayOpcode = enum(u8) {
             1 => .heartbeat,
             2 => .identify,
             3 => .presence_update,
+            4 => .voice_state_update,
             6 => .@"resume",
             7 => .reconnect,
+            8 => .request_guild_members,
             9 => .invalid_session,
             10 => .hello,
             11 => .heartbeat_ack,
@@ -584,4 +586,361 @@ test "DiscordChannel as PluginVTable" {
 
     p.stop();
     try std.testing.expectEqual(plugin.ChannelStatus.disconnected, p.getStatus());
+}
+
+// ======================================================================
+// Additional comprehensive tests
+// ======================================================================
+
+// --- Gateway Opcode Tests ---
+
+test "GatewayOpcode fromInt identify" {
+    try std.testing.expectEqual(GatewayOpcode.identify, GatewayOpcode.fromInt(2).?);
+}
+
+test "GatewayOpcode fromInt presence_update" {
+    try std.testing.expectEqual(GatewayOpcode.presence_update, GatewayOpcode.fromInt(3).?);
+}
+
+test "GatewayOpcode fromInt voice_state_update" {
+    try std.testing.expectEqual(GatewayOpcode.voice_state_update, GatewayOpcode.fromInt(4).?);
+}
+
+test "GatewayOpcode fromInt resume" {
+    try std.testing.expectEqual(GatewayOpcode.@"resume", GatewayOpcode.fromInt(6).?);
+}
+
+test "GatewayOpcode fromInt reconnect" {
+    try std.testing.expectEqual(GatewayOpcode.reconnect, GatewayOpcode.fromInt(7).?);
+}
+
+test "GatewayOpcode fromInt request_guild_members" {
+    try std.testing.expectEqual(GatewayOpcode.request_guild_members, GatewayOpcode.fromInt(8).?);
+}
+
+test "GatewayOpcode fromInt invalid_session" {
+    try std.testing.expectEqual(GatewayOpcode.invalid_session, GatewayOpcode.fromInt(9).?);
+}
+
+test "GatewayOpcode fromInt heartbeat_ack" {
+    try std.testing.expectEqual(GatewayOpcode.heartbeat_ack, GatewayOpcode.fromInt(11).?);
+}
+
+test "GatewayOpcode fromInt invalid value 5" {
+    try std.testing.expect(GatewayOpcode.fromInt(5) == null);
+}
+
+test "GatewayOpcode fromInt invalid value 12" {
+    try std.testing.expect(GatewayOpcode.fromInt(12) == null);
+}
+
+test "GatewayOpcode fromInt invalid value 100" {
+    try std.testing.expect(GatewayOpcode.fromInt(100) == null);
+}
+
+// --- Intent Tests ---
+
+test "INTENT_GUILDS bit position" {
+    try std.testing.expectEqual(@as(u32, 1), INTENT_GUILDS);
+}
+
+test "INTENT_GUILD_MESSAGES bit position" {
+    try std.testing.expectEqual(@as(u32, 512), INTENT_GUILD_MESSAGES);
+}
+
+test "INTENT_DIRECT_MESSAGES bit position" {
+    try std.testing.expectEqual(@as(u32, 4096), INTENT_DIRECT_MESSAGES);
+}
+
+test "INTENT_MESSAGE_CONTENT bit position" {
+    try std.testing.expectEqual(@as(u32, 32768), INTENT_MESSAGE_CONTENT);
+}
+
+test "DEFAULT_INTENTS is correct combination" {
+    const expected = INTENT_GUILDS | INTENT_GUILD_MESSAGES | INTENT_DIRECT_MESSAGES | INTENT_MESSAGE_CONTENT;
+    try std.testing.expectEqual(expected, DEFAULT_INTENTS);
+}
+
+test "custom intents without message content" {
+    const intents = INTENT_GUILDS | INTENT_GUILD_MESSAGES | INTENT_DIRECT_MESSAGES;
+    try std.testing.expect(intents & INTENT_MESSAGE_CONTENT == 0);
+    try std.testing.expect(intents & INTENT_GUILDS != 0);
+}
+
+// --- API URL Builder Tests ---
+
+test "buildApiUrl guilds endpoint" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, "/guilds/123");
+    try std.testing.expectEqualStrings("https://discord.com/api/v10/guilds/123", url);
+}
+
+test "buildApiUrl gateway" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, "/gateway");
+    try std.testing.expectEqualStrings("https://discord.com/api/v10/gateway", url);
+}
+
+test "buildApiUrl users me" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, "/users/@me");
+    try std.testing.expectEqualStrings("https://discord.com/api/v10/users/@me", url);
+}
+
+test "buildApiUrl buffer too small" {
+    var buf: [5]u8 = undefined;
+    const result = buildApiUrl(&buf, "/test");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+// --- Message Body Tests ---
+
+test "buildSendMessageBody escapes quotes" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "He said \"hello\"");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"hello\\\"") != null);
+}
+
+test "buildSendMessageBody escapes newlines" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "line1\nline2");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\n") != null);
+}
+
+test "buildSendMessageBody empty content" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageBody(&buf, "");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"\"") != null);
+}
+
+// --- Identify Payload Tests ---
+
+test "buildIdentifyPayload custom intents" {
+    var buf: [1024]u8 = undefined;
+    const intents = INTENT_GUILDS | INTENT_GUILD_MESSAGES;
+    const payload = try buildIdentifyPayload(&buf, "my-token", intents);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"op\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"device\":\"zclaw\"") != null);
+}
+
+test "buildIdentifyPayload contains properties" {
+    var buf: [1024]u8 = undefined;
+    const payload = try buildIdentifyPayload(&buf, "tok", DEFAULT_INTENTS);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"browser\":\"zclaw\"") != null);
+}
+
+// --- Heartbeat Payload Tests ---
+
+test "buildHeartbeatPayload with zero sequence" {
+    var buf: [256]u8 = undefined;
+    const payload = try buildHeartbeatPayload(&buf, 0);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"d\":0") != null);
+}
+
+test "buildHeartbeatPayload with large sequence" {
+    var buf: [256]u8 = undefined;
+    const payload = try buildHeartbeatPayload(&buf, 999999);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"d\":999999") != null);
+}
+
+// --- Opcode Extraction from Gateway Messages ---
+
+test "extractOpcode hello" {
+    try std.testing.expectEqual(@as(u8, 10), extractOpcode("{\"op\":10,\"d\":{\"heartbeat_interval\":41250}}").?);
+}
+
+test "extractOpcode heartbeat_ack" {
+    try std.testing.expectEqual(@as(u8, 11), extractOpcode("{\"op\":11}").?);
+}
+
+test "extractOpcode reconnect" {
+    try std.testing.expectEqual(@as(u8, 7), extractOpcode("{\"op\":7,\"d\":null}").?);
+}
+
+test "extractOpcode invalid_session" {
+    try std.testing.expectEqual(@as(u8, 9), extractOpcode("{\"op\":9,\"d\":false}").?);
+}
+
+test "extractOpcode missing" {
+    try std.testing.expect(extractOpcode("{\"t\":\"READY\"}") == null);
+}
+
+// --- Event Name Extraction ---
+
+test "extractEventName READY" {
+    try std.testing.expectEqualStrings("READY", extractEventName("{\"t\":\"READY\",\"op\":0}").?);
+}
+
+test "extractEventName GUILD_CREATE" {
+    try std.testing.expectEqualStrings("GUILD_CREATE", extractEventName("{\"t\":\"GUILD_CREATE\"}").?);
+}
+
+test "extractEventName GUILD_MEMBER_ADD" {
+    try std.testing.expectEqualStrings("GUILD_MEMBER_ADD", extractEventName("{\"t\":\"GUILD_MEMBER_ADD\"}").?);
+}
+
+test "extractEventName INTERACTION_CREATE" {
+    try std.testing.expectEqualStrings("INTERACTION_CREATE", extractEventName("{\"t\":\"INTERACTION_CREATE\"}").?);
+}
+
+test "extractEventName missing for non-dispatch" {
+    try std.testing.expect(extractEventName("{\"op\":11}") == null);
+}
+
+// --- Sequence Extraction ---
+
+test "extractSequence zero" {
+    try std.testing.expectEqual(@as(i64, 0), extractSequence("{\"s\":0}").?);
+}
+
+test "extractSequence large value" {
+    try std.testing.expectEqual(@as(i64, 123456), extractSequence("{\"s\":123456,\"op\":0}").?);
+}
+
+// --- Heartbeat Interval Extraction ---
+
+test "extractHeartbeatInterval typical value" {
+    const json = "{\"op\":10,\"d\":{\"heartbeat_interval\":45000}}";
+    try std.testing.expectEqual(@as(i64, 45000), extractHeartbeatInterval(json).?);
+}
+
+test "extractHeartbeatInterval missing" {
+    try std.testing.expect(extractHeartbeatInterval("{\"op\":0}") == null);
+}
+
+// --- Message Parsing with Embeds/Attachments ---
+
+test "extractMessageContent empty content" {
+    const json = "{\"content\":\"\",\"channel_id\":\"123\"}";
+    try std.testing.expectEqualStrings("", extractMessageContent(json).?);
+}
+
+test "extractChannelId from guild message" {
+    const json = "{\"guild_id\":\"g1\",\"channel_id\":\"c1\",\"content\":\"hi\"}";
+    try std.testing.expectEqualStrings("c1", extractChannelId(json).?);
+}
+
+test "extractAuthorId missing author" {
+    const json = "{\"content\":\"hello\",\"channel_id\":\"c1\"}";
+    try std.testing.expect(extractAuthorId(json) == null);
+}
+
+test "extractAuthorUsername missing author" {
+    const json = "{\"content\":\"hi\"}";
+    try std.testing.expect(extractAuthorUsername(json) == null);
+}
+
+test "extractGuildId missing for DM" {
+    const json = "{\"channel_id\":\"c1\",\"content\":\"hi\"}";
+    try std.testing.expect(extractGuildId(json) == null);
+}
+
+test "extractMessageId from dispatch" {
+    const json = "{\"op\":0,\"d\":{\"id\":\"msg12345\",\"content\":\"hi\"}}";
+    try std.testing.expectEqualStrings("msg12345", extractMessageId(json).?);
+}
+
+test "extractMessageId missing d section" {
+    const json = "{\"id\":\"123\"}";
+    try std.testing.expect(extractMessageId(json) == null);
+}
+
+// --- Bot Detection ---
+
+test "isBot no author section" {
+    const json = "{\"content\":\"hello\"}";
+    try std.testing.expect(!isBot(json));
+}
+
+test "isBot missing bot field" {
+    const json = "{\"author\":{\"id\":\"1\",\"username\":\"user\"}}";
+    try std.testing.expect(!isBot(json));
+}
+
+// --- Full MESSAGE_CREATE Parsing ---
+
+test "parseIncomingMessage full MESSAGE_CREATE" {
+    const json =
+        \\{"op":0,"t":"MESSAGE_CREATE","s":5,"d":{"id":"msg001","content":"Hello world!","channel_id":"ch001","guild_id":"g001","author":{"id":"u001","username":"testuser","discriminator":"0001","avatar":null},"timestamp":"2024-01-01T00:00:00Z"}}
+    ;
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expectEqual(plugin.ChannelType.discord, msg.channel);
+    try std.testing.expectEqualStrings("Hello world!", msg.content);
+    try std.testing.expectEqualStrings("ch001", msg.chat_id);
+    try std.testing.expectEqualStrings("u001", msg.sender_id);
+    try std.testing.expectEqualStrings("testuser", msg.sender_name.?);
+    try std.testing.expectEqualStrings("msg001", msg.message_id);
+    try std.testing.expect(msg.is_group);
+}
+
+test "parseIncomingMessage DM no guild_id" {
+    const json = "{\"d\":{\"id\":\"m1\",\"content\":\"DM text\",\"channel_id\":\"dm-ch\",\"author\":{\"id\":\"u1\",\"username\":\"alice\"}}}";
+    const msg = parseIncomingMessage(json).?;
+    try std.testing.expect(!msg.is_group);
+    try std.testing.expectEqualStrings("DM text", msg.content);
+}
+
+test "parseIncomingMessage missing author" {
+    const json = "{\"d\":{\"id\":\"1\",\"content\":\"hi\",\"channel_id\":\"c1\"}}";
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+test "parseIncomingMessage missing channel_id" {
+    const json = "{\"d\":{\"id\":\"1\",\"content\":\"hi\",\"author\":{\"id\":\"u1\"}}}";
+    try std.testing.expect(parseIncomingMessage(json) == null);
+}
+
+// --- DiscordConfig Tests ---
+
+test "DiscordConfig with application_id" {
+    const config = DiscordConfig{ .bot_token = "tok", .application_id = "app-123" };
+    try std.testing.expectEqualStrings("app-123", config.application_id.?);
+}
+
+test "DiscordConfig custom intents" {
+    const config = DiscordConfig{ .bot_token = "tok", .intents = INTENT_GUILDS };
+    try std.testing.expectEqual(INTENT_GUILDS, config.intents);
+}
+
+// --- DiscordChannel Advanced Tests ---
+
+test "DiscordChannel stop resets sequence" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+    channel.status = .connected;
+    channel.sequence = 42;
+
+    var p = channel.asPlugin();
+    p.stop();
+    try std.testing.expectEqual(plugin.ChannelStatus.disconnected, channel.status);
+    try std.testing.expect(channel.sequence == null);
+}
+
+test "DiscordChannel auth value with long token" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+
+    const long_token = "fake-discord-test-token-that-is-intentionally-long-for-testing-purposes-only";
+    const channel = DiscordChannel.init(allocator, .{ .bot_token = long_token }, &client);
+    const auth = channel.authValue();
+    try std.testing.expect(std.mem.startsWith(u8, auth, "Bot "));
+    try std.testing.expect(std.mem.endsWith(u8, auth, long_token));
+}
+
+test "DiscordChannel sendText constructs correct URL" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"id\":\"msg-1\"}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = DiscordChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    try channel.sendText(.{ .chat_id = "999888777", .content = "test" });
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_url.?, "/channels/999888777/messages") != null);
 }

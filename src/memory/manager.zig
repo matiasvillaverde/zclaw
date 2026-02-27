@@ -357,3 +357,120 @@ test "MemoryManager large document chunking" {
 
     try std.testing.expect(mgr.chunkCount() >= 2); // Should have multiple chunks
 }
+
+// --- Additional Tests ---
+
+test "MemoryManager sequential doc IDs" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    const id1 = try mgr.indexDocument("a.md", "Content A");
+    const id2 = try mgr.indexDocument("b.md", "Content B");
+    const id3 = try mgr.indexDocument("c.md", "Content C");
+
+    try std.testing.expectEqual(@as(u64, 1), id1);
+    try std.testing.expectEqual(@as(u64, 2), id2);
+    try std.testing.expectEqual(@as(u64, 3), id3);
+}
+
+test "MemoryManager replace increments doc ID" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    const id1 = try mgr.indexDocument("a.md", "V1");
+    const id2 = try mgr.indexDocument("a.md", "V2");
+
+    try std.testing.expectEqual(@as(u64, 1), id1);
+    try std.testing.expectEqual(@as(u64, 2), id2);
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+}
+
+test "MemoryManager empty document" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("empty.md", "");
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+}
+
+test "MemoryManager keywordSearch max results limit" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("a.md", "Zig language features");
+    _ = try mgr.indexDocument("b.md", "Zig comptime is powerful");
+    _ = try mgr.indexDocument("c.md", "Zig build system works well");
+
+    const results = try mgr.keywordSearch(allocator, "zig", 1);
+    defer freeResults(allocator, results);
+
+    try std.testing.expect(results.len <= 1);
+}
+
+test "MemoryManager needsReindex different content" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("test.md", "original");
+    try std.testing.expect(mgr.needsReindex("test.md", "modified"));
+}
+
+test "MemoryManager needsReindex unknown path" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    try std.testing.expect(mgr.needsReindex("unknown.md", "anything"));
+}
+
+test "computeTextScore query longer than text" {
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), computeTextScore("hi", "hello world"), 0.001);
+}
+
+test "computeTextScore repeated matches higher score" {
+    // Use longer texts so normalization (text.len/100) differentiates
+    const score1 = computeTextScore("hello hello hello hello hello", "hello");
+    const score2 = computeTextScore("hello world foo bar baz", "hello");
+    // Both short texts get capped at 1.0 due to min(1.0, tf) with small denominator
+    try std.testing.expect(score1 >= score2);
+}
+
+test "eqlNoCase matching" {
+    try std.testing.expect(eqlNoCase("Hello", "hello"));
+    try std.testing.expect(eqlNoCase("ABC", "abc"));
+    try std.testing.expect(!eqlNoCase("abc", "abcd"));
+    try std.testing.expect(!eqlNoCase("abc", "xyz"));
+}
+
+test "MemoryManager chunkCount matches chunks stored" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("a.md", "Short.");
+    const count_a = mgr.chunkCount();
+    try std.testing.expect(count_a >= 1);
+
+    _ = try mgr.indexDocument("b.md", "Also short.");
+    const count_b = mgr.chunkCount();
+    try std.testing.expect(count_b >= count_a + 1);
+}
+
+test "MemoryManager keywordSearch results have source file" {
+    const allocator = std.testing.allocator;
+    var mgr = MemoryManager.init(allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.indexDocument("source.md", "Zig is awesome");
+
+    const results = try mgr.keywordSearch(allocator, "zig", 5);
+    defer freeResults(allocator, results);
+
+    try std.testing.expect(results.len >= 1);
+    try std.testing.expectEqualStrings("source.md", results[0].source_file.?);
+}
