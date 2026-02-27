@@ -2,6 +2,10 @@ const std = @import("std");
 const output = @import("output.zig");
 const config_schema = @import("../config/schema.zig");
 const config_loader = @import("../config/loader.zig");
+const runtime = @import("../agent/runtime.zig");
+const http_client = @import("../infra/http_client.zig");
+const session = @import("../agent/session.zig");
+const openai_compat = @import("../providers/openai_compat.zig");
 
 const OutputWriter = output.OutputWriter;
 const OutputMode = output.OutputMode;
@@ -163,22 +167,29 @@ pub const CommandResult = struct {
 // --- Dispatch ---
 
 pub fn dispatch(ctx: *CliContext, args: []const []const u8) !CommandResult {
-    // Filter out global flags to find command
-    const cmd_args = filterGlobalFlags(args);
-    if (cmd_args.len == 0) {
+    // Find the first non-flag argument (the command)
+    var cmd_idx: ?usize = null;
+    for (args, 0..) |arg, i| {
+        if (!isGlobalFlag(arg)) {
+            cmd_idx = i;
+            break;
+        }
+    }
+
+    if (cmd_idx == null) {
         try printHelp(&ctx.out);
         return .{};
     }
 
-    const cmd = Command.fromString(cmd_args[0]) orelse {
+    const cmd = Command.fromString(args[cmd_idx.?]) orelse {
         try ctx.out.err("Unknown command: ");
-        try ctx.out.write(cmd_args[0]);
+        try ctx.out.write(args[cmd_idx.?]);
         try ctx.out.newline();
         try ctx.out.write("Run 'zclaw help' for available commands.\n");
         return .{ .exit_code = 1 };
     };
 
-    const sub_args = if (cmd_args.len > 1) cmd_args[1..] else &[_][]const u8{};
+    const sub_args = if (cmd_idx.? + 1 < args.len) args[cmd_idx.? + 1 ..] else &[_][]const u8{};
 
     return switch (cmd) {
         .version => {
@@ -248,6 +259,9 @@ fn runGateway(ctx: *CliContext, args: []const []const u8) !CommandResult {
 
     return switch (sub) {
         .run => {
+            // When dispatched via CLI, gateway run is handled by main.zig directly.
+            // This path is only reached if someone calls dispatch() without
+            // the main.zig gateway-run interception (e.g. in tests).
             const port = findArgValue(args[1..], "--port") orelse "18789";
             if (ctx.mode == .json) {
                 try ctx.out.print("{{\"command\":\"gateway.run\",\"port\":{s}}}\n", .{port});
@@ -317,20 +331,9 @@ fn printGatewayHelp(out: *const OutputWriter) !void {
 fn runAgent(ctx: *CliContext, args: []const []const u8) !CommandResult {
     const message = findArgValue(args, "--message") orelse findArgValue(args, "-m");
     const agent_name = findArgValue(args, "--agent") orelse "default";
+    const model_override = findArgValue(args, "--model");
 
-    if (message) |msg| {
-        if (ctx.mode == .json) {
-            try ctx.out.write("{\"command\":\"agent\",\"agent\":\"");
-            try ctx.out.write(agent_name);
-            try ctx.out.write("\",\"message\":\"");
-            try ctx.out.write(msg);
-            try ctx.out.write("\"}\n");
-        } else {
-            try ctx.out.kv("Agent", agent_name);
-            try ctx.out.kv("Message", msg);
-            try ctx.out.write("Running agent turn...\n");
-        }
-    } else {
+    if (message == null) {
         if (ctx.mode == .json) {
             try ctx.out.write("{\"error\":\"No message provided\"}\n");
         } else {
@@ -340,9 +343,135 @@ fn runAgent(ctx: *CliContext, args: []const []const u8) !CommandResult {
             try ctx.out.heading("Options:");
             try ctx.out.write("  -m, --message <text>  Message to send\n");
             try ctx.out.write("  --agent <name>        Agent name (default: default)\n");
+            try ctx.out.write("  --model <model>       Model to use\n");
+            try ctx.out.write("  --provider <name>     Provider: anthropic, openai (default: anthropic)\n");
+        }
+        return .{};
+    }
+
+    const msg = message.?;
+
+    // Detect provider and API key
+    const provider_name = findArgValue(args, "--provider") orelse "anthropic";
+
+    // Resolve API key based on provider
+    const api_key = resolveApiKey(provider_name);
+
+    if (api_key == null) {
+        const env_name = resolveApiKeyEnvName(provider_name);
+        if (ctx.mode == .json) {
+            try ctx.out.print("{{\"error\":\"No API key found. Set {s} environment variable.\"}}\n", .{env_name});
+        } else {
+            try ctx.out.print("No API key found. Set {s} environment variable.\n", .{env_name});
+        }
+        return .{ .exit_code = 1 };
+    }
+
+    // Determine model
+    const model = model_override orelse resolveDefaultModel(provider_name);
+
+    // Create HTTP transport and client
+    var transport_instance = http_client.StdHttpTransport.init(ctx.allocator);
+    var client = http_client.HttpClient.init(ctx.allocator, transport_instance.transport());
+    defer client.deinit();
+
+    // Create provider dispatch
+    var provider = resolveProvider(&client, provider_name, api_key.?);
+
+    // Create agent runtime
+    var agent_rt = runtime.AgentRuntime.init(ctx.allocator, .{
+        .agent_id = agent_name,
+        .model = model,
+        .api_key = api_key.?,
+        .max_turns = 1,
+        .stream = false,
+    });
+    defer agent_rt.deinit();
+
+    // Add user message
+    try agent_rt.addUserMessage(msg);
+
+    if (ctx.mode != .json) {
+        try ctx.out.kv("Agent", agent_name);
+        try ctx.out.kv("Model", model);
+        try ctx.out.kv("Provider", provider_name);
+        try ctx.out.newline();
+    }
+
+    // Run one turn
+    var result = runtime.runLoop(ctx.allocator, &agent_rt, &provider, null) catch |err| {
+        if (ctx.mode == .json) {
+            try ctx.out.write("{\"error\":\"Agent run failed\"}\n");
+        } else {
+            try ctx.out.err("Agent run failed.");
+            try ctx.out.print("  Error: {}\n", .{err});
+        }
+        return .{ .exit_code = 1 };
+    };
+    defer runtime.freeRunResult(ctx.allocator, &result);
+
+    // Output result
+    if (result.text) |text| {
+        if (ctx.mode == .json) {
+            try ctx.out.write("{\"agent\":\"");
+            try ctx.out.write(agent_name);
+            try ctx.out.write("\",\"response\":\"");
+            // Simple JSON escape for the response text
+            for (text) |c| {
+                switch (c) {
+                    '"' => try ctx.out.write("\\\""),
+                    '\\' => try ctx.out.write("\\\\"),
+                    '\n' => try ctx.out.write("\\n"),
+                    '\r' => try ctx.out.write("\\r"),
+                    '\t' => try ctx.out.write("\\t"),
+                    else => {
+                        const buf = [1]u8{c};
+                        try ctx.out.write(&buf);
+                    },
+                }
+            }
+            try ctx.out.print("\",\"input_tokens\":{d},\"output_tokens\":{d}}}\n", .{
+                agent_rt.total_input_tokens,
+                agent_rt.total_output_tokens,
+            });
+        } else {
+            try ctx.out.write(text);
+            try ctx.out.newline();
+            try ctx.out.newline();
+            try ctx.out.print("  tokens: {d} in / {d} out\n", .{
+                agent_rt.total_input_tokens,
+                agent_rt.total_output_tokens,
+            });
+        }
+    } else {
+        if (ctx.mode == .json) {
+            try ctx.out.write("{\"agent\":\"");
+            try ctx.out.write(agent_name);
+            try ctx.out.write("\",\"response\":null}\n");
+        } else {
+            try ctx.out.write("(no response)\n");
         }
     }
+
+    // Save session
+    saveAgentSession(agent_name, msg, result.text);
+
     return .{};
+}
+
+/// Save agent session to disk (best effort)
+fn saveAgentSession(agent_name: []const u8, user_msg: []const u8, response: ?[]const u8) void {
+    var path_buf: [4096]u8 = undefined;
+    const home = std.posix.getenv("HOME") orelse return;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.openclaw/sessions/{s}.jsonl", .{ home, agent_name }) catch return;
+
+    var writer = session.JsonlWriter.init(path) catch return;
+    defer writer.close();
+
+    writer.writeMessage(.user, user_msg) catch {};
+    if (response) |resp| {
+        writer.writeMessage(.assistant, resp) catch {};
+    }
 }
 
 // --- Channels Commands ---
@@ -600,19 +729,56 @@ fn runSessionsList(ctx: *CliContext) !CommandResult {
 // --- Doctor Command ---
 
 fn runDoctor(ctx: *CliContext, _: []const []const u8) !CommandResult {
+    // Real health checks
+    const has_config = if (ctx.services) |svc| svc.config != null else false;
+    const has_anthropic_key = std.posix.getenv("ANTHROPIC_API_KEY") != null;
+    const has_openai_key = std.posix.getenv("OPENAI_API_KEY") != null;
+    const has_any_key = has_anthropic_key or has_openai_key;
+
+    // Check config file exists
+    var path_buf: [4096]u8 = undefined;
+    const config_exists = blk: {
+        const home = std.posix.getenv("HOME") orelse break :blk false;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/.openclaw/openclaw.json", .{home}) catch break :blk false;
+        std.fs.cwd().access(path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
     if (ctx.mode == .json) {
         try ctx.out.write("{\"command\":\"doctor\",\"checks\":[");
-        try ctx.out.write("{\"name\":\"config\",\"status\":\"ok\"},");
-        try ctx.out.write("{\"name\":\"gateway\",\"status\":\"not_running\"},");
-        try ctx.out.write("{\"name\":\"channels\",\"status\":\"none_configured\"}");
+        try ctx.out.print("{{\"name\":\"config\",\"status\":\"{s}\"}},", .{if (has_config) "ok" else "missing"});
+        try ctx.out.print("{{\"name\":\"config_file\",\"status\":\"{s}\"}},", .{if (config_exists) "found" else "not_found"});
+        try ctx.out.print("{{\"name\":\"api_keys\",\"status\":\"{s}\"}}", .{if (has_any_key) "ok" else "missing"});
         try ctx.out.write("]}\n");
     } else {
         try ctx.out.heading("Health Checks:");
-        try ctx.out.success("  [ok] Configuration file");
-        try ctx.out.warning("  [--] Gateway not running");
-        try ctx.out.warning("  [--] No channels configured");
+        if (has_config) {
+            try ctx.out.success("  [ok] Configuration loaded");
+        } else {
+            try ctx.out.warning("  [--] Configuration not loaded");
+        }
+        if (config_exists) {
+            try ctx.out.success("  [ok] Config file found");
+        } else {
+            try ctx.out.warning("  [--] No config file (~/.openclaw/openclaw.json)");
+        }
+        if (has_anthropic_key) {
+            try ctx.out.success("  [ok] ANTHROPIC_API_KEY set");
+        } else {
+            try ctx.out.warning("  [--] ANTHROPIC_API_KEY not set");
+        }
+        if (has_openai_key) {
+            try ctx.out.success("  [ok] OPENAI_API_KEY set");
+        } else {
+            try ctx.out.warning("  [--] OPENAI_API_KEY not set");
+        }
         try ctx.out.newline();
-        try ctx.out.write("Run 'zclaw setup' to configure your instance.\n");
+        if (!has_any_key) {
+            try ctx.out.write("Set ANTHROPIC_API_KEY or OPENAI_API_KEY to use AI providers.\n");
+        }
+        if (!config_exists) {
+            try ctx.out.write("Run 'zclaw setup' to create a configuration file.\n");
+        }
     }
     return .{};
 }
@@ -620,14 +786,35 @@ fn runDoctor(ctx: *CliContext, _: []const []const u8) !CommandResult {
 // --- Status Command ---
 
 fn runStatus(ctx: *CliContext, _: []const []const u8) !CommandResult {
+    const port_str = if (ctx.services) |svc|
+        if (svc.config) |cfg| portToString(cfg.gateway.port) else "18789"
+    else
+        "18789";
+
+    const log_level = if (ctx.services) |svc|
+        if (svc.config) |cfg| cfg.logging.level.label() else "info"
+    else
+        "info";
+
     if (ctx.mode == .json) {
-        try ctx.out.write("{\"command\":\"status\",\"gateway\":\"not_running\",\"channels\":0,\"sessions\":0}\n");
+        try ctx.out.print("{{\"command\":\"status\",\"version\":\"{s}\",\"port\":{s},\"log_level\":\"{s}\"}}\n", .{
+            output.VERSION,
+            port_str,
+            log_level,
+        });
     } else {
         try ctx.out.heading("System Status:");
         try ctx.out.kv("Version", output.VERSION);
-        try ctx.out.kv("Gateway", "not running");
-        try ctx.out.kv("Channels", "0 active");
-        try ctx.out.kv("Sessions", "0 active");
+        try ctx.out.kv("Port", port_str);
+        try ctx.out.kv("Log Level", log_level);
+
+        // Show provider availability
+        if (std.posix.getenv("ANTHROPIC_API_KEY")) |_| {
+            try ctx.out.kv("Anthropic", "configured");
+        }
+        if (std.posix.getenv("OPENAI_API_KEY")) |_| {
+            try ctx.out.kv("OpenAI", "configured");
+        }
     }
     return .{};
 }
@@ -670,22 +857,9 @@ fn runOnboard(ctx: *CliContext, _: []const []const u8) !CommandResult {
 
 // --- Helpers ---
 
-fn filterGlobalFlags(args: []const []const u8) []const []const u8 {
-    // Return args without global flags (--json, --plain)
-    // We just skip them in iteration, return the same slice
-    // The caller already detected mode via detectOutputMode
-    var count: usize = 0;
-    for (args) |arg| {
-        if (!std.mem.eql(u8, arg, "--json") and
-            !std.mem.eql(u8, arg, "--plain"))
-        {
-            count += 1;
-        }
-    }
-    if (count == args.len) return args;
-    // Since we can't easily allocate, just return original args
-    // and skip flags in dispatch
-    return args;
+fn isGlobalFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--json") or
+        std.mem.eql(u8, arg, "--plain");
 }
 
 fn findArgValue(args: []const []const u8, flag: []const u8) ?[]const u8 {
@@ -744,6 +918,89 @@ fn configSetValue(ctx: *CliContext, key: []const u8, value: []const u8) void {
             }
         }
     }
+}
+
+// --- Provider Resolution Helpers ---
+
+/// Resolve API key for a given provider name.
+fn resolveApiKey(provider_name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider_name, "anthropic")) {
+        return std.posix.getenv("ANTHROPIC_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "openai")) {
+        return std.posix.getenv("OPENAI_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "gemini")) {
+        return std.posix.getenv("GEMINI_API_KEY") orelse std.posix.getenv("GOOGLE_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "groq")) {
+        return std.posix.getenv("GROQ_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "deepseek")) {
+        return std.posix.getenv("DEEPSEEK_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "mistral")) {
+        return std.posix.getenv("MISTRAL_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "xai")) {
+        return std.posix.getenv("XAI_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "fireworks")) {
+        return std.posix.getenv("FIREWORKS_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "cerebras")) {
+        return std.posix.getenv("CEREBRAS_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "perplexity")) {
+        return std.posix.getenv("PERPLEXITY_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "openrouter")) {
+        return std.posix.getenv("OPENROUTER_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "together")) {
+        return std.posix.getenv("TOGETHER_API_KEY");
+    } else if (std.mem.eql(u8, provider_name, "ollama")) {
+        return "ollama"; // Ollama needs no API key
+    }
+    // Try generic key env var
+    return std.posix.getenv("ANTHROPIC_API_KEY");
+}
+
+/// Get the env var name for a provider (for error messages).
+fn resolveApiKeyEnvName(provider_name: []const u8) []const u8 {
+    if (std.mem.eql(u8, provider_name, "openai")) return "OPENAI_API_KEY";
+    if (std.mem.eql(u8, provider_name, "gemini")) return "GEMINI_API_KEY";
+    if (std.mem.eql(u8, provider_name, "groq")) return "GROQ_API_KEY";
+    if (std.mem.eql(u8, provider_name, "deepseek")) return "DEEPSEEK_API_KEY";
+    if (std.mem.eql(u8, provider_name, "mistral")) return "MISTRAL_API_KEY";
+    if (std.mem.eql(u8, provider_name, "xai")) return "XAI_API_KEY";
+    if (std.mem.eql(u8, provider_name, "fireworks")) return "FIREWORKS_API_KEY";
+    if (std.mem.eql(u8, provider_name, "cerebras")) return "CEREBRAS_API_KEY";
+    if (std.mem.eql(u8, provider_name, "perplexity")) return "PERPLEXITY_API_KEY";
+    if (std.mem.eql(u8, provider_name, "openrouter")) return "OPENROUTER_API_KEY";
+    if (std.mem.eql(u8, provider_name, "together")) return "TOGETHER_API_KEY";
+    return "ANTHROPIC_API_KEY";
+}
+
+/// Get the default model for a provider.
+fn resolveDefaultModel(provider_name: []const u8) []const u8 {
+    if (std.mem.eql(u8, provider_name, "openai")) return "gpt-4o";
+    if (std.mem.eql(u8, provider_name, "gemini")) return "gemini-2.0-flash";
+    if (std.mem.eql(u8, provider_name, "groq")) return "llama-3.3-70b-versatile";
+    if (std.mem.eql(u8, provider_name, "deepseek")) return "deepseek-chat";
+    if (std.mem.eql(u8, provider_name, "mistral")) return "mistral-large-latest";
+    if (std.mem.eql(u8, provider_name, "xai")) return "grok-2";
+    if (std.mem.eql(u8, provider_name, "fireworks")) return "accounts/fireworks/models/llama-v3p1-70b-instruct";
+    if (std.mem.eql(u8, provider_name, "cerebras")) return "llama-3.3-70b";
+    if (std.mem.eql(u8, provider_name, "perplexity")) return "llama-3.1-sonar-large-128k-online";
+    if (std.mem.eql(u8, provider_name, "openrouter")) return "anthropic/claude-sonnet-4-20250514";
+    if (std.mem.eql(u8, provider_name, "together")) return "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo";
+    if (std.mem.eql(u8, provider_name, "ollama")) return "llama3";
+    return "claude-sonnet-4-20250514";
+}
+
+/// Create a ProviderDispatch for the given provider name.
+fn resolveProvider(client: *http_client.HttpClient, provider_name: []const u8, api_key: []const u8) runtime.ProviderDispatch {
+    if (std.mem.eql(u8, provider_name, "anthropic")) {
+        return runtime.ProviderDispatch.initAnthropic(client, api_key, null);
+    } else if (std.mem.eql(u8, provider_name, "openai")) {
+        return runtime.ProviderDispatch.initOpenAI(client, api_key, null);
+    } else if (std.mem.eql(u8, provider_name, "gemini")) {
+        return runtime.ProviderDispatch.initGemini(client, api_key, null);
+    } else if (openai_compat.getPreset(provider_name)) |preset| {
+        return runtime.ProviderDispatch.initCompat(client, api_key, preset);
+    }
+    // Default to Anthropic
+    return runtime.ProviderDispatch.initAnthropic(client, api_key, null);
 }
 
 // --- Tests ---
@@ -1172,7 +1429,7 @@ test "dispatch status json" {
     const args = [_][]const u8{"status"};
     const result = try dispatch(&ctx, &args);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"gateway\":\"not_running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"version\":\"") != null);
 }
 
 test "dispatch setup" {
@@ -1207,11 +1464,11 @@ test "findArgValue last flag" {
     try std.testing.expect(findArgValue(&args, "--port") == null);
 }
 
-test "filterGlobalFlags" {
-    const args = [_][]const u8{ "gateway", "--json", "run" };
-    const filtered = filterGlobalFlags(&args);
-    // Returns original slice when can't reallocate
-    try std.testing.expectEqual(@as(usize, 3), filtered.len);
+test "isGlobalFlag" {
+    try std.testing.expect(isGlobalFlag("--json"));
+    try std.testing.expect(isGlobalFlag("--plain"));
+    try std.testing.expect(!isGlobalFlag("gateway"));
+    try std.testing.expect(!isGlobalFlag("run"));
 }
 
 test "dispatch gateway unknown sub" {
@@ -1574,24 +1831,32 @@ test "dispatch agent no message plain" {
     try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "Agent Command") != null);
 }
 
-test "dispatch agent with message" {
+test "dispatch agent with message requires api key" {
+    // Without an API key set, agent command returns exit_code 1
     var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     var ctx = makeCtx(&fbs, .plain);
     const args = [_][]const u8{ "agent", "--message", "hello world" };
     const result = try dispatch(&ctx, &args);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "hello world") != null);
+    // Without ANTHROPIC_API_KEY, should fail with exit 1
+    if (std.posix.getenv("ANTHROPIC_API_KEY") == null) {
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "API key") != null or
+            std.mem.indexOf(u8, fbs.getWritten(), "ANTHROPIC") != null);
+    }
 }
 
-test "dispatch agent with message json" {
+test "dispatch agent with message json requires api key" {
     var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     var ctx = makeCtx(&fbs, .json);
     const args = [_][]const u8{ "agent", "--message", "test" };
     const result = try dispatch(&ctx, &args);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"message\":\"test\"") != null);
+    if (std.posix.getenv("ANTHROPIC_API_KEY") == null) {
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "API key") != null or
+            std.mem.indexOf(u8, fbs.getWritten(), "error") != null);
+    }
 }
 
 test "dispatch agent with custom agent name" {
@@ -1600,8 +1865,10 @@ test "dispatch agent with custom agent name" {
     var ctx = makeCtx(&fbs, .plain);
     const args = [_][]const u8{ "agent", "--message", "hi", "--agent", "custom" };
     const result = try dispatch(&ctx, &args);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "custom") != null);
+    // Without API key, should still report the error (exit 1)
+    if (std.posix.getenv("ANTHROPIC_API_KEY") == null) {
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    }
 }
 
 test "dispatch agent with -m shorthand" {
@@ -1610,8 +1877,9 @@ test "dispatch agent with -m shorthand" {
     var ctx = makeCtx(&fbs, .plain);
     const args = [_][]const u8{ "agent", "-m", "short" };
     const result = try dispatch(&ctx, &args);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "short") != null);
+    if (std.posix.getenv("ANTHROPIC_API_KEY") == null) {
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    }
 }
 
 test "dispatch agent no message json" {
@@ -1654,10 +1922,10 @@ test "findArgValue empty args" {
     try std.testing.expect(findArgValue(&args, "--port") == null);
 }
 
-test "filterGlobalFlags no flags" {
-    const args = [_][]const u8{ "gateway", "run" };
-    const filtered = filterGlobalFlags(&args);
-    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+test "isGlobalFlag non-flags" {
+    try std.testing.expect(!isGlobalFlag("--help"));
+    try std.testing.expect(!isGlobalFlag("status"));
+    try std.testing.expect(!isGlobalFlag(""));
 }
 
 test "config set invalid port" {
