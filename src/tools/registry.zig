@@ -776,3 +776,265 @@ test "ToolCategory has 10 variants" {
     const tags = std.meta.tags(ToolCategory);
     try std.testing.expectEqual(@as(usize, 10), tags.len);
 }
+
+// === New Tests (batch 3) ===
+
+fn echoHandler(input_json: []const u8, output_buf: []u8) ToolResult {
+    // Parse input and echo it back into output_buf
+    const len = @min(input_json.len, output_buf.len);
+    @memcpy(output_buf[0..len], input_json[0..len]);
+    return .{ .success = true, .output = output_buf[0..len] };
+}
+
+fn fillHandler(_: []const u8, output_buf: []u8) ToolResult {
+    // Fill the entire output buffer to capacity
+    @memset(output_buf, 'X');
+    return .{ .success = true, .output = output_buf };
+}
+
+test "register and execute tool with JSON input" {
+    const allocator = std.testing.allocator;
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    try reg.register(.{ .name = "echo", .category = .custom, .description = "echoes input" }, echoHandler);
+
+    var buf: [256]u8 = undefined;
+    const result = reg.execute("echo", "{\"query\":\"hello world\"}", &buf).?;
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("{\"query\":\"hello world\"}", result.output);
+}
+
+test "execute disabled tool returns error" {
+    const allocator = std.testing.allocator;
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    try reg.register(.{ .name = "mytool" }, dummyHandler);
+    _ = reg.setEnabled("mytool", false);
+
+    var buf: [1024]u8 = undefined;
+    const result = reg.execute("mytool", "{}", &buf).?;
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("tool is disabled", result.error_message.?);
+    try std.testing.expectEqualStrings("", result.output);
+}
+
+test "listByCategory returns only matching tools" {
+    const allocator = std.testing.allocator;
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    try reg.register(.{ .name = "read_file", .category = .file }, dummyHandler);
+    try reg.register(.{ .name = "write_file", .category = .file }, dummyHandler);
+    try reg.register(.{ .name = "list_dir", .category = .file }, dummyHandler);
+    try reg.register(.{ .name = "run_bash", .category = .exec }, dummyHandler);
+    try reg.register(.{ .name = "web_fetch", .category = .web }, dummyHandler);
+    try reg.register(.{ .name = "mem_search", .category = .memory }, dummyHandler);
+
+    const file_tools = try reg.listByCategory(allocator, .file);
+    defer allocator.free(file_tools);
+    try std.testing.expectEqual(@as(usize, 3), file_tools.len);
+
+    const exec_tools = try reg.listByCategory(allocator, .exec);
+    defer allocator.free(exec_tools);
+    try std.testing.expectEqual(@as(usize, 1), exec_tools.len);
+
+    const web_tools = try reg.listByCategory(allocator, .web);
+    defer allocator.free(web_tools);
+    try std.testing.expectEqual(@as(usize, 1), web_tools.len);
+
+    const memory_tools = try reg.listByCategory(allocator, .memory);
+    defer allocator.free(memory_tools);
+    try std.testing.expectEqual(@as(usize, 1), memory_tools.len);
+
+    // No session tools registered
+    const session_tools = try reg.listByCategory(allocator, .session);
+    defer allocator.free(session_tools);
+    try std.testing.expectEqual(@as(usize, 0), session_tools.len);
+}
+
+test "buildToolsJson with multiple tools" {
+    const allocator = std.testing.allocator;
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    try reg.register(.{
+        .name = "bash",
+        .description = "Run shell commands",
+        .category = .exec,
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}}}",
+    }, dummyHandler);
+    try reg.register(.{
+        .name = "read",
+        .description = "Read a file",
+        .category = .file,
+    }, dummyHandler);
+    try reg.register(.{
+        .name = "search",
+        .description = "Search memory",
+        .category = .memory,
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}",
+    }, dummyHandler);
+
+    var buf: [8192]u8 = undefined;
+    const json = try reg.buildToolsJson(&buf);
+
+    // Valid JSON array structure
+    try std.testing.expectEqual(@as(u8, '['), json[0]);
+    try std.testing.expectEqual(@as(u8, ']'), json[json.len - 1]);
+
+    // All three tools present
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"search\"") != null);
+
+    // Descriptions present
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\":\"Run shell commands\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\":\"Read a file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\":\"Search memory\"") != null);
+
+    // Comma separators exist (at least 2 commas between entries)
+    var comma_count: usize = 0;
+    for (json) |c| {
+        if (c == ',') comma_count += 1;
+    }
+    try std.testing.expect(comma_count >= 2);
+}
+
+test "re-register tool overwrites handler" {
+    const allocator = std.testing.allocator;
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    // First register with dummyHandler (returns success)
+    try reg.register(.{ .name = "tool", .category = .file, .description = "v1" }, dummyHandler);
+    var buf: [1024]u8 = undefined;
+    const r1 = reg.execute("tool", "{}", &buf).?;
+    try std.testing.expect(r1.success);
+    try std.testing.expectEqualStrings("ok", r1.output);
+
+    // Re-register with failHandler (returns failure)
+    try reg.register(.{ .name = "tool", .category = .exec, .description = "v2" }, failHandler);
+
+    // Count should still be 1
+    try std.testing.expectEqual(@as(usize, 1), reg.count());
+
+    // Handler should now be failHandler
+    const r2 = reg.execute("tool", "{}", &buf).?;
+    try std.testing.expect(!r2.success);
+    try std.testing.expectEqualStrings("failed", r2.error_message.?);
+
+    // Category should be updated too
+    try std.testing.expectEqual(ToolCategory.exec, reg.get("tool").?.def.category);
+}
+
+test "execute nonexistent tool returns null" {
+    const allocator = std.testing.allocator;
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    // Register some tools but look up a different one
+    try reg.register(.{ .name = "bash" }, dummyHandler);
+    try reg.register(.{ .name = "read" }, dummyHandler);
+
+    var buf: [1024]u8 = undefined;
+    const result = reg.execute("nonexistent_tool", "{\"arg\":1}", &buf);
+    try std.testing.expect(result == null);
+
+    // Also test with similar but not exact names
+    const result2 = reg.execute("bas", "{}", &buf);
+    try std.testing.expect(result2 == null);
+
+    const result3 = reg.execute("bashy", "{}", &buf);
+    try std.testing.expect(result3 == null);
+}
+
+test "tool output fills buffer exactly" {
+    const allocator = std.testing.allocator;
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    try reg.register(.{ .name = "filler" }, fillHandler);
+
+    var buf: [64]u8 = undefined;
+    const result = reg.execute("filler", "{}", &buf).?;
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(usize, 64), result.output.len);
+
+    // Every byte should be 'X'
+    for (result.output) |c| {
+        try std.testing.expectEqual(@as(u8, 'X'), c);
+    }
+}
+
+test "ToolDef with all fields populated" {
+    const params = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"recursive\":{\"type\":\"boolean\"}},\"required\":[\"path\"]}";
+    const def = ToolDef{
+        .name = "file_search",
+        .description = "Search for files in a directory tree",
+        .category = .file,
+        .parameters_json = params,
+        .requires_approval = true,
+        .sandboxed = true,
+    };
+    try std.testing.expectEqualStrings("file_search", def.name);
+    try std.testing.expectEqualStrings("Search for files in a directory tree", def.description);
+    try std.testing.expectEqual(ToolCategory.file, def.category);
+    try std.testing.expectEqualStrings(params, def.parameters_json.?);
+    try std.testing.expect(def.requires_approval);
+    try std.testing.expect(def.sandboxed);
+}
+
+test "listNames returns all registered" {
+    const allocator = std.testing.allocator;
+    var reg = ToolRegistry.init(allocator);
+    defer reg.deinit();
+
+    try reg.register(.{ .name = "alpha", .category = .file }, dummyHandler);
+    try reg.register(.{ .name = "beta", .category = .exec }, dummyHandler);
+    try reg.register(.{ .name = "gamma", .category = .web }, dummyHandler);
+    try reg.register(.{ .name = "delta", .category = .memory }, dummyHandler);
+    try reg.register(.{ .name = "epsilon", .category = .session }, dummyHandler);
+
+    const names = try reg.listNames(allocator);
+    defer allocator.free(names);
+
+    try std.testing.expectEqual(@as(usize, 5), names.len);
+
+    // Check that each registered name appears in the list
+    const expected = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon" };
+    for (expected) |exp| {
+        var found = false;
+        for (names) |name| {
+            if (std.mem.eql(u8, name, exp)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "ToolResult success vs failure" {
+    const success_result = ToolResult{
+        .success = true,
+        .output = "file contents here",
+        .elapsed_ms = 15,
+    };
+    try std.testing.expect(success_result.success);
+    try std.testing.expectEqualStrings("file contents here", success_result.output);
+    try std.testing.expect(success_result.error_message == null);
+    try std.testing.expectEqual(@as(i64, 15), success_result.elapsed_ms);
+
+    const failure_result = ToolResult{
+        .success = false,
+        .output = "",
+        .error_message = "permission denied",
+        .elapsed_ms = 3,
+    };
+    try std.testing.expect(!failure_result.success);
+    try std.testing.expectEqualStrings("", failure_result.output);
+    try std.testing.expectEqualStrings("permission denied", failure_result.error_message.?);
+    try std.testing.expectEqual(@as(i64, 3), failure_result.elapsed_ms);
+}

@@ -667,3 +667,127 @@ test "PolicyEngine multiple prefix patterns" {
     try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("exec_bash"));
     try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("memory_search"));
 }
+
+// === New Tests (batch 3) ===
+
+test "deny wins over allow at same layer" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    // Both rules at agent layer: allow via wildcard, deny via exact match
+    try engine.addRule(.agent, .{ .tool_pattern = "*", .decision = .allow });
+    try engine.addRule(.agent, .{ .tool_pattern = "bash", .decision = .deny, .reason = "explicitly denied" });
+
+    // Deny wins regardless
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("bash"));
+    // Others still allowed
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("read"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("write"));
+}
+
+test "empty policy allows all" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    // No rules added at all
+    try std.testing.expectEqual(@as(usize, 0), engine.ruleCount());
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("bash"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("exec"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("write"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("read"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("anything_at_all"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate(""));
+}
+
+test "category-level deny with prefix pattern" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    // Allow everything by default
+    try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .allow });
+    // Deny entire "exec" category using prefix pattern
+    try engine.addRule(.agent, .{ .tool_pattern = "exec*", .decision = .deny, .reason = "execution blocked" });
+
+    // All exec-prefixed tools denied
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("exec"));
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("exec_bash"));
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("exec_python"));
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("exec_node"));
+
+    // Non-exec tools remain allowed
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("read"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("write"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("memory_search"));
+
+    // Verify deny reasons
+    try std.testing.expectEqualStrings("execution blocked", engine.getDenyReason("exec_bash").?);
+    try std.testing.expect(engine.getDenyReason("read") == null);
+}
+
+test "tool-specific override in denied category" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    // Global allows all
+    try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .allow });
+    // Agent denies all file tools
+    try engine.addRule(.agent, .{ .tool_pattern = "file_*", .decision = .deny, .reason = "file ops blocked" });
+    // Profile (higher priority) allows file_read specifically
+    try engine.addRule(.profile, .{ .tool_pattern = "file_read", .decision = .allow });
+
+    // file_read: has both deny (from agent layer) and allow (from profile layer)
+    // But deny always wins regardless of layer priority
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("file_read"));
+
+    // file_write: only deny from agent
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("file_write"));
+
+    // non-file tools: allowed
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("bash"));
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("memory_search"));
+}
+
+test "multiple policies compose - most restrictive wins" {
+    const allocator = std.testing.allocator;
+    var engine = PolicyEngine.init(allocator);
+    defer engine.deinit();
+
+    // Chain of policies at different layers
+    // Global: allow everything
+    try engine.addRule(.global, .{ .tool_pattern = "*", .decision = .allow });
+    // Provider: ask for exec tools
+    try engine.addRule(.provider, .{ .tool_pattern = "exec*", .decision = .ask });
+    // Agent: deny bash specifically
+    try engine.addRule(.agent, .{ .tool_pattern = "bash", .decision = .deny, .reason = "agent blocks bash" });
+    // Profile: ask for write
+    try engine.addRule(.profile, .{ .tool_pattern = "write", .decision = .ask });
+    // Sandbox: deny edit
+    try engine.addRule(.sandbox, .{ .tool_pattern = "edit", .decision = .deny, .reason = "sandbox blocks edit" });
+
+    // bash: denied by agent (deny always wins)
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("bash"));
+    // edit: denied by sandbox
+    try std.testing.expectEqual(PolicyDecision.deny, engine.evaluate("edit"));
+    // exec_python: ask from provider (no deny present, highest matching layer with non-deny is agent wildcard=allow, but provider has exec* ask - agent layer has higher priority, default from global is allow, so agent's * allow at prio 3 > provider's exec* ask at prio 2)
+    // Actually: global * allow (prio 1), provider exec* ask (prio 2), so highest prio matching is provider at prio 2... but global * also matches at prio 1. Provider at prio 2 wins.
+    // Wait - let's trace evaluate: for "exec_python"
+    // - global * allow (prio 1) -> best_prio=1, best=allow
+    // - provider exec* ask (prio 2) -> prio 2 >= 1, best_prio=2, best=ask
+    // No deny. Result: ask
+    try std.testing.expectEqual(PolicyDecision.ask, engine.evaluate("exec_python"));
+    // write: global allow (1), profile ask (4). Profile wins: ask
+    try std.testing.expectEqual(PolicyDecision.ask, engine.evaluate("write"));
+    // read: only global allow matches
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("read"));
+    // memory_search: only global allow matches
+    try std.testing.expectEqual(PolicyDecision.allow, engine.evaluate("memory_search"));
+
+    // Verify reasons
+    try std.testing.expectEqualStrings("agent blocks bash", engine.getDenyReason("bash").?);
+    try std.testing.expectEqualStrings("sandbox blocks edit", engine.getDenyReason("edit").?);
+    try std.testing.expect(engine.getDenyReason("read") == null);
+}
