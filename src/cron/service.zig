@@ -671,3 +671,172 @@ test "CronService getDueJobs with range and step" {
     defer allocator.free(due3);
     try std.testing.expectEqual(@as(usize, 0), due3.len);
 }
+
+// === Tests batch 3: job store, due-job detection, missed jobs, state management, concurrency edge cases ===
+
+test "CronService getDueJobs returns correct job IDs" {
+    const allocator = std.testing.allocator;
+    var svc = CronService.init(allocator);
+    defer svc.deinit();
+
+    try svc.addJob("alpha", "0 * * * *", "a", "action_a");
+    try svc.addJob("beta", "30 * * * *", "a", "action_b");
+    try svc.addJob("gamma", "* * * * *", "a", "action_c");
+
+    // At minute 0: alpha and gamma should be due
+    const due = try svc.getDueJobs(0, 12, 15, 6, 3, allocator);
+    defer allocator.free(due);
+    try std.testing.expectEqual(@as(usize, 2), due.len);
+
+    // Verify the returned IDs reference the actual job IDs
+    var found_alpha = false;
+    var found_gamma = false;
+    for (due) |id| {
+        if (std.mem.eql(u8, id, "alpha")) found_alpha = true;
+        if (std.mem.eql(u8, id, "gamma")) found_gamma = true;
+    }
+    try std.testing.expect(found_alpha);
+    try std.testing.expect(found_gamma);
+}
+
+test "CronService disable one of many jobs affects getDueJobs" {
+    const allocator = std.testing.allocator;
+    var svc = CronService.init(allocator);
+    defer svc.deinit();
+
+    try svc.addJob("j1", "* * * * *", "a", "b");
+    try svc.addJob("j2", "* * * * *", "a", "c");
+    try svc.addJob("j3", "* * * * *", "a", "d");
+
+    // All three due
+    const due_all = try svc.getDueJobs(0, 0, 1, 1, 0, allocator);
+    defer allocator.free(due_all);
+    try std.testing.expectEqual(@as(usize, 3), due_all.len);
+
+    // Disable j2
+    _ = svc.setEnabled("j2", false);
+    const due_after = try svc.getDueJobs(0, 0, 1, 1, 0, allocator);
+    defer allocator.free(due_after);
+    try std.testing.expectEqual(@as(usize, 2), due_after.len);
+}
+
+test "CronService markExecuted does not affect due detection" {
+    const allocator = std.testing.allocator;
+    var svc = CronService.init(allocator);
+    defer svc.deinit();
+
+    try svc.addJob("j1", "* * * * *", "a", "b");
+    svc.markExecuted("j1");
+
+    // markExecuted only updates last_run_ms, doesn't disable the job
+    const due = try svc.getDueJobs(0, 0, 1, 1, 0, allocator);
+    defer allocator.free(due);
+    try std.testing.expectEqual(@as(usize, 1), due.len);
+    try std.testing.expect(svc.getJob("j1").?.last_run_ms > 0);
+}
+
+test "CronService addJob stores parsed expression that matches correctly" {
+    const allocator = std.testing.allocator;
+    var svc = CronService.init(allocator);
+    defer svc.deinit();
+
+    // Every 10 minutes at hour 8 on weekdays in January
+    try svc.addJob("specific", "*/10 8 * 1 1-5", "agent", "check");
+
+    // 8:00 Monday January should match
+    const due_match = try svc.getDueJobs(0, 8, 15, 1, 1, allocator);
+    defer allocator.free(due_match);
+    try std.testing.expectEqual(@as(usize, 1), due_match.len);
+
+    // 8:05 Monday January should NOT match (5 is not */10)
+    const due_no = try svc.getDueJobs(5, 8, 15, 1, 1, allocator);
+    defer allocator.free(due_no);
+    try std.testing.expectEqual(@as(usize, 0), due_no.len);
+
+    // 8:00 Monday February should NOT match (month 2 != 1)
+    const due_feb = try svc.getDueJobs(0, 8, 15, 2, 1, allocator);
+    defer allocator.free(due_feb);
+    try std.testing.expectEqual(@as(usize, 0), due_feb.len);
+}
+
+test "CronService remove then add preserves independent state" {
+    const allocator = std.testing.allocator;
+    var svc = CronService.init(allocator);
+    defer svc.deinit();
+
+    try svc.addJob("temp", "0 0 * * *", "agent-old", "old-action");
+    svc.markExecuted("temp");
+    const old_ts = svc.getJob("temp").?.last_run_ms;
+    try std.testing.expect(old_ts > 0);
+
+    _ = svc.removeJob("temp");
+
+    // Re-add with same id but different params -- should have fresh state
+    try svc.addJob("temp", "30 12 * * *", "agent-new", "new-action");
+    const job = svc.getJob("temp").?;
+    try std.testing.expectEqualStrings("agent-new", job.agent_id);
+    try std.testing.expectEqualStrings("new-action", job.action);
+    try std.testing.expectEqualStrings("30 12 * * *", job.expression);
+    // last_run_ms should be reset to 0 since it's a brand new job
+    try std.testing.expectEqual(@as(i64, 0), job.last_run_ms);
+    try std.testing.expect(job.enabled);
+}
+
+test "CronService getDueJobs day of month filter" {
+    const allocator = std.testing.allocator;
+    var svc = CronService.init(allocator);
+    defer svc.deinit();
+
+    // First of the month only
+    try svc.addJob("monthly", "0 0 1 * *", "a", "monthly_report");
+
+    // Day 1 should match
+    const due1 = try svc.getDueJobs(0, 0, 1, 6, 3, allocator);
+    defer allocator.free(due1);
+    try std.testing.expectEqual(@as(usize, 1), due1.len);
+
+    // Day 15 should not match
+    const due15 = try svc.getDueJobs(0, 0, 15, 6, 3, allocator);
+    defer allocator.free(due15);
+    try std.testing.expectEqual(@as(usize, 0), due15.len);
+}
+
+test "CronService setEnabled idempotent" {
+    const allocator = std.testing.allocator;
+    var svc = CronService.init(allocator);
+    defer svc.deinit();
+
+    try svc.addJob("j1", "* * * * *", "a", "b");
+
+    // Disable multiple times - should succeed each time
+    try std.testing.expect(svc.setEnabled("j1", false));
+    try std.testing.expect(!svc.getJob("j1").?.enabled);
+    try std.testing.expect(svc.setEnabled("j1", false));
+    try std.testing.expect(!svc.getJob("j1").?.enabled);
+
+    // Enable multiple times - should succeed each time
+    try std.testing.expect(svc.setEnabled("j1", true));
+    try std.testing.expect(svc.getJob("j1").?.enabled);
+    try std.testing.expect(svc.setEnabled("j1", true));
+    try std.testing.expect(svc.getJob("j1").?.enabled);
+}
+
+test "CronService getDueJobs many jobs mixed matching" {
+    const allocator = std.testing.allocator;
+    var svc = CronService.init(allocator);
+    defer svc.deinit();
+
+    try svc.addJob("every_min", "* * * * *", "a", "b");
+    try svc.addJob("at_noon", "0 12 * * *", "a", "c");
+    try svc.addJob("weekends", "0 12 * * 0", "a", "d");
+    try svc.addJob("disabled_all", "* * * * *", "a", "e");
+    _ = svc.setEnabled("disabled_all", false);
+
+    try std.testing.expectEqual(@as(usize, 4), svc.jobCount());
+    try std.testing.expect(!svc.getJob("disabled_all").?.enabled);
+
+    // At noon on a Sunday: every_min + at_noon + weekends = 3 (disabled not counted)
+    const due = try svc.getDueJobs(0, 12, 15, 6, 0, allocator);
+    defer allocator.free(due);
+    try std.testing.expectEqual(@as(usize, 3), due.len);
+}

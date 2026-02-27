@@ -581,3 +581,146 @@ test "LoadError variants" {
     const err: LoadError = error.PluginNotFound;
     try std.testing.expect(err == error.PluginNotFound);
 }
+
+// === Tests batch 3: manifest validation edge cases, registry operations, lifecycle ===
+
+test "loadFromManifest missing version returns ManifestInvalid" {
+    const allocator = std.testing.allocator;
+    const m = manifest_mod.PluginManifest{ .name = "test", .version = "" };
+    try std.testing.expectError(error.ManifestInvalid, loadFromManifest(allocator, m));
+}
+
+test "loadFromManifest partial semver returns ManifestInvalid" {
+    const allocator = std.testing.allocator;
+    // "1.0" is not a valid semver (needs X.Y.Z)
+    const m = manifest_mod.PluginManifest{ .name = "test", .version = "1.0" };
+    try std.testing.expectError(error.ManifestInvalid, loadFromManifest(allocator, m));
+}
+
+test "loadFromManifest entry has correct state and api fields" {
+    const allocator = std.testing.allocator;
+    const m = manifest_mod.PluginManifest{
+        .name = "lifecycle-test",
+        .version = "2.3.4",
+        .description = "a test plugin",
+        .author = "tester",
+    };
+    var entry = try loadFromManifest(allocator, m);
+    defer entry.api.?.deinit();
+
+    // Verify state is active upon loading
+    try std.testing.expectEqual(api_mod.PluginState.active, entry.state);
+    // Verify API was initialized with the manifest name
+    try std.testing.expectEqualStrings("lifecycle-test", entry.api.?.plugin_name);
+    // Verify the API starts with zero registrations
+    try std.testing.expectEqual(@as(usize, 0), entry.api.?.count());
+    // Verify manifest fields are preserved
+    try std.testing.expectEqualStrings("2.3.4", entry.manifest.version);
+}
+
+test "PluginRegistry register overwrites same name" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .manifest = .{ .name = "dup", .version = "1.0.0" },
+        .state = .active,
+    });
+    try registry.register(.{
+        .manifest = .{ .name = "dup", .version = "2.0.0" },
+        .state = .disabled,
+    });
+
+    // HashMap put overwrites, so count stays 1
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+    // The second registration should overwrite the first
+    const entry = registry.get("dup").?;
+    try std.testing.expectEqualStrings("2.0.0", entry.manifest.version);
+    try std.testing.expectEqual(api_mod.PluginState.disabled, entry.state);
+}
+
+test "PluginRegistry activeCount with all states" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .manifest = .{ .name = "a", .version = "1.0.0" },
+        .state = .active,
+    });
+    try registry.register(.{
+        .manifest = .{ .name = "b", .version = "1.0.0" },
+        .state = .unloaded,
+    });
+    try registry.register(.{
+        .manifest = .{ .name = "c", .version = "1.0.0" },
+        .state = .error_state,
+    });
+    try registry.register(.{
+        .manifest = .{ .name = "d", .version = "1.0.0" },
+        .state = .loading,
+    });
+    try registry.register(.{
+        .manifest = .{ .name = "e", .version = "1.0.0" },
+        .state = .disabled,
+    });
+
+    // Only .active counts as active
+    try std.testing.expectEqual(@as(usize, 5), registry.count());
+    try std.testing.expectEqual(@as(usize, 1), registry.activeCount());
+}
+
+test "PluginRegistry disable then get confirms disabled state" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .manifest = .{ .name = "toggler", .version = "1.0.0" },
+        .state = .active,
+    });
+
+    try std.testing.expect(registry.get("toggler").?.isActive());
+    try std.testing.expect(registry.disablePlugin("toggler"));
+    try std.testing.expect(!registry.get("toggler").?.isActive());
+    try std.testing.expectEqual(api_mod.PluginState.disabled, registry.get("toggler").?.state);
+}
+
+test "PluginRegistry enable on unloaded plugin returns false" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .manifest = .{ .name = "unloaded-p", .version = "1.0.0" },
+        .state = .unloaded,
+    });
+
+    // enablePlugin only works on .disabled state, not .unloaded
+    try std.testing.expect(!registry.enablePlugin("unloaded-p"));
+    try std.testing.expectEqual(api_mod.PluginState.unloaded, registry.get("unloaded-p").?.state);
+}
+
+test "serializePluginList reflects disabled state label" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .manifest = .{ .name = "d-plug", .version = "1.0.0" },
+        .state = .disabled,
+    });
+
+    var buf: [1024]u8 = undefined;
+    const json = try serializePluginList(&buf, &registry);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"d-plug\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"state\":\"disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"count\":1") != null);
+}
+
+test "buildPluginPath buffer too small returns error" {
+    var buf: [5]u8 = undefined;
+    const result = buildPluginPath(&buf, "/plugins", "my-plugin");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}

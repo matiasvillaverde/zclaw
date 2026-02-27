@@ -941,3 +941,157 @@ test "WorkspaceManager activate and check state" {
     try std.testing.expectEqual(WorkspaceState.active, ws.state);
     try std.testing.expect(ws.state.isUsable());
 }
+
+// === Tests batch 3: workspace listing, mount modes, prune, container config, state transitions ===
+
+test "WorkspaceManager listWorkspaces multiple with mixed states" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{});
+    defer mgr.deinit();
+
+    _ = try mgr.createWorkspace("ws-a", .basic);
+    _ = try mgr.createWorkspace("ws-b", .strict);
+    try mgr.activateWorkspace("ws-a", 1000);
+
+    var buf: [4096]u8 = undefined;
+    const json = try mgr.listWorkspaces(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"count\":2") != null);
+    // Both workspaces should appear in the list
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"ws-a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"ws-b\"") != null);
+}
+
+test "WorkspaceManager default mount mode applied from config" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    // Set config default_mount to .ro
+    var mgr = WorkspaceManager.init(allocator, &dock, .{ .default_mount = .ro });
+    defer mgr.deinit();
+
+    const ws = try mgr.createWorkspace("ro-ws", .basic);
+    // basic policy mount_mode is .rw (not .none), so config default_mount applies
+    try std.testing.expectEqual(policy_mod.MountMode.ro, ws.mount_mode);
+}
+
+test "WorkspaceManager pruneIdle skips active workspaces" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{ .max_idle_seconds = 10 });
+    defer mgr.deinit();
+
+    _ = try mgr.createWorkspace("ws-active", .basic);
+    try mgr.activateWorkspace("ws-active", 100);
+    // ws is active state, not idle -- should NOT be pruned even after time passes
+    try std.testing.expectEqual(@as(usize, 0), mgr.pruneIdle(999999));
+    try std.testing.expectEqual(@as(usize, 1), mgr.count());
+}
+
+test "WorkspaceManager pruneIdle prunes multiple idle workspaces" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{ .max_idle_seconds = 50 });
+    defer mgr.deinit();
+
+    _ = try mgr.createWorkspace("ws1", .basic);
+    _ = try mgr.createWorkspace("ws2", .basic);
+    try mgr.activateWorkspace("ws1", 100);
+    try mgr.deactivateWorkspace("ws1");
+    try mgr.activateWorkspace("ws2", 100);
+    try mgr.deactivateWorkspace("ws2");
+
+    // Both workspaces idle since t=100, prune at t=200 (100s > 50s threshold)
+    const pruned = mgr.pruneIdle(200);
+    try std.testing.expectEqual(@as(usize, 2), pruned);
+    try std.testing.expectEqual(@as(usize, 0), mgr.count());
+}
+
+test "buildContainerConfig strict policy memory and cpu" {
+    const ws = Workspace{
+        .id = "ws-strict",
+        .name = "strict-sandbox",
+        .host_path = "/tmp/ws-strict",
+    };
+    const pol = policy_mod.STRICT_POLICY;
+    const config = buildContainerConfig(&ws, pol);
+    // STRICT_POLICY: max_memory_mb=256, max_cpu_percent=50, network=none
+    try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024), config.memory_limit);
+    try std.testing.expectEqual(@as(i64, 50 * 1000), config.cpu_quota);
+    try std.testing.expect(config.network_disabled);
+    try std.testing.expectEqualStrings("/workspace", config.working_dir);
+}
+
+test "Workspace state transition creating to ready to active to idle" {
+    var ws = Workspace{
+        .id = "ws-lifecycle",
+        .name = "lifecycle",
+        .host_path = "/tmp/lifecycle",
+        .state = .creating,
+    };
+    try std.testing.expectEqual(WorkspaceState.creating, ws.state);
+    try std.testing.expect(!ws.state.isUsable());
+
+    // Simulate becoming ready
+    ws.state = .ready;
+    try std.testing.expect(ws.state.isUsable());
+
+    // Activate
+    ws.markActive(5000);
+    try std.testing.expectEqual(WorkspaceState.active, ws.state);
+    try std.testing.expect(ws.state.isUsable());
+    try std.testing.expectEqual(@as(i64, 5000), ws.last_used_at);
+
+    // Mark idle
+    ws.markIdle();
+    try std.testing.expectEqual(WorkspaceState.idle, ws.state);
+    try std.testing.expect(!ws.state.isUsable());
+}
+
+test "WorkspaceManager workspace IDs are auto-incremented" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{});
+    defer mgr.deinit();
+
+    const ws1 = try mgr.createWorkspace("first", .basic);
+    const ws2 = try mgr.createWorkspace("second", .basic);
+    // IDs should be sequential (ws-1, ws-2)
+    try std.testing.expectEqualStrings("ws-1", ws1.id);
+    try std.testing.expectEqualStrings("ws-2", ws2.id);
+}
+
+test "WorkspaceManager createWorkspace host path contains base dir and id" {
+    const allocator = std.testing.allocator;
+    const http = @import("../infra/http_client.zig");
+    const responses = [_]http.MockTransport.MockResponse{};
+    var mock = http.MockTransport.init(&responses);
+    var client = http.HttpClient.init(allocator, mock.transport());
+    var dock = docker.DockerClient.init(allocator, &client);
+    var mgr = WorkspaceManager.init(allocator, &dock, .{ .base_dir = "/my/sandbox/dir" });
+    defer mgr.deinit();
+
+    const ws = try mgr.createWorkspace("dev", .basic);
+    // host_path should be base_dir/ws-id
+    try std.testing.expect(std.mem.startsWith(u8, ws.host_path, "/my/sandbox/dir/ws-"));
+    try std.testing.expectEqualStrings("dev", ws.name);
+}
