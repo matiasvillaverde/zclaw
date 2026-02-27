@@ -452,3 +452,447 @@ test "Header struct" {
     try std.testing.expectEqualStrings("Authorization", h.name);
     try std.testing.expectEqualStrings("Bearer token", h.value);
 }
+
+// ===== Additional comprehensive tests =====
+
+// --- HttpMethod enum ---
+
+test "HttpMethod - all variants exist" {
+    const methods = [_]HttpMethod{ .GET, .POST, .PUT, .DELETE, .PATCH };
+    try std.testing.expectEqual(@as(usize, 5), methods.len);
+}
+
+// --- HttpResponse ---
+
+test "HttpResponse - status code 200" {
+    var resp = HttpResponse{ .status = 200, .body = "ok" };
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("ok", resp.body);
+    resp.deinit(); // no allocator, should not crash
+}
+
+test "HttpResponse - status code 201 Created" {
+    var resp = HttpResponse{ .status = 201, .body = "{\"id\":1}" };
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 204 No Content" {
+    var resp = HttpResponse{ .status = 204, .body = "" };
+    try std.testing.expectEqual(@as(u16, 204), resp.status);
+    try std.testing.expectEqualStrings("", resp.body);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 301 redirect" {
+    var resp = HttpResponse{ .status = 301, .body = "" };
+    try std.testing.expectEqual(@as(u16, 301), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 400 Bad Request" {
+    var resp = HttpResponse{ .status = 400, .body = "{\"error\":\"bad request\"}" };
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 401 Unauthorized" {
+    var resp = HttpResponse{ .status = 401, .body = "{\"error\":\"unauthorized\"}" };
+    try std.testing.expectEqual(@as(u16, 401), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 403 Forbidden" {
+    var resp = HttpResponse{ .status = 403, .body = "Forbidden" };
+    try std.testing.expectEqual(@as(u16, 403), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 404 Not Found" {
+    var resp = HttpResponse{ .status = 404, .body = "Not Found" };
+    try std.testing.expectEqual(@as(u16, 404), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 429 Rate Limited" {
+    var resp = HttpResponse{ .status = 429, .body = "{\"error\":\"rate limited\"}" };
+    try std.testing.expectEqual(@as(u16, 429), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 500 Internal Server Error" {
+    var resp = HttpResponse{ .status = 500, .body = "{\"error\":\"internal\"}" };
+    try std.testing.expectEqual(@as(u16, 500), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 502 Bad Gateway" {
+    var resp = HttpResponse{ .status = 502, .body = "Bad Gateway" };
+    try std.testing.expectEqual(@as(u16, 502), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - status code 503 Service Unavailable" {
+    var resp = HttpResponse{ .status = 503, .body = "Service Unavailable" };
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    resp.deinit();
+}
+
+test "HttpResponse - empty body with allocator" {
+    const body = try std.testing.allocator.dupe(u8, "");
+    var resp = HttpResponse{
+        .status = 200,
+        .body = body,
+        .allocator = std.testing.allocator,
+    };
+    resp.deinit();
+}
+
+test "HttpResponse - large body with allocator" {
+    const large_body = try std.testing.allocator.alloc(u8, 10000);
+    defer {} // deinit below handles freeing
+    @memset(large_body, 'x');
+    var resp = HttpResponse{
+        .status = 200,
+        .body = large_body,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqual(@as(usize, 10000), resp.body.len);
+    resp.deinit();
+}
+
+// --- RequestOptions ---
+
+test "RequestOptions - custom values" {
+    const opts = RequestOptions{
+        .method = .GET,
+        .url = "https://api.example.com/v1/models",
+        .timeout_ms = 5000,
+        .max_response_bytes = 1024,
+    };
+    try std.testing.expectEqual(HttpMethod.GET, opts.method);
+    try std.testing.expectEqualStrings("https://api.example.com/v1/models", opts.url);
+    try std.testing.expectEqual(@as(u32, 5000), opts.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1024), opts.max_response_bytes);
+    try std.testing.expect(opts.body == null);
+    try std.testing.expectEqual(@as(usize, 0), opts.headers.len);
+}
+
+test "RequestOptions - with body" {
+    const opts = RequestOptions{
+        .url = "https://example.com",
+        .body = "{\"key\":\"value\"}",
+    };
+    try std.testing.expectEqualStrings("{\"key\":\"value\"}", opts.body.?);
+}
+
+test "RequestOptions - with headers" {
+    const hdrs = [_]Header{
+        .{ .name = "Authorization", .value = "Bearer token" },
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    const opts = RequestOptions{
+        .url = "https://example.com",
+        .headers = &hdrs,
+    };
+    try std.testing.expectEqual(@as(usize, 2), opts.headers.len);
+    try std.testing.expectEqualStrings("Authorization", opts.headers[0].name);
+    try std.testing.expectEqualStrings("Content-Type", opts.headers[1].name);
+}
+
+test "RequestOptions - default max_response_bytes is 10MB" {
+    const opts = RequestOptions{ .url = "https://example.com" };
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), opts.max_response_bytes);
+}
+
+// --- MockTransport extended ---
+
+test "MockTransport - many sequential responses" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "r1" },
+        .{ .status = 201, .body = "r2" },
+        .{ .status = 202, .body = "r3" },
+        .{ .status = 204, .body = "" },
+        .{ .status = 400, .body = "err1" },
+        .{ .status = 500, .body = "err2" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var r1 = try client.get("https://a.com/1", &.{});
+    defer r1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), r1.status);
+    try std.testing.expectEqualStrings("r1", r1.body);
+
+    var r2 = try client.get("https://a.com/2", &.{});
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(u16, 201), r2.status);
+
+    var r3 = try client.get("https://a.com/3", &.{});
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(u16, 202), r3.status);
+
+    var r4 = try client.get("https://a.com/4", &.{});
+    defer r4.deinit();
+    try std.testing.expectEqual(@as(u16, 204), r4.status);
+    try std.testing.expectEqualStrings("", r4.body);
+
+    var r5 = try client.get("https://a.com/5", &.{});
+    defer r5.deinit();
+    try std.testing.expectEqual(@as(u16, 400), r5.status);
+
+    var r6 = try client.get("https://a.com/6", &.{});
+    defer r6.deinit();
+    try std.testing.expectEqual(@as(u16, 500), r6.status);
+
+    try std.testing.expectEqual(@as(usize, 6), mock.call_count);
+}
+
+test "MockTransport - captures last URL correctly" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{}" },
+        .{ .status = 200, .body = "{}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var r1 = try client.get("https://first.com/path", &.{});
+    defer r1.deinit();
+    try std.testing.expectEqualStrings("https://first.com/path", mock.last_url.?);
+
+    var r2 = try client.get("https://second.com/other", &.{});
+    defer r2.deinit();
+    try std.testing.expectEqualStrings("https://second.com/other", mock.last_url.?);
+}
+
+test "MockTransport - GET method captured" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var resp = try client.get("https://a.com", &.{});
+    defer resp.deinit();
+    try std.testing.expectEqual(HttpMethod.GET, mock.last_method.?);
+}
+
+test "MockTransport - POST method captured" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var resp = try client.post("https://a.com", &.{}, "body");
+    defer resp.deinit();
+    try std.testing.expectEqual(HttpMethod.POST, mock.last_method.?);
+}
+
+test "MockTransport - initial state" {
+    const responses = [_]MockTransport.MockResponse{};
+    const mock = MockTransport.init(&responses);
+    try std.testing.expectEqual(@as(usize, 0), mock.call_count);
+    try std.testing.expect(mock.last_url == null);
+    try std.testing.expect(mock.last_body == null);
+    try std.testing.expect(mock.last_method == null);
+}
+
+test "MockTransport - body is null for GET" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var resp = try client.get("https://a.com", &.{});
+    defer resp.deinit();
+    try std.testing.expect(mock.last_body == null);
+}
+
+test "MockTransport - body captured for POST" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var resp = try client.post("https://a.com", &.{}, "{\"test\":true}");
+    defer resp.deinit();
+    try std.testing.expectEqualStrings("{\"test\":true}", mock.last_body.?);
+}
+
+test "MockTransport - empty body for POST" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var resp = try client.post("https://a.com", &.{}, "");
+    defer resp.deinit();
+    try std.testing.expectEqualStrings("", mock.last_body.?);
+}
+
+// --- buildUrl extended ---
+
+test "buildUrl - empty base and path" {
+    var buf: [256]u8 = undefined;
+    const url = try buildUrl(&buf, "", "");
+    try std.testing.expectEqualStrings("", url);
+}
+
+test "buildUrl - empty path" {
+    var buf: [256]u8 = undefined;
+    const url = try buildUrl(&buf, "https://api.example.com", "");
+    try std.testing.expectEqualStrings("https://api.example.com", url);
+}
+
+test "buildUrl - empty base" {
+    var buf: [256]u8 = undefined;
+    const url = try buildUrl(&buf, "", "/path");
+    try std.testing.expectEqualStrings("/path", url);
+}
+
+test "buildUrl - URL with special characters in path" {
+    var buf: [256]u8 = undefined;
+    const url = try buildUrl(&buf, "https://api.example.com", "/search?q=hello%20world&limit=10");
+    try std.testing.expectEqualStrings("https://api.example.com/search?q=hello%20world&limit=10", url);
+}
+
+test "buildUrl - long URL" {
+    var buf: [1024]u8 = undefined;
+    const long_path = "/" ++ "a" ** 200;
+    const url = try buildUrl(&buf, "https://api.example.com", long_path);
+    try std.testing.expect(url.len == "https://api.example.com".len + long_path.len);
+}
+
+test "buildUrl - buffer too small returns error" {
+    var buf: [10]u8 = undefined;
+    const result = buildUrl(&buf, "https://api.example.com", "/v1/messages");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+// --- buildUrlWithQuery extended ---
+
+test "buildUrlWithQuery - empty query" {
+    var buf: [256]u8 = undefined;
+    const url = try buildUrlWithQuery(&buf, "https://api.example.com", "/path", "");
+    try std.testing.expectEqualStrings("https://api.example.com/path?", url);
+}
+
+test "buildUrlWithQuery - complex query" {
+    var buf: [512]u8 = undefined;
+    const url = try buildUrlWithQuery(&buf, "https://api.example.com", "/search", "q=hello+world&lang=en&page=1&per_page=20");
+    try std.testing.expectEqualStrings("https://api.example.com/search?q=hello+world&lang=en&page=1&per_page=20", url);
+}
+
+test "buildUrlWithQuery - buffer too small returns error" {
+    var buf: [10]u8 = undefined;
+    const result = buildUrlWithQuery(&buf, "https://api.example.com", "/search", "q=hello");
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+// --- postJson extended ---
+
+test "postJson - with multiple auth headers" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    const auth_headers = [_]Header{
+        .{ .name = "x-api-key", .value = "sk-test" },
+        .{ .name = "anthropic-version", .value = "2023-06-01" },
+        .{ .name = "x-custom", .value = "value" },
+    };
+    var resp = try client.postJson("https://api.anthropic.com/v1/messages", &auth_headers, "{\"model\":\"claude\"}");
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("{\"ok\":true}", resp.body);
+}
+
+test "postJson - with empty auth headers" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "{}" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    var resp = try client.postJson("https://api.example.com", &.{}, "{}");
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+}
+
+// --- postSse extended ---
+
+test "postSse - with auth headers" {
+    const responses = [_]MockTransport.MockResponse{
+        .{ .status = 200, .body = "event: done\ndata: {}\n\n" },
+    };
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    const auth_headers = [_]Header{
+        .{ .name = "x-api-key", .value = "sk-test" },
+    };
+    var resp = try client.postSse("https://api.anthropic.com/v1/messages", &auth_headers, "{\"stream\":true}");
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+}
+
+// --- Header edge cases ---
+
+test "Header - empty name and value" {
+    const h = Header{ .name = "", .value = "" };
+    try std.testing.expectEqualStrings("", h.name);
+    try std.testing.expectEqualStrings("", h.value);
+}
+
+test "Header - special characters in value" {
+    const h = Header{ .name = "Authorization", .value = "Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature" };
+    try std.testing.expect(std.mem.indexOf(u8, h.value, ".") != null);
+}
+
+test "Header - unicode in value" {
+    const h = Header{ .name = "X-Custom", .value = "\xc3\xa9\xc3\xa0\xc3\xbc" };
+    try std.testing.expect(h.value.len > 0);
+}
+
+// --- MockResponse defaults ---
+
+test "MockResponse - default values" {
+    const mr = MockTransport.MockResponse{};
+    try std.testing.expectEqual(@as(u16, 200), mr.status);
+    try std.testing.expectEqualStrings("{}", mr.body);
+}
+
+test "MockResponse - custom values" {
+    const mr = MockTransport.MockResponse{ .status = 418, .body = "I'm a teapot" };
+    try std.testing.expectEqual(@as(u16, 418), mr.status);
+    try std.testing.expectEqualStrings("I'm a teapot", mr.body);
+}
+
+// --- HttpClient init/deinit ---
+
+test "HttpClient - init and deinit" {
+    const responses = [_]MockTransport.MockResponse{};
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+    client.deinit();
+}
+
+// --- HttpError enum ---
+
+test "HttpError - ConnectionFailed from exhausted mock" {
+    const responses = [_]MockTransport.MockResponse{};
+    var mock = MockTransport.init(&responses);
+    var client = HttpClient.init(std.testing.allocator, mock.transport());
+
+    try std.testing.expectError(HttpError.ConnectionFailed, client.get("https://a.com", &.{}));
+    try std.testing.expectError(HttpError.ConnectionFailed, client.post("https://a.com", &.{}, ""));
+}
