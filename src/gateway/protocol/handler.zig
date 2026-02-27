@@ -400,3 +400,511 @@ test "frame too large rejected" {
     const result = dispatch(&big, &registry, null, &writer);
     try std.testing.expectEqual(DispatchResult.frame_too_large, result);
 }
+
+// --- Additional Tests ---
+
+test "MethodRegistry empty" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), registry.methodCount());
+    try std.testing.expect(registry.get("anything") == null);
+}
+
+test "MethodRegistry overwrite handler" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register("health", handleHealth);
+    try registry.register("health", handleStatus);
+
+    try std.testing.expectEqual(@as(usize, 1), registry.methodCount());
+}
+
+test "ClientInfo struct fields" {
+    const info = ClientInfo{
+        .conn_id = "conn-123",
+        .role = .admin,
+        .client_id = "client-abc",
+        .client_mode = .ui,
+        .authenticated = true,
+    };
+    try std.testing.expectEqualStrings("conn-123", info.conn_id);
+    try std.testing.expectEqual(auth.ClientRole.admin, info.role);
+    try std.testing.expect(info.authenticated);
+}
+
+test "ClientInfo with null optionals" {
+    const info = ClientInfo{
+        .conn_id = "c1",
+        .role = .viewer,
+        .client_id = null,
+        .client_mode = null,
+        .authenticated = false,
+    };
+    try std.testing.expect(info.client_id == null);
+    try std.testing.expect(info.client_mode == null);
+    try std.testing.expect(!info.authenticated);
+}
+
+test "HandlerContext fields" {
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = HandlerContext{
+        .request_id = "req-1",
+        .method = "health",
+        .params_raw = null,
+        .client = null,
+        .respond = &writer,
+    };
+    try std.testing.expectEqualStrings("req-1", ctx.request_id);
+    try std.testing.expectEqualStrings("health", ctx.method);
+    try std.testing.expect(ctx.params_raw == null);
+    try std.testing.expect(ctx.user_data == null);
+}
+
+test "DispatchResult enum values" {
+    try std.testing.expect(DispatchResult.ok != DispatchResult.not_authenticated);
+    try std.testing.expect(DispatchResult.method_not_found != DispatchResult.unauthorized);
+    try std.testing.expect(DispatchResult.invalid_frame != DispatchResult.frame_too_large);
+}
+
+test "handleHealth outputs ok status" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = HandlerContext{
+        .request_id = "test-id",
+        .method = "health",
+        .params_raw = null,
+        .client = null,
+        .respond = &writer,
+    };
+    handleHealth(&ctx);
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "version") != null);
+}
+
+test "handleStatus outputs gateway running" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = HandlerContext{
+        .request_id = "status-id",
+        .method = "status",
+        .params_raw = null,
+        .client = null,
+        .respond = &writer,
+    };
+    handleStatus(&ctx);
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"gateway\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"protocol\":3") != null);
+}
+
+test "ResponseWriter sendEvent without payload" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+    writer.sendEvent("tick", null);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"event\":\"tick\"") != null);
+}
+
+test "dispatch response frame ignored" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const json = "{\"type\":\"res\",\"id\":\"1\",\"ok\":true}";
+    const result = dispatch(json, &registry, null, &writer);
+    try std.testing.expectEqual(DispatchResult.invalid_frame, result);
+}
+
+// --- New Tests ---
+
+test "MethodRegistry register single and get" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register("my.method", handleHealth);
+    try std.testing.expectEqual(@as(usize, 1), registry.methodCount());
+    try std.testing.expect(registry.get("my.method") != null);
+}
+
+test "MethodRegistry get returns null for unknown" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expect(registry.get("unknown") == null);
+}
+
+test "dispatch empty JSON returns invalid_frame" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const result = dispatch("", &registry, null, &writer);
+    try std.testing.expectEqual(DispatchResult.invalid_frame, result);
+}
+
+test "dispatch well-formed request to registered method" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register("status", handleStatus);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const client_info = ClientInfo{
+        .conn_id = "c1",
+        .role = .admin,
+        .client_id = null,
+        .client_mode = null,
+        .authenticated = true,
+    };
+
+    const json = "{\"type\":\"req\",\"id\":\"s1\",\"method\":\"status\"}";
+    const result = dispatch(json, &registry, &client_info, &writer);
+    try std.testing.expectEqual(DispatchResult.ok, result);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"gateway\":\"running\"") != null);
+}
+
+test "dispatch health always allowed for viewer" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register("health", handleHealth);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const viewer = ClientInfo{
+        .conn_id = "v1",
+        .role = .viewer,
+        .client_id = null,
+        .client_mode = null,
+        .authenticated = true,
+    };
+
+    const json = "{\"type\":\"req\",\"id\":\"h1\",\"method\":\"health\"}";
+    const result = dispatch(json, &registry, &viewer, &writer);
+    try std.testing.expectEqual(DispatchResult.ok, result);
+}
+
+test "dispatchWithData passes user_data correctly" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    const check_handler: MethodHandler = struct {
+        fn handle(ctx: *const HandlerContext) void {
+            if (ctx.user_data != null) {
+                ctx.respond.sendOk(ctx.request_id, "{\"has_data\":true}");
+            } else {
+                ctx.respond.sendOk(ctx.request_id, "{\"has_data\":false}");
+            }
+        }
+    }.handle;
+
+    try registry.register("check", check_handler);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const client_info = ClientInfo{
+        .conn_id = "c1",
+        .role = .admin,
+        .client_id = null,
+        .client_mode = null,
+        .authenticated = true,
+    };
+
+    var dummy_data: u32 = 42;
+    const json = "{\"type\":\"req\",\"id\":\"d1\",\"method\":\"check\"}";
+    _ = dispatchWithData(json, &registry, &client_info, &writer, @ptrCast(&dummy_data));
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"has_data\":true") != null);
+}
+
+test "dispatchWithData null user_data" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    const check_handler: MethodHandler = struct {
+        fn handle(ctx: *const HandlerContext) void {
+            if (ctx.user_data != null) {
+                ctx.respond.sendOk(ctx.request_id, "{\"has_data\":true}");
+            } else {
+                ctx.respond.sendOk(ctx.request_id, "{\"has_data\":false}");
+            }
+        }
+    }.handle;
+
+    try registry.register("check", check_handler);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const client_info = ClientInfo{
+        .conn_id = "c1",
+        .role = .admin,
+        .client_id = null,
+        .client_mode = null,
+        .authenticated = true,
+    };
+
+    const json = "{\"type\":\"req\",\"id\":\"d2\",\"method\":\"check\"}";
+    _ = dispatchWithData(json, &registry, &client_info, &writer, null);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"has_data\":false") != null);
+}
+
+test "ResponseWriter sendOk null payload" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+    writer.sendOk("null-test", null);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "payload") == null);
+}
+
+test "ResponseWriter sendError different codes" {
+    const codes = [_]schema.ErrorCode{ .not_linked, .not_paired, .agent_timeout, .unavailable, .method_not_found, .unauthorized, .internal, .invalid_request };
+    for (codes) |code| {
+        test_output_len = 0;
+        var resp_buf: [4096]u8 = undefined;
+        var writer = createTestWriter();
+        writer.buf = &resp_buf;
+        writer.sendError("err-id", code, "msg");
+
+        const output = getTestOutput();
+        try std.testing.expect(std.mem.indexOf(u8, output, code.label()) != null);
+    }
+}
+
+test "DispatchResult all variants distinct" {
+    const variants = [_]DispatchResult{ .ok, .not_authenticated, .method_not_found, .unauthorized, .invalid_frame, .frame_too_large };
+    for (variants, 0..) |v1, i| {
+        for (variants, 0..) |v2, j| {
+            if (i != j) {
+                try std.testing.expect(v1 != v2);
+            }
+        }
+    }
+}
+
+test "HandlerContext with all fields populated" {
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const client_info = ClientInfo{
+        .conn_id = "conn-full",
+        .role = .operator,
+        .client_id = "client-full",
+        .client_mode = .backend,
+        .authenticated = true,
+    };
+
+    var data: u8 = 1;
+    const ctx = HandlerContext{
+        .request_id = "req-full",
+        .method = "test.full",
+        .params_raw = "{\"key\":\"val\"}",
+        .client = &client_info,
+        .respond = &writer,
+        .user_data = @ptrCast(&data),
+    };
+    try std.testing.expectEqualStrings("req-full", ctx.request_id);
+    try std.testing.expectEqualStrings("test.full", ctx.method);
+    try std.testing.expectEqualStrings("{\"key\":\"val\"}", ctx.params_raw.?);
+    try std.testing.expect(ctx.client != null);
+    try std.testing.expect(ctx.user_data != null);
+}
+
+test "dispatch operator can call non-admin methods" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    const dummy: MethodHandler = struct {
+        fn handle(ctx: *const HandlerContext) void {
+            ctx.respond.sendOk(ctx.request_id, null);
+        }
+    }.handle;
+
+    try registry.register("chat.send", dummy);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const operator = ClientInfo{
+        .conn_id = "op1",
+        .role = .operator,
+        .client_id = null,
+        .client_mode = null,
+        .authenticated = true,
+    };
+
+    const json = "{\"type\":\"req\",\"id\":\"op-1\",\"method\":\"chat.send\"}";
+    const result = dispatch(json, &registry, &operator, &writer);
+    try std.testing.expectEqual(DispatchResult.ok, result);
+}
+
+test "dispatch admin can call admin methods" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    const dummy: MethodHandler = struct {
+        fn handle(ctx: *const HandlerContext) void {
+            ctx.respond.sendOk(ctx.request_id, null);
+        }
+    }.handle;
+
+    try registry.register("config.set", dummy);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const admin = ClientInfo{
+        .conn_id = "a1",
+        .role = .admin,
+        .client_id = null,
+        .client_mode = null,
+        .authenticated = true,
+    };
+
+    const json = "{\"type\":\"req\",\"id\":\"a-1\",\"method\":\"config.set\"}";
+    const result = dispatch(json, &registry, &admin, &writer);
+    try std.testing.expectEqual(DispatchResult.ok, result);
+}
+
+test "dispatch calls dispatch with null user_data" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register("health", handleHealth);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const client_info = ClientInfo{
+        .conn_id = "c1",
+        .role = .admin,
+        .client_id = null,
+        .client_mode = null,
+        .authenticated = true,
+    };
+
+    const json = "{\"type\":\"req\",\"id\":\"d-1\",\"method\":\"health\"}";
+    const result = dispatch(json, &registry, &client_info, &writer);
+    try std.testing.expectEqual(DispatchResult.ok, result);
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"status\":\"ok\"") != null);
+}
+
+test "MethodRegistry register many methods" {
+    const allocator = std.testing.allocator;
+    var registry = MethodRegistry.init(allocator);
+    defer registry.deinit();
+
+    const dummy: MethodHandler = struct {
+        fn handle(_: *const HandlerContext) void {}
+    }.handle;
+
+    try registry.register("method.1", dummy);
+    try registry.register("method.2", dummy);
+    try registry.register("method.3", dummy);
+    try registry.register("method.4", dummy);
+    try registry.register("method.5", dummy);
+
+    try std.testing.expectEqual(@as(usize, 5), registry.methodCount());
+    for ([_][]const u8{ "method.1", "method.2", "method.3", "method.4", "method.5" }) |name| {
+        try std.testing.expect(registry.get(name) != null);
+    }
+}
+
+test "handleHealth includes version field" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = HandlerContext{
+        .request_id = "ver-id",
+        .method = "health",
+        .params_raw = null,
+        .client = null,
+        .respond = &writer,
+    };
+    handleHealth(&ctx);
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"version\":\"0.1.0\"") != null);
+}
+
+test "handleStatus includes protocol version 3" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = HandlerContext{
+        .request_id = "proto-id",
+        .method = "status",
+        .params_raw = null,
+        .client = null,
+        .respond = &writer,
+    };
+    handleStatus(&ctx);
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"protocol\":3") != null);
+}

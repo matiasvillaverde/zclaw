@@ -411,3 +411,314 @@ test "GatewayState rate limiter" {
     }
     try std.testing.expect(!state.rate_limiter.check("192.168.1.1"));
 }
+
+// --- Additional Tests ---
+
+test "Connection struct defaults" {
+    const conn = Connection{
+        .conn_id = "c1",
+        .role = .operator,
+        .client_id = null,
+        .client_mode = null,
+        .connected_at_ms = 1000,
+        .last_frame_ms = 1000,
+        .authenticated = true,
+    };
+    try std.testing.expect(conn.presence_key == null);
+    try std.testing.expect(conn.authenticated);
+}
+
+test "ConnectionRegistry get nonexistent" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expect(registry.get("missing") == null);
+}
+
+test "ConnectionRegistry isAuthenticated returns false for missing" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expect(!registry.isAuthenticated("missing"));
+}
+
+test "ConnectionRegistry updateLastFrame nonexistent is safe" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Should not crash
+    registry.updateLastFrame("missing");
+}
+
+test "ConnectionRegistry add with null client_id and mode" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.add("conn-1", .viewer, null, null);
+    const conn = registry.get("conn-1").?;
+    try std.testing.expect(conn.client_id == null);
+    try std.testing.expect(conn.client_mode == null);
+    try std.testing.expectEqual(auth.ClientRole.viewer, conn.role);
+}
+
+test "PresenceTracker init empty" {
+    const allocator = std.testing.allocator;
+    var tracker = PresenceTracker.init(allocator);
+    defer tracker.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), tracker.onlineCount());
+    try std.testing.expectEqual(@as(u64, 0), tracker.getVersion());
+}
+
+test "PresenceTracker removeByConnId nonexistent" {
+    const allocator = std.testing.allocator;
+    var tracker = PresenceTracker.init(allocator);
+    defer tracker.deinit();
+
+    try std.testing.expect(!tracker.removeByConnId("missing"));
+}
+
+test "PresenceTracker isOnline nonexistent" {
+    const allocator = std.testing.allocator;
+    var tracker = PresenceTracker.init(allocator);
+    defer tracker.deinit();
+
+    try std.testing.expect(!tracker.isOnline("user:missing"));
+}
+
+test "PresenceTracker multiple users" {
+    const allocator = std.testing.allocator;
+    var tracker = PresenceTracker.init(allocator);
+    defer tracker.deinit();
+
+    try tracker.upsert("user:1", "conn-a");
+    try tracker.upsert("user:2", "conn-b");
+    try tracker.upsert("user:3", "conn-c");
+
+    try std.testing.expectEqual(@as(usize, 3), tracker.onlineCount());
+    try std.testing.expect(tracker.isOnline("user:1"));
+    try std.testing.expect(tracker.isOnline("user:2"));
+    try std.testing.expect(tracker.isOnline("user:3"));
+}
+
+test "GatewayState uptimeMs positive" {
+    const allocator = std.testing.allocator;
+    var state = GatewayState.init(allocator, .none, .{});
+    defer state.deinit();
+
+    try std.testing.expect(state.uptimeMs() >= 0);
+}
+
+test "GatewayState password auth mode" {
+    const allocator = std.testing.allocator;
+    var state = GatewayState.init(allocator, .password, .{ .password = "secret" });
+    defer state.deinit();
+
+    try std.testing.expectEqual(auth.AuthMode.password, state.auth_mode);
+    try std.testing.expectEqualStrings("secret", state.auth_config.password.?);
+}
+
+test "GatewayState none auth mode" {
+    const allocator = std.testing.allocator;
+    var state = GatewayState.init(allocator, .none, .{});
+    defer state.deinit();
+
+    try std.testing.expectEqual(auth.AuthMode.none, state.auth_mode);
+    try std.testing.expect(state.auth_config.token == null);
+}
+
+// --- New Tests ---
+
+test "ConnectionRegistry add and remove multiple" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.add("c1", .operator, "client1", .cli);
+    try registry.add("c2", .admin, "client2", .ui);
+    try registry.add("c3", .viewer, null, .webchat);
+
+    try std.testing.expectEqual(@as(usize, 3), registry.count());
+
+    try std.testing.expect(registry.remove("c2"));
+    try std.testing.expectEqual(@as(usize, 2), registry.count());
+    try std.testing.expect(registry.get("c2") == null);
+    try std.testing.expect(registry.get("c1") != null);
+    try std.testing.expect(registry.get("c3") != null);
+}
+
+test "ConnectionRegistry count starts at zero" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), registry.count());
+}
+
+test "ConnectionRegistry remove returns false for unknown" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expect(!registry.remove("does-not-exist"));
+}
+
+test "ConnectionRegistry connection fields preserved" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.add("conn-test", .admin, "my-client", .ui);
+    const conn = registry.get("conn-test").?;
+    try std.testing.expectEqualStrings("conn-test", conn.conn_id);
+    try std.testing.expectEqual(auth.ClientRole.admin, conn.role);
+    try std.testing.expectEqualStrings("my-client", conn.client_id.?);
+    try std.testing.expectEqual(schema.ClientMode.ui, conn.client_mode.?);
+    try std.testing.expect(conn.authenticated);
+    try std.testing.expect(conn.connected_at_ms > 0);
+    try std.testing.expect(conn.last_frame_ms > 0);
+}
+
+test "Connection with presence_key" {
+    const conn = Connection{
+        .conn_id = "c1",
+        .role = .operator,
+        .client_id = null,
+        .client_mode = null,
+        .connected_at_ms = 1000,
+        .last_frame_ms = 2000,
+        .authenticated = false,
+        .presence_key = "user:abc",
+    };
+    try std.testing.expectEqualStrings("user:abc", conn.presence_key.?);
+    try std.testing.expect(!conn.authenticated);
+}
+
+test "PresenceTracker version starts at 0" {
+    const allocator = std.testing.allocator;
+    var tracker = PresenceTracker.init(allocator);
+    defer tracker.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), tracker.getVersion());
+}
+
+test "PresenceTracker upsert same key increments version each time" {
+    const allocator = std.testing.allocator;
+    var tracker = PresenceTracker.init(allocator);
+    defer tracker.deinit();
+
+    try tracker.upsert("user:1", "conn-a");
+    try std.testing.expectEqual(@as(u64, 1), tracker.getVersion());
+    try tracker.upsert("user:1", "conn-b");
+    try std.testing.expectEqual(@as(u64, 2), tracker.getVersion());
+    try tracker.upsert("user:1", "conn-c");
+    try std.testing.expectEqual(@as(u64, 3), tracker.getVersion());
+    // Only 1 user online despite 3 upserts
+    try std.testing.expectEqual(@as(usize, 1), tracker.onlineCount());
+}
+
+test "PresenceTracker removeByConnId reduces count" {
+    const allocator = std.testing.allocator;
+    var tracker = PresenceTracker.init(allocator);
+    defer tracker.deinit();
+
+    try tracker.upsert("user:a", "conn-1");
+    try tracker.upsert("user:b", "conn-2");
+    try tracker.upsert("user:c", "conn-3");
+    try std.testing.expectEqual(@as(usize, 3), tracker.onlineCount());
+
+    try std.testing.expect(tracker.removeByConnId("conn-2"));
+    try std.testing.expectEqual(@as(usize, 2), tracker.onlineCount());
+    try std.testing.expect(!tracker.isOnline("user:b"));
+}
+
+test "GatewayState started_at_ms is recent" {
+    const allocator = std.testing.allocator;
+    const before = std.time.milliTimestamp();
+    var gw_state = GatewayState.init(allocator, .none, .{});
+    defer gw_state.deinit();
+    const after = std.time.milliTimestamp();
+
+    try std.testing.expect(gw_state.started_at_ms >= before);
+    try std.testing.expect(gw_state.started_at_ms <= after);
+}
+
+test "GatewayState connectionCount reflects registry" {
+    const allocator = std.testing.allocator;
+    var gw_state = GatewayState.init(allocator, .none, .{});
+    defer gw_state.deinit();
+
+    try gw_state.connections.add("c1", .operator, null, null);
+    try std.testing.expectEqual(@as(usize, 1), gw_state.connectionCount());
+    try gw_state.connections.add("c2", .admin, null, null);
+    try std.testing.expectEqual(@as(usize, 2), gw_state.connectionCount());
+    _ = gw_state.connections.remove("c1");
+    try std.testing.expectEqual(@as(usize, 1), gw_state.connectionCount());
+}
+
+test "GatewayState token auth config preserved" {
+    const allocator = std.testing.allocator;
+    var gw_state = GatewayState.init(allocator, .token, .{ .token = "my-secret-token" });
+    defer gw_state.deinit();
+
+    try std.testing.expectEqual(auth.AuthMode.token, gw_state.auth_mode);
+    try std.testing.expectEqualStrings("my-secret-token", gw_state.auth_config.token.?);
+}
+
+test "ConnectionRegistry add then remove then re-add same conn_id" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.add("conn-1", .operator, "client-a", .cli);
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+    try std.testing.expectEqual(auth.ClientRole.operator, registry.get("conn-1").?.role);
+
+    // Remove first, then re-add
+    try std.testing.expect(registry.remove("conn-1"));
+    try std.testing.expectEqual(@as(usize, 0), registry.count());
+
+    try registry.add("conn-1", .admin, "client-b", .ui);
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+    try std.testing.expectEqual(auth.ClientRole.admin, registry.get("conn-1").?.role);
+}
+
+test "PresenceTracker remove all and readd" {
+    const allocator = std.testing.allocator;
+    var tracker = PresenceTracker.init(allocator);
+    defer tracker.deinit();
+
+    try tracker.upsert("u1", "c1");
+    try tracker.upsert("u2", "c2");
+    _ = tracker.removeByConnId("c1");
+    _ = tracker.removeByConnId("c2");
+    try std.testing.expectEqual(@as(usize, 0), tracker.onlineCount());
+
+    try tracker.upsert("u3", "c3");
+    try std.testing.expectEqual(@as(usize, 1), tracker.onlineCount());
+    try std.testing.expect(tracker.isOnline("u3"));
+}
+
+test "ConnectionRegistry empty deinit is safe" {
+    const allocator = std.testing.allocator;
+    var registry = ConnectionRegistry.init(allocator);
+    registry.deinit();
+}
+
+test "PresenceTracker empty deinit is safe" {
+    const allocator = std.testing.allocator;
+    var tracker = PresenceTracker.init(allocator);
+    tracker.deinit();
+}
+
+test "GatewayState deinit after adding connections" {
+    const allocator = std.testing.allocator;
+    var gw_state = GatewayState.init(allocator, .none, .{});
+    try gw_state.connections.add("c1", .operator, "client1", .cli);
+    try gw_state.presence.upsert("user:1", "c1");
+    gw_state.deinit();
+}

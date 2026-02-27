@@ -236,3 +236,233 @@ test "constants" {
     try std.testing.expectEqual(@as(u32, 30_000), TICK_INTERVAL_MS);
     try std.testing.expectEqual(@as(u32, 10_000), HANDSHAKE_TIMEOUT_MS);
 }
+
+// --- Additional Tests ---
+
+test "ErrorCode all labels non-empty" {
+    for (std.meta.tags(ErrorCode)) |code| {
+        try std.testing.expect(code.label().len > 0);
+    }
+}
+
+test "ErrorCode not_paired label" {
+    try std.testing.expectEqualStrings("NOT_PAIRED", ErrorCode.not_paired.label());
+}
+
+test "ErrorCode agent_timeout label" {
+    try std.testing.expectEqualStrings("AGENT_TIMEOUT", ErrorCode.agent_timeout.label());
+}
+
+test "ErrorCode unavailable label" {
+    try std.testing.expectEqualStrings("UNAVAILABLE", ErrorCode.unavailable.label());
+}
+
+test "ErrorCode method_not_found label" {
+    try std.testing.expectEqualStrings("METHOD_NOT_FOUND", ErrorCode.method_not_found.label());
+}
+
+test "ErrorCode internal label" {
+    try std.testing.expectEqualStrings("INTERNAL", ErrorCode.internal.label());
+}
+
+test "FrameType.fromString all valid" {
+    try std.testing.expectEqual(FrameType.req, FrameType.fromString("req").?);
+    try std.testing.expectEqual(FrameType.res, FrameType.fromString("res").?);
+    try std.testing.expectEqual(FrameType.event, FrameType.fromString("event").?);
+}
+
+test "FrameType.fromString empty" {
+    try std.testing.expect(FrameType.fromString("") == null);
+}
+
+test "parseFrameType empty string" {
+    try std.testing.expect(parseFrameType("") == null);
+}
+
+test "parseRequestFrame with params" {
+    const json = "{\"type\":\"req\",\"id\":\"abc\",\"method\":\"chat.send\",\"params\":{\"msg\":\"hi\"}}";
+    const frame = parseRequestFrame(json).?;
+    try std.testing.expectEqualStrings("abc", frame.id);
+    try std.testing.expectEqualStrings("chat.send", frame.method);
+    try std.testing.expect(frame.params_raw != null);
+}
+
+test "RequestFrame struct fields" {
+    const frame = RequestFrame{
+        .id = "req-1",
+        .method = "health",
+    };
+    try std.testing.expectEqualStrings("req-1", frame.id);
+    try std.testing.expectEqualStrings("health", frame.method);
+    try std.testing.expect(frame.params_raw == null);
+}
+
+test "buildOkResponse contains type res" {
+    var buf: [4096]u8 = undefined;
+    const resp = buildOkResponse(&buf, "id-1", null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"type\":\"res\"") != null);
+}
+
+test "buildErrorResponse contains type res" {
+    var buf: [4096]u8 = undefined;
+    const resp = buildErrorResponse(&buf, "id-1", .internal, "server error");
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"type\":\"res\"") != null);
+}
+
+test "buildEvent with payload" {
+    var buf: [4096]u8 = undefined;
+    const evt = buildEvent(&buf, "agent.delta", "{\"text\":\"hi\"}");
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"type\":\"event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"event\":\"agent.delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"text\":\"hi\"") != null);
+}
+
+test "buildEvent without payload" {
+    var buf: [4096]u8 = undefined;
+    const evt = buildEvent(&buf, "tick", null);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"event\":\"tick\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "payload") == null);
+}
+
+test "MAX_BUFFERED_BYTES" {
+    try std.testing.expectEqual(@as(usize, 50 * 1024 * 1024), MAX_BUFFERED_BYTES);
+}
+
+// --- New Tests ---
+
+test "FrameType.label all variants return non-empty" {
+    for (std.meta.tags(FrameType)) |ft| {
+        try std.testing.expect(ft.label().len > 0);
+    }
+}
+
+test "FrameType round-trip via label and fromString" {
+    for (std.meta.tags(FrameType)) |ft| {
+        const parsed = FrameType.fromString(ft.label());
+        try std.testing.expectEqual(ft, parsed.?);
+    }
+}
+
+test "FrameType.fromString case sensitive" {
+    try std.testing.expect(FrameType.fromString("REQ") == null);
+    try std.testing.expect(FrameType.fromString("Req") == null);
+    try std.testing.expect(FrameType.fromString("RES") == null);
+    try std.testing.expect(FrameType.fromString("EVENT") == null);
+}
+
+test "ErrorCode all variants unique labels" {
+    const codes = std.meta.tags(ErrorCode);
+    for (codes, 0..) |c1, i| {
+        for (codes, 0..) |c2, j| {
+            if (i != j) {
+                try std.testing.expect(!std.mem.eql(u8, c1.label(), c2.label()));
+            }
+        }
+    }
+}
+
+test "buildOkResponse with complex payload" {
+    var buf: [4096]u8 = undefined;
+    const resp = buildOkResponse(&buf, "req-complex", "{\"data\":{\"nested\":true},\"count\":42}");
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"nested\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"count\":42") != null);
+}
+
+test "buildErrorResponse all error codes" {
+    var buf: [4096]u8 = undefined;
+    for (std.meta.tags(ErrorCode)) |code| {
+        const resp = buildErrorResponse(&buf, "err-all", code, "test message");
+        try std.testing.expect(std.mem.indexOf(u8, resp, code.label()) != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "\"ok\":false") != null);
+    }
+}
+
+test "buildEvent type is event" {
+    var buf: [4096]u8 = undefined;
+    const evt = buildEvent(&buf, "custom.event", null);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"type\":\"event\"") != null);
+}
+
+test "buildChallengeEvent has correct structure" {
+    var buf: [4096]u8 = undefined;
+    const evt = buildChallengeEvent(&buf, "test-nonce-value");
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"type\":\"event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"event\":\"connect.challenge\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"nonce\":\"test-nonce-value\"") != null);
+}
+
+test "buildTickEvent has correct structure" {
+    var buf: [4096]u8 = undefined;
+    const evt = buildTickEvent(&buf, 0);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"event\":\"tick\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"ts\":0") != null);
+}
+
+test "buildTickEvent negative timestamp" {
+    var buf: [4096]u8 = undefined;
+    const evt = buildTickEvent(&buf, -1);
+    try std.testing.expect(std.mem.indexOf(u8, evt, "\"ts\":-1") != null);
+}
+
+test "parseFrameType with extra whitespace" {
+    // Not JSON-aware parser, looks for exact substring
+    try std.testing.expect(parseFrameType("{  \"type\":\"req\"  }") != null);
+}
+
+test "parseRequestFrame missing method" {
+    const result = parseRequestFrame("{\"type\":\"req\",\"id\":\"123\"}");
+    try std.testing.expect(result == null);
+}
+
+test "parseRequestFrame missing id" {
+    const result = parseRequestFrame("{\"type\":\"req\",\"method\":\"health\"}");
+    try std.testing.expect(result == null);
+}
+
+test "parseRequestFrame params_raw is full JSON" {
+    const json = "{\"type\":\"req\",\"id\":\"r1\",\"method\":\"test\",\"params\":{\"a\":1}}";
+    const frame = parseRequestFrame(json).?;
+    try std.testing.expectEqualStrings(json, frame.params_raw.?);
+}
+
+test "ClientMode all variants" {
+    const modes = [_]ClientMode{ .webchat, .cli, .ui, .backend, .node, .probe, .@"test" };
+    for (modes, 0..) |m1, i| {
+        for (modes, 0..) |m2, j| {
+            if (i != j) {
+                try std.testing.expect(m1 != m2);
+            }
+        }
+    }
+}
+
+test "RequestFrame with params_raw" {
+    const frame = RequestFrame{
+        .id = "req-42",
+        .method = "chat.send",
+        .params_raw = "{\"text\":\"hi\"}",
+    };
+    try std.testing.expectEqualStrings("req-42", frame.id);
+    try std.testing.expectEqualStrings("chat.send", frame.method);
+    try std.testing.expectEqualStrings("{\"text\":\"hi\"}", frame.params_raw.?);
+}
+
+test "parseFrameType only matches first type found" {
+    // Contains req before res
+    const json = "{\"type\":\"req\",\"data\":\"type\":\"res\"}";
+    try std.testing.expectEqual(FrameType.req, parseFrameType(json).?);
+}
+
+test "buildOkResponse with empty payload" {
+    var buf: [4096]u8 = undefined;
+    const resp = buildOkResponse(&buf, "req-empty", "{}");
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"payload\":{}") != null);
+}
+
+test "buildErrorResponse with long message" {
+    var buf: [4096]u8 = undefined;
+    const resp = buildErrorResponse(&buf, "req-long", .internal, "this is a longer error message for testing");
+    try std.testing.expect(std.mem.indexOf(u8, resp, "this is a longer error message for testing") != null);
+}

@@ -561,3 +561,118 @@ test "RateLimiter different keys" {
     try std.testing.expect(!limiter.check("ip-1"));
     try std.testing.expect(limiter.check("ip-2")); // Different key still allowed
 }
+
+// --- Additional Tests ---
+
+test "ClientRole all labels non-empty" {
+    for (std.meta.tags(ClientRole)) |role| {
+        try std.testing.expect(role.label().len > 0);
+    }
+}
+
+test "ClientRole viewer read-only methods" {
+    try std.testing.expect(ClientRole.viewer.canAccessMethod("sessions.list"));
+    try std.testing.expect(ClientRole.viewer.canAccessMethod("sessions.preview"));
+    try std.testing.expect(ClientRole.viewer.canAccessMethod("channels.status"));
+    try std.testing.expect(ClientRole.viewer.canAccessMethod("models.list"));
+    try std.testing.expect(ClientRole.viewer.canAccessMethod("tools.catalog"));
+    try std.testing.expect(ClientRole.viewer.canAccessMethod("cron.list"));
+    try std.testing.expect(ClientRole.viewer.canAccessMethod("usage.status"));
+    try std.testing.expect(ClientRole.viewer.canAccessMethod("agents.list"));
+}
+
+test "ClientRole admin-only methods" {
+    try std.testing.expect(!ClientRole.operator.canAccessMethod("config.apply"));
+    try std.testing.expect(!ClientRole.operator.canAccessMethod("config.patch"));
+    try std.testing.expect(!ClientRole.operator.canAccessMethod("agents.create"));
+    try std.testing.expect(!ClientRole.operator.canAccessMethod("agents.update"));
+    try std.testing.expect(ClientRole.admin.canAccessMethod("config.apply"));
+    try std.testing.expect(ClientRole.admin.canAccessMethod("agents.create"));
+}
+
+test "ClientRole operator device methods denied" {
+    try std.testing.expect(!ClientRole.operator.canAccessMethod("device.pair.approve"));
+    try std.testing.expect(!ClientRole.operator.canAccessMethod("device.token.rotate"));
+    try std.testing.expect(!ClientRole.operator.canAccessMethod("device.token.revoke"));
+}
+
+test "safeEqual same length different content" {
+    try std.testing.expect(!safeEqual("abc", "xyz"));
+}
+
+test "safeEqual single char" {
+    try std.testing.expect(safeEqual("x", "x"));
+    try std.testing.expect(!safeEqual("x", "y"));
+}
+
+test "validateToken empty strings" {
+    try std.testing.expect(validateToken("", ""));
+}
+
+test "validatePassword empty strings" {
+    try std.testing.expect(validatePassword("", ""));
+}
+
+test "validateProtocolVersion only min" {
+    try std.testing.expect(validateProtocolVersion(1, null));
+    try std.testing.expect(validateProtocolVersion(3, null));
+    try std.testing.expect(!validateProtocolVersion(4, null));
+}
+
+test "validateProtocolVersion only max" {
+    try std.testing.expect(validateProtocolVersion(null, 3));
+    try std.testing.expect(validateProtocolVersion(null, 5));
+    try std.testing.expect(!validateProtocolVersion(null, 2));
+}
+
+test "ConnectParams defaults" {
+    const params = ConnectParams{};
+    try std.testing.expect(params.protocol_version == null);
+    try std.testing.expect(params.client_id == null);
+    try std.testing.expect(params.client_mode == null);
+    try std.testing.expect(params.role == null);
+    try std.testing.expect(params.token == null);
+    try std.testing.expect(params.password == null);
+}
+
+test "AuthResult defaults" {
+    const result = AuthResult{ .ok = true };
+    try std.testing.expect(result.error_code == null);
+    try std.testing.expect(result.error_message == null);
+    try std.testing.expectEqual(ClientRole.operator, result.role);
+}
+
+test "AuthConfig defaults" {
+    const config = AuthConfig{};
+    try std.testing.expect(config.token == null);
+    try std.testing.expect(config.password == null);
+}
+
+test "authenticate with client_id preserved" {
+    const result = authenticate(
+        .{ .client_id = "my-client", .client_mode = .webchat },
+        .none,
+        .{},
+    );
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqualStrings("my-client", result.client_id.?);
+}
+
+test "authenticate password not configured" {
+    const result = authenticate(
+        .{ .password = "pass" },
+        .password,
+        .{},
+    );
+    try std.testing.expect(!result.ok);
+    try std.testing.expectEqual(schema.ErrorCode.internal, result.error_code.?);
+}
+
+test "RateLimiter reset nonexistent key is safe" {
+    const allocator = std.testing.allocator;
+    var limiter = RateLimiter.init(allocator, 3, 60_000);
+    defer limiter.deinit();
+
+    // Should not crash
+    limiter.reset("nonexistent");
+}

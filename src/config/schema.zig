@@ -259,3 +259,270 @@ test "LogLevel.label" {
     try std.testing.expectEqualStrings("info", LogLevel.info.label());
     try std.testing.expectEqualStrings("error", LogLevel.err.label());
 }
+
+// --- Additional Tests ---
+
+test "LogLevel.label all variants" {
+    try std.testing.expectEqualStrings("fatal", LogLevel.fatal.label());
+    try std.testing.expectEqualStrings("warn", LogLevel.warn.label());
+    try std.testing.expectEqualStrings("debug", LogLevel.debug.label());
+    try std.testing.expectEqualStrings("trace", LogLevel.trace.label());
+}
+
+test "validate accepts password auth with password" {
+    var config = defaultConfig();
+    config.gateway.auth.mode = .password;
+    config.gateway.auth.password = "secret123";
+    const result = validate(&config);
+    try std.testing.expect(result.ok);
+}
+
+test "validate accepts none auth" {
+    var config = defaultConfig();
+    config.gateway.auth.mode = .none;
+    const result = validate(&config);
+    try std.testing.expect(result.ok);
+}
+
+test "validate accepts trusted_proxy auth" {
+    var config = defaultConfig();
+    config.gateway.auth.mode = .trusted_proxy;
+    const result = validate(&config);
+    try std.testing.expect(result.ok);
+}
+
+test "Config getPort after modification" {
+    var config = defaultConfig();
+    config.gateway.port = 1;
+    try std.testing.expectEqual(@as(u16, 1), config.getPort());
+    config.gateway.port = 65535;
+    try std.testing.expectEqual(@as(u16, 65535), config.getPort());
+}
+
+test "GatewayConfig defaults" {
+    const gw = GatewayConfig{};
+    try std.testing.expectEqual(@as(u16, 18789), gw.port);
+    try std.testing.expectEqual(GatewayMode.local, gw.mode);
+    try std.testing.expectEqual(GatewayBindMode.auto, gw.bind);
+    try std.testing.expectEqual(@as(?[]const u8, null), gw.custom_bind_host);
+}
+
+test "LoggingConfig defaults" {
+    const log = LoggingConfig{};
+    try std.testing.expectEqual(LogLevel.info, log.level);
+    try std.testing.expectEqual(@as(?LogLevel, null), log.console_level);
+    try std.testing.expectEqual(ConsoleStyle.pretty, log.console_style);
+    try std.testing.expectEqual(@as(?[]const u8, null), log.file);
+}
+
+test "SessionConfig default" {
+    const sess = SessionConfig{};
+    try std.testing.expectEqualStrings("main", sess.main_key);
+}
+
+test "MemoryConfig defaults" {
+    const mem = MemoryConfig{};
+    try std.testing.expectEqual(MemoryBackend.builtin, mem.backend);
+}
+
+test "ReloadConfig defaults" {
+    const reload = ReloadConfig{};
+    try std.testing.expectEqual(ReloadMode.hybrid, reload.mode);
+    try std.testing.expectEqual(@as(u32, 300), reload.debounce_ms);
+}
+
+test "AgentConfig defaults" {
+    const agent = AgentConfig{};
+    try std.testing.expectEqualStrings("main", agent.id);
+    try std.testing.expectEqual(@as(?[]const u8, null), agent.name);
+    try std.testing.expectEqual(@as(?[]const u8, null), agent.model);
+}
+
+test "AgentsConfig defaults" {
+    const agents = AgentsConfig{};
+    try std.testing.expectEqualStrings("main", agents.default_agent);
+    try std.testing.expectEqual(@as(usize, 0), agents.list.len);
+}
+
+test "MetaConfig defaults" {
+    const meta = MetaConfig{};
+    try std.testing.expectEqual(@as(?[]const u8, null), meta.last_touched_version);
+    try std.testing.expectEqual(@as(?[]const u8, null), meta.last_touched_at);
+}
+
+test "ValidationIssue struct" {
+    const issue = ValidationIssue{ .path = "gateway.port", .message = "invalid" };
+    try std.testing.expectEqualStrings("gateway.port", issue.path);
+    try std.testing.expectEqualStrings("invalid", issue.message);
+}
+
+// --- New Tests ---
+
+test "LogLevel all variants have unique labels" {
+    const labels = [_][]const u8{
+        LogLevel.silent.label(),
+        LogLevel.fatal.label(),
+        LogLevel.err.label(),
+        LogLevel.warn.label(),
+        LogLevel.info.label(),
+        LogLevel.debug.label(),
+        LogLevel.trace.label(),
+    };
+    for (labels, 0..) |l1, i| {
+        for (labels, 0..) |l2, j| {
+            if (i != j) {
+                try std.testing.expect(!std.mem.eql(u8, l1, l2));
+            }
+        }
+    }
+}
+
+test "ConsoleStyle all variants" {
+    try std.testing.expect(ConsoleStyle.pretty != ConsoleStyle.compact);
+    try std.testing.expect(ConsoleStyle.compact != ConsoleStyle.json);
+    try std.testing.expect(ConsoleStyle.pretty != ConsoleStyle.json);
+}
+
+test "GatewayMode all variants" {
+    try std.testing.expect(GatewayMode.local != GatewayMode.remote);
+}
+
+test "GatewayBindMode all variants" {
+    const modes = [_]GatewayBindMode{ .auto, .lan, .loopback, .custom, .tailnet };
+    for (modes, 0..) |m1, i| {
+        for (modes, 0..) |m2, j| {
+            if (i != j) {
+                try std.testing.expect(m1 != m2);
+            }
+        }
+    }
+}
+
+test "AuthMode all variants" {
+    const modes = [_]AuthMode{ .none, .token, .password, .trusted_proxy };
+    for (modes, 0..) |m1, i| {
+        for (modes, 0..) |m2, j| {
+            if (i != j) {
+                try std.testing.expect(m1 != m2);
+            }
+        }
+    }
+}
+
+test "ReloadMode all variants" {
+    const modes = [_]ReloadMode{ .off, .restart, .hot, .hybrid };
+    for (modes, 0..) |m1, i| {
+        for (modes, 0..) |m2, j| {
+            if (i != j) {
+                try std.testing.expect(m1 != m2);
+            }
+        }
+    }
+}
+
+test "MemoryBackend all variants" {
+    try std.testing.expect(MemoryBackend.builtin != MemoryBackend.qmd);
+}
+
+test "validate port 1 is valid" {
+    var config = defaultConfig();
+    config.gateway.port = 1;
+    const result = validate(&config);
+    try std.testing.expect(result.ok);
+}
+
+test "validate port 65535 is valid" {
+    var config = defaultConfig();
+    config.gateway.port = 65535;
+    const result = validate(&config);
+    try std.testing.expect(result.ok);
+}
+
+test "validate validation result ok has empty issues" {
+    const config = defaultConfig();
+    const result = validate(&config);
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqual(@as(usize, 0), result.issues.len);
+}
+
+test "validate token auth error message content" {
+    var config = defaultConfig();
+    config.gateway.auth.mode = .token;
+    config.gateway.auth.token = null;
+    const result = validate(&config);
+    try std.testing.expect(!result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, result.issues[0].message, "token required") != null);
+}
+
+test "validate password auth error message content" {
+    var config = defaultConfig();
+    config.gateway.auth.mode = .password;
+    config.gateway.auth.password = null;
+    const result = validate(&config);
+    try std.testing.expect(!result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, result.issues[0].message, "password required") != null);
+}
+
+test "Config default agents list is empty" {
+    const config = defaultConfig();
+    try std.testing.expectEqual(@as(usize, 0), config.agents.list.len);
+}
+
+test "Config default memory citations is auto" {
+    const config = defaultConfig();
+    try std.testing.expect(config.memory.citations == .auto);
+}
+
+test "Config default logging redact is tools" {
+    const config = defaultConfig();
+    try std.testing.expect(config.logging.redact_sensitive == .tools);
+}
+
+test "Config meta defaults are null" {
+    const config = defaultConfig();
+    try std.testing.expect(config.meta.last_touched_version == null);
+    try std.testing.expect(config.meta.last_touched_at == null);
+}
+
+test "Config logging file default is null" {
+    const config = defaultConfig();
+    try std.testing.expect(config.logging.file == null);
+    try std.testing.expect(config.logging.max_file_bytes == null);
+}
+
+test "AgentConfig with custom values" {
+    const agent = AgentConfig{
+        .id = "custom",
+        .name = "My Agent",
+        .model = "claude-3",
+        .model_provider = "anthropic",
+        .working_directory = "/tmp/work",
+    };
+    try std.testing.expectEqualStrings("custom", agent.id);
+    try std.testing.expectEqualStrings("My Agent", agent.name.?);
+    try std.testing.expectEqualStrings("claude-3", agent.model.?);
+    try std.testing.expectEqualStrings("anthropic", agent.model_provider.?);
+    try std.testing.expectEqualStrings("/tmp/work", agent.working_directory.?);
+}
+
+test "GatewayConfig custom values" {
+    const gw = GatewayConfig{
+        .port = 9090,
+        .mode = .remote,
+        .bind = .lan,
+        .custom_bind_host = "192.168.1.1",
+    };
+    try std.testing.expectEqual(@as(u16, 9090), gw.port);
+    try std.testing.expectEqual(GatewayMode.remote, gw.mode);
+    try std.testing.expectEqual(GatewayBindMode.lan, gw.bind);
+    try std.testing.expectEqualStrings("192.168.1.1", gw.custom_bind_host.?);
+}
+
+test "ReloadConfig custom values" {
+    const reload = ReloadConfig{
+        .mode = .off,
+        .debounce_ms = 1000,
+    };
+    try std.testing.expectEqual(ReloadMode.off, reload.mode);
+    try std.testing.expectEqual(@as(u32, 1000), reload.debounce_ms);
+}

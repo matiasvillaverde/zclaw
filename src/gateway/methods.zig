@@ -637,3 +637,269 @@ test "dispatchWithData passes user_data to handler" {
     const output = getTestOutput();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"port\":18789") != null);
 }
+
+// --- New Tests ---
+
+test "extractJsonString with nested quotes" {
+    const json = "{\"key\":\"value with spaces\"}";
+    try std.testing.expectEqualStrings("value with spaces", extractJsonString(json, "key").?);
+}
+
+test "extractJsonString empty value" {
+    const json = "{\"key\":\"\"}";
+    try std.testing.expectEqualStrings("", extractJsonString(json, "key").?);
+}
+
+test "extractJsonInt zero" {
+    const json = "{\"count\":0}";
+    try std.testing.expectEqual(@as(i64, 0), extractJsonInt(json, "count").?);
+}
+
+test "extractJsonInt large value" {
+    const json = "{\"big\":999999}";
+    try std.testing.expectEqual(@as(i64, 999999), extractJsonInt(json, "big").?);
+}
+
+test "extractJsonInt with whitespace" {
+    const json = "{\"val\":  42}";
+    try std.testing.expectEqual(@as(i64, 42), extractJsonInt(json, "val").?);
+}
+
+test "handleConfigSet invalid port zero" {
+    const allocator = std.testing.allocator;
+    var config = config_schema.defaultConfig();
+    var connections = state.ConnectionRegistry.init(allocator);
+    defer connections.deinit();
+    var presence = state.PresenceTracker.init(allocator);
+    defer presence.deinit();
+    var svc = createTestServices(&config, &connections, &presence);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = handler.HandlerContext{
+        .request_id = "req-port0",
+        .method = "config.set",
+        .params_raw = "{\"key\":\"gateway.port\",\"value\":0}",
+        .client = null,
+        .respond = &writer,
+        .user_data = @ptrCast(&svc),
+    };
+    handleConfigSet(&ctx);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "invalid port value") != null);
+}
+
+test "handleConfigSet invalid log level" {
+    const allocator = std.testing.allocator;
+    var config = config_schema.defaultConfig();
+    var connections = state.ConnectionRegistry.init(allocator);
+    defer connections.deinit();
+    var presence = state.PresenceTracker.init(allocator);
+    defer presence.deinit();
+    var svc = createTestServices(&config, &connections, &presence);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = handler.HandlerContext{
+        .request_id = "req-bad-level",
+        .method = "config.set",
+        .params_raw = "{\"key\":\"logging.level\",\"value\":\"nonexistent\"}",
+        .client = null,
+        .respond = &writer,
+        .user_data = @ptrCast(&svc),
+    };
+    handleConfigSet(&ctx);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "invalid log level") != null);
+}
+
+test "handleConfigSet missing key field" {
+    const allocator = std.testing.allocator;
+    var config = config_schema.defaultConfig();
+    var connections = state.ConnectionRegistry.init(allocator);
+    defer connections.deinit();
+    var presence = state.PresenceTracker.init(allocator);
+    defer presence.deinit();
+    var svc = createTestServices(&config, &connections, &presence);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = handler.HandlerContext{
+        .request_id = "req-no-key",
+        .method = "config.set",
+        .params_raw = "{\"value\":\"something\"}",
+        .client = null,
+        .respond = &writer,
+        .user_data = @ptrCast(&svc),
+    };
+    handleConfigSet(&ctx);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "missing 'key'") != null);
+}
+
+test "handleStatusEnhanced without services returns basic status" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = handler.HandlerContext{
+        .request_id = "req-status-no-svc",
+        .method = "status",
+        .params_raw = null,
+        .client = null,
+        .respond = &writer,
+        .user_data = null,
+    };
+    handleStatusEnhanced(&ctx);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"gateway\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"protocol\":3") != null);
+}
+
+test "handleConnectionsList without services returns empty" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = handler.HandlerContext{
+        .request_id = "req-conn-no-svc",
+        .method = "connections.list",
+        .params_raw = null,
+        .client = null,
+        .respond = &writer,
+        .user_data = null,
+    };
+    handleConnectionsList(&ctx);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"connections\":[]") != null);
+}
+
+test "handlePresence without services returns error" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = handler.HandlerContext{
+        .request_id = "req-pres-no-svc",
+        .method = "system.presence",
+        .params_raw = "{\"presenceKey\":\"u:1\"}",
+        .client = null,
+        .respond = &writer,
+        .user_data = null,
+    };
+    handlePresence(&ctx);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "services unavailable") != null);
+}
+
+test "handlePresence without params returns error" {
+    const allocator = std.testing.allocator;
+    var config = config_schema.defaultConfig();
+    var connections = state.ConnectionRegistry.init(allocator);
+    defer connections.deinit();
+    var presence = state.PresenceTracker.init(allocator);
+    defer presence.deinit();
+    var svc = createTestServices(&config, &connections, &presence);
+
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = handler.HandlerContext{
+        .request_id = "req-no-params",
+        .method = "system.presence",
+        .params_raw = null,
+        .client = null,
+        .respond = &writer,
+        .user_data = @ptrCast(&svc),
+    };
+    handlePresence(&ctx);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "missing params") != null);
+}
+
+test "handleConfigSet without services returns error" {
+    test_output_len = 0;
+    var resp_buf: [4096]u8 = undefined;
+    var writer = createTestWriter();
+    writer.buf = &resp_buf;
+
+    const ctx = handler.HandlerContext{
+        .request_id = "req-set-no-svc",
+        .method = "config.set",
+        .params_raw = "{\"key\":\"gateway.port\",\"value\":9999}",
+        .client = null,
+        .respond = &writer,
+        .user_data = null,
+    };
+    handleConfigSet(&ctx);
+
+    const output = getTestOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "services unavailable") != null);
+}
+
+test "GatewayServices init preserves all fields" {
+    const allocator = std.testing.allocator;
+    var config = config_schema.defaultConfig();
+    var connections = state.ConnectionRegistry.init(allocator);
+    defer connections.deinit();
+    var presence = state.PresenceTracker.init(allocator);
+    defer presence.deinit();
+
+    const svc = GatewayServices.init(&config, &connections, &presence, 12345);
+    try std.testing.expectEqual(@as(i64, 12345), svc.started_at_ms);
+}
+
+test "handleConfigSet all log levels" {
+    const allocator = std.testing.allocator;
+    const levels = [_][]const u8{ "silent", "fatal", "error", "warn", "info", "debug", "trace" };
+    for (levels) |level| {
+        var config = config_schema.defaultConfig();
+        var connections = state.ConnectionRegistry.init(allocator);
+        defer connections.deinit();
+        var presence = state.PresenceTracker.init(allocator);
+        defer presence.deinit();
+        var svc = createTestServices(&config, &connections, &presence);
+
+        test_output_len = 0;
+        var resp_buf: [4096]u8 = undefined;
+        var writer = createTestWriter();
+        writer.buf = &resp_buf;
+
+        var params_buf: [256]u8 = undefined;
+        const params = std.fmt.bufPrint(&params_buf, "{{\"key\":\"logging.level\",\"value\":\"{s}\"}}", .{level}) catch continue;
+
+        const ctx = handler.HandlerContext{
+            .request_id = "req-lvl",
+            .method = "config.set",
+            .params_raw = params,
+            .client = null,
+            .respond = &writer,
+            .user_data = @ptrCast(&svc),
+        };
+        handleConfigSet(&ctx);
+
+        const output = getTestOutput();
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"updated\":true") != null);
+    }
+}

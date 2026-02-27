@@ -202,3 +202,118 @@ test "debounce prevents rapid fire" {
 
     watcher.stop();
 }
+
+// --- New Tests ---
+
+test "WatchEvent all variants are distinct" {
+    const events = [_]WatchEvent{ .modified, .deleted, .created };
+    for (events, 0..) |e1, i| {
+        for (events, 0..) |e2, j| {
+            if (i != j) {
+                try std.testing.expect(e1 != e2);
+            }
+        }
+    }
+}
+
+test "debounceMs large value" {
+    try std.testing.expectEqual(@as(u64, 60_000_000_000), debounceMs(60_000));
+}
+
+test "debounceMs one millisecond" {
+    try std.testing.expectEqual(@as(u64, 1_000_000), debounceMs(1));
+}
+
+test "debounceMs max u32" {
+    const result = debounceMs(std.math.maxInt(u32));
+    try std.testing.expect(result > 0);
+}
+
+test "Watcher.init different debounce values" {
+    const w1 = Watcher.init("/tmp/a", 100, testCallback);
+    const w2 = Watcher.init("/tmp/b", 500, testCallback);
+    try std.testing.expectEqual(@as(u64, 100 * std.time.ns_per_ms), w1.debounce_ns);
+    try std.testing.expectEqual(@as(u64, 500 * std.time.ns_per_ms), w2.debounce_ns);
+}
+
+test "Watcher.init zero debounce" {
+    const watcher = Watcher.init("/tmp/test", 0, testCallback);
+    try std.testing.expectEqual(@as(u64, 0), watcher.debounce_ns);
+}
+
+test "Watcher stop_flag initially false" {
+    const watcher = Watcher.init("/tmp/test", 100, testCallback);
+    try std.testing.expect(!watcher.stop_flag.load(.acquire));
+}
+
+test "Watcher double stop is safe" {
+    var watcher = Watcher.init("/tmp/nonexistent.json", 100, testCallback);
+    watcher.stop();
+    watcher.stop();
+    try std.testing.expect(!watcher.isRunning());
+}
+
+test "Watcher.isRunning false after stop" {
+    test_event_count = 0;
+    const tmp_path = "/tmp/zclaw_running_test.json";
+    {
+        const f = try std.fs.cwd().createFile(tmp_path, .{});
+        try f.writeAll("{}");
+        f.close();
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var watcher = Watcher.init(tmp_path, 50, testCallback);
+    try watcher.start();
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    try std.testing.expect(watcher.isRunning());
+
+    watcher.stop();
+    try std.testing.expect(!watcher.isRunning());
+}
+
+test "Watcher.init stores path reference" {
+    const path = "/tmp/specific/path.json";
+    const watcher = Watcher.init(path, 200, testCallback);
+    try std.testing.expectEqualStrings(path, watcher.path);
+}
+
+test "Watcher.init stores callback" {
+    const watcher = Watcher.init("/tmp/test", 100, testCallback);
+    try std.testing.expectEqual(@as(WatchCallback, testCallback), watcher.callback);
+}
+
+test "Watcher thread is null before start" {
+    const watcher = Watcher.init("/tmp/test.json", 100, testCallback);
+    try std.testing.expectEqual(@as(?std.Thread, null), watcher.thread);
+}
+
+test "Watcher start sets thread" {
+    test_event_count = 0;
+    const tmp_path = "/tmp/zclaw_thread_test.json";
+    {
+        const f = try std.fs.cwd().createFile(tmp_path, .{});
+        try f.writeAll("{}");
+        f.close();
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var watcher = Watcher.init(tmp_path, 50, testCallback);
+    try watcher.start();
+    try std.testing.expect(watcher.thread != null);
+    watcher.stop();
+    try std.testing.expectEqual(@as(?std.Thread, null), watcher.thread);
+}
+
+test "debounceMs conversion formula" {
+    // Verify the formula: ms * ns_per_ms
+    const ms: u32 = 42;
+    const expected = @as(u64, ms) * std.time.ns_per_ms;
+    try std.testing.expectEqual(expected, debounceMs(ms));
+}
+
+test "Watcher.init with long path" {
+    const long_path = "/tmp/" ++ "a" ** 200 ++ ".json";
+    const watcher = Watcher.init(long_path, 100, testCallback);
+    try std.testing.expectEqualStrings(long_path, watcher.path);
+}
