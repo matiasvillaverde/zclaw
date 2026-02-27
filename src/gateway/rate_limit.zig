@@ -1025,3 +1025,359 @@ test "SlidingWindowLimiter reset clears lockout" {
     try std.testing.expect(limiter.check("ip-1", .default).allowed);
     try std.testing.expectEqual(@as(u32, 0), limiter.size());
 }
+
+// --- Additional Edge-Case Tests ---
+
+test "SlidingWindowLimiter exact boundary: attempts equal max triggers lockout" {
+    const allocator = std.testing.allocator;
+    var limiter = SlidingWindowLimiter.init(allocator, .{
+        .max_attempts = 3,
+        .window_ms = 60_000,
+        .lockout_ms = 10_000,
+        .burst_allowance = 0,
+    });
+    defer limiter.deinit();
+
+    const base_time: i64 = 1_000_000;
+
+    // Record exactly max_attempts failures
+    try limiter.recordFailureAt("10.0.0.99", .default, base_time);
+    try limiter.recordFailureAt("10.0.0.99", .default, base_time + 1);
+    try limiter.recordFailureAt("10.0.0.99", .default, base_time + 2);
+
+    // At exactly max, should be locked
+    const r = limiter.checkAt("10.0.0.99", .default, base_time + 3);
+    try std.testing.expect(!r.allowed);
+    try std.testing.expectEqual(@as(u32, 0), r.remaining);
+    try std.testing.expect(r.retry_after_ms > 0);
+}
+
+test "SlidingWindowLimiter burst allowance exact boundary" {
+    const allocator = std.testing.allocator;
+    var limiter = SlidingWindowLimiter.init(allocator, .{
+        .max_attempts = 2,
+        .window_ms = 60_000,
+        .lockout_ms = 300_000,
+        .burst_allowance = 1,
+    });
+    defer limiter.deinit();
+
+    const base_time: i64 = 1_000_000;
+
+    // Effective max = 2 + 1 = 3. Record 2 failures, should still be allowed (1 remaining).
+    try limiter.recordFailureAt("10.0.0.50", .default, base_time);
+    try limiter.recordFailureAt("10.0.0.50", .default, base_time + 1);
+
+    const r1 = limiter.checkAt("10.0.0.50", .default, base_time + 2);
+    try std.testing.expect(r1.allowed);
+    try std.testing.expectEqual(@as(u32, 1), r1.remaining);
+
+    // 3rd failure reaches effective max
+    try limiter.recordFailureAt("10.0.0.50", .default, base_time + 3);
+    const r2 = limiter.checkAt("10.0.0.50", .default, base_time + 4);
+    try std.testing.expect(!r2.allowed);
+}
+
+test "SlidingWindowLimiter window expiry restores full capacity" {
+    const allocator = std.testing.allocator;
+    var limiter = SlidingWindowLimiter.init(allocator, .{
+        .max_attempts = 3,
+        .window_ms = 5_000,
+        .lockout_ms = 1_000,
+    });
+    defer limiter.deinit();
+
+    const base_time: i64 = 1_000_000;
+
+    // Record 2 out of 3 failures
+    try limiter.recordFailureAt("10.0.0.77", .default, base_time);
+    try limiter.recordFailureAt("10.0.0.77", .default, base_time + 100);
+
+    const r1 = limiter.checkAt("10.0.0.77", .default, base_time + 200);
+    try std.testing.expectEqual(@as(u32, 1), r1.remaining);
+
+    // After window_ms, both attempts slide out => full capacity restored
+    const r2 = limiter.checkAt("10.0.0.77", .default, base_time + 6_000);
+    try std.testing.expect(r2.allowed);
+    try std.testing.expectEqual(@as(u32, 3), r2.remaining);
+}
+
+test "SlidingWindowLimiter lockout expiry clears attempts" {
+    const allocator = std.testing.allocator;
+    var limiter = SlidingWindowLimiter.init(allocator, .{
+        .max_attempts = 2,
+        .window_ms = 60_000,
+        .lockout_ms = 5_000,
+    });
+    defer limiter.deinit();
+
+    const base_time: i64 = 1_000_000;
+
+    // Trigger lockout
+    try limiter.recordFailureAt("10.0.0.88", .default, base_time);
+    try limiter.recordFailureAt("10.0.0.88", .default, base_time + 1);
+
+    const locked = limiter.checkAt("10.0.0.88", .default, base_time + 2);
+    try std.testing.expect(!locked.allowed);
+
+    // After lockout expires, check clears attempts and restores full capacity
+    const after_lockout = limiter.checkAt("10.0.0.88", .default, base_time + 6_000);
+    try std.testing.expect(after_lockout.allowed);
+    try std.testing.expectEqual(@as(u32, 2), after_lockout.remaining);
+}
+
+test "FixedWindowLimiter exact window boundary triggers new window" {
+    var limiter = FixedWindowLimiter.init(2, 10_000);
+
+    const base_time: i64 = 1_000_000;
+
+    _ = limiter.consumeAt(base_time);
+    _ = limiter.consumeAt(base_time + 100);
+
+    // Exactly at window_ms boundary
+    const r = limiter.consumeAt(base_time + 10_000);
+    try std.testing.expect(r.allowed);
+    try std.testing.expectEqual(@as(u32, 1), r.remaining);
+}
+
+test "FixedWindowLimiter retry_after is accurate" {
+    var limiter = FixedWindowLimiter.init(1, 20_000);
+
+    const base_time: i64 = 1_000_000;
+
+    _ = limiter.consumeAt(base_time);
+
+    // Exhausted, check retry_after at base_time + 5000
+    const r = limiter.consumeAt(base_time + 5_000);
+    try std.testing.expect(!r.allowed);
+    // window_start=base_time, window_ms=20000, now=base_time+5000
+    // retry_after = base_time + 20000 - (base_time + 5000) = 15000
+    try std.testing.expectEqual(@as(i64, 15_000), r.retry_after_ms);
+}
+
+test "FixedWindowLimiter consecutive windows work independently" {
+    var limiter = FixedWindowLimiter.init(2, 10_000);
+
+    const base_time: i64 = 1_000_000;
+
+    // Fill first window
+    _ = limiter.consumeAt(base_time);
+    _ = limiter.consumeAt(base_time + 1);
+    try std.testing.expect(!limiter.consumeAt(base_time + 2).allowed);
+
+    // Second window
+    const r1 = limiter.consumeAt(base_time + 10_001);
+    try std.testing.expect(r1.allowed);
+    _ = limiter.consumeAt(base_time + 10_002);
+    try std.testing.expect(!limiter.consumeAt(base_time + 10_003).allowed);
+
+    // Third window
+    const r2 = limiter.consumeAt(base_time + 20_002);
+    try std.testing.expect(r2.allowed);
+    try std.testing.expectEqual(@as(u32, 1), r2.remaining);
+}
+
+test "ControlPlaneLimiter resolveKey with IPv6 address" {
+    var buf: [256]u8 = undefined;
+
+    const key = ControlPlaneLimiter.resolveKey("dev-42", "2001:db8::1", null, &buf);
+    try std.testing.expectEqualStrings("dev-42|2001:db8::1", key);
+}
+
+test "ControlPlaneLimiter resolveKey with special characters" {
+    var buf: [256]u8 = undefined;
+
+    const key = ControlPlaneLimiter.resolveKey("dev/special@chars", "10.0.0.1", null, &buf);
+    try std.testing.expectEqualStrings("dev/special@chars|10.0.0.1", key);
+}
+
+test "ControlPlaneLimiter resolveKey empty conn_id not used as fallback" {
+    var buf: [256]u8 = undefined;
+
+    // Both device and ip are null, but conn_id is empty string => should NOT use conn_id path
+    const key = ControlPlaneLimiter.resolveKey(null, null, "", &buf);
+    try std.testing.expectEqualStrings("unknown-device|unknown-ip", key);
+}
+
+test "ControlPlaneLimiter resolveKey buffer overflow returns empty" {
+    var small_buf: [4]u8 = undefined;
+
+    // "unknown-device|unknown-ip" is 25 chars, which overflows a 4-byte buffer
+    const key = ControlPlaneLimiter.resolveKey(null, null, null, &small_buf);
+    try std.testing.expectEqual(@as(usize, 0), key.len);
+}
+
+test "ControlPlaneLimiter resolveKey ip only fallback" {
+    var buf: [256]u8 = undefined;
+
+    // device_id is null but ip is present: no conn_id appended
+    const key = ControlPlaneLimiter.resolveKey(null, "192.168.1.1", "conn-xyz", &buf);
+    try std.testing.expectEqualStrings("unknown-device|192.168.1.1", key);
+}
+
+test "SlidingWindowLimiter check with oversized key silently allows" {
+    const allocator = std.testing.allocator;
+    var limiter = SlidingWindowLimiter.init(allocator, .{ .max_attempts = 1, .window_ms = 60_000, .lockout_ms = 300_000 });
+    defer limiter.deinit();
+
+    // Create an IP string that makes scope_label + ":" + ip exceed 256 bytes
+    // "default" is 7 bytes, ":" is 1 byte, so IP needs > 248 bytes
+    const long_ip = "A" ** 250;
+
+    // check should silently allow (key buffer overflow returns allowed)
+    const r = limiter.check(long_ip, .default);
+    try std.testing.expect(r.allowed);
+    try std.testing.expectEqual(@as(u32, 1), r.remaining);
+}
+
+test "SlidingWindowLimiter recordFailure with oversized key is silently ignored" {
+    const allocator = std.testing.allocator;
+    var limiter = SlidingWindowLimiter.init(allocator, .{ .max_attempts = 1, .window_ms = 60_000, .lockout_ms = 300_000 });
+    defer limiter.deinit();
+
+    const long_ip = "B" ** 250;
+
+    // recordFailure should silently return (key overflow)
+    try limiter.recordFailure(long_ip, .default);
+
+    // Nothing was recorded, size should be 0
+    try std.testing.expectEqual(@as(u32, 0), limiter.size());
+}
+
+test "SlidingWindowLimiter reset with oversized key does nothing" {
+    const allocator = std.testing.allocator;
+    var limiter = SlidingWindowLimiter.init(allocator, .{ .max_attempts = 5, .window_ms = 60_000, .lockout_ms = 300_000 });
+    defer limiter.deinit();
+
+    const long_ip = "C" ** 250;
+
+    // Should not crash
+    limiter.reset(long_ip, .default);
+    try std.testing.expectEqual(@as(u32, 0), limiter.size());
+}
+
+test "Entry slideWindow removes only expired timestamps" {
+    const allocator = std.testing.allocator;
+    var entry = Entry.init();
+    defer entry.deinit(allocator);
+
+    // Timestamps: 100, 200, 300, 400, 500
+    try entry.attempts.append(allocator, 100);
+    try entry.attempts.append(allocator, 200);
+    try entry.attempts.append(allocator, 300);
+    try entry.attempts.append(allocator, 400);
+    try entry.attempts.append(allocator, 500);
+
+    // now=500, window_ms=200 => cutoff=300 => keep only ts > 300 => {400, 500}
+    entry.slideWindow(500, 200);
+    try std.testing.expectEqual(@as(usize, 2), entry.attempts.items.len);
+    try std.testing.expectEqual(@as(i64, 400), entry.attempts.items[0]);
+    try std.testing.expectEqual(@as(i64, 500), entry.attempts.items[1]);
+}
+
+test "Entry slideWindow with all timestamps expired" {
+    const allocator = std.testing.allocator;
+    var entry = Entry.init();
+    defer entry.deinit(allocator);
+
+    try entry.attempts.append(allocator, 100);
+    try entry.attempts.append(allocator, 200);
+    try entry.attempts.append(allocator, 300);
+
+    // now=1000, window_ms=100 => cutoff=900 => all timestamps <= 900 => empty
+    entry.slideWindow(1000, 100);
+    try std.testing.expectEqual(@as(usize, 0), entry.attempts.items.len);
+}
+
+test "Entry slideWindow with no timestamps is a no-op" {
+    var entry = Entry.init();
+    // No allocator needed since no append was done, but slideWindow should not crash
+    entry.slideWindow(1000, 500);
+    try std.testing.expectEqual(@as(usize, 0), entry.attempts.items.len);
+}
+
+test "Entry countInWindow counts only recent timestamps" {
+    const allocator = std.testing.allocator;
+    var entry = Entry.init();
+    defer entry.deinit(allocator);
+
+    try entry.attempts.append(allocator, 100);
+    try entry.attempts.append(allocator, 200);
+    try entry.attempts.append(allocator, 300);
+    try entry.attempts.append(allocator, 400);
+
+    // now=400, window=150 => cutoff=250 => count ts > 250 => {300, 400} => 2
+    const count = entry.countInWindow(400, 150);
+    try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "Entry countInWindow with empty attempts returns zero" {
+    const entry = Entry.init();
+    const count = entry.countInWindow(1000, 500);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "SlidingWindowLimiter prune after lockout expires removes entry" {
+    const allocator = std.testing.allocator;
+    var limiter = SlidingWindowLimiter.init(allocator, .{
+        .max_attempts = 1,
+        .window_ms = 5_000,
+        .lockout_ms = 10_000,
+    });
+    defer limiter.deinit();
+
+    const base_time: i64 = 1_000_000;
+
+    // Trigger lockout
+    try limiter.recordFailureAt("ip-prune", .default, base_time);
+
+    // During lockout, prune should keep it
+    limiter.pruneAt(base_time + 8_000);
+    try std.testing.expectEqual(@as(u32, 1), limiter.size());
+
+    // After lockout AND window expire, prune should remove it
+    // lockout_until = base_time + 10_000, window cutoff at base_time + 16_000 - 5_000 = base_time + 11_000
+    // At base_time + 16_000: lockout expired, and attempt at base_time is older than cutoff
+    limiter.pruneAt(base_time + 16_000);
+    try std.testing.expectEqual(@as(u32, 0), limiter.size());
+}
+
+test "SlidingWindowLimiter partial window slide preserves recent failures" {
+    const allocator = std.testing.allocator;
+    var limiter = SlidingWindowLimiter.init(allocator, .{
+        .max_attempts = 5,
+        .window_ms = 10_000,
+        .lockout_ms = 60_000,
+    });
+    defer limiter.deinit();
+
+    const base_time: i64 = 1_000_000;
+
+    // Record 4 failures spread across the window
+    try limiter.recordFailureAt("10.0.0.33", .default, base_time);
+    try limiter.recordFailureAt("10.0.0.33", .default, base_time + 3_000);
+    try limiter.recordFailureAt("10.0.0.33", .default, base_time + 6_000);
+    try limiter.recordFailureAt("10.0.0.33", .default, base_time + 9_000);
+
+    // At base_time + 12_000, window_ms=10_000 => cutoff = base_time + 2_000
+    // Only failures at +3000, +6000, +9000 survive (3 of 4)
+    const r = limiter.checkAt("10.0.0.33", .default, base_time + 12_000);
+    try std.testing.expect(r.allowed);
+    try std.testing.expectEqual(@as(u32, 2), r.remaining);
+}
+
+test "ControlPlaneLimiter resolveKey with device_id present ignores conn_id" {
+    var buf: [256]u8 = undefined;
+
+    // device_id present, ip null, conn_id present => conn_id NOT appended
+    const key = ControlPlaneLimiter.resolveKey("my-device", null, "conn-999", &buf);
+    try std.testing.expectEqualStrings("my-device|unknown-ip", key);
+}
+
+test "ControlPlaneLimiter resolveKey with ip present ignores conn_id" {
+    var buf: [256]u8 = undefined;
+
+    // device_id null but ip present => not both unknown => conn_id NOT appended
+    const key = ControlPlaneLimiter.resolveKey(null, "172.16.0.1", "conn-abc", &buf);
+    try std.testing.expectEqualStrings("unknown-device|172.16.0.1", key);
+}
