@@ -447,3 +447,137 @@ test "discoverPlugins skips invalid manifests" {
     const count = try discoverPlugins(allocator, &registry, tmp_dir);
     try std.testing.expectEqual(@as(usize, 0), count);
 }
+
+// --- Additional Tests ---
+
+test "PLUGIN_DIR_NAME constant" {
+    try std.testing.expectEqualStrings("plugins", PLUGIN_DIR_NAME);
+}
+
+test "MANIFEST_FILE constant" {
+    try std.testing.expectEqualStrings("plugin.json", MANIFEST_FILE);
+}
+
+test "buildPluginDir empty base" {
+    var buf: [256]u8 = undefined;
+    const dir = try buildPluginDir(&buf, "");
+    try std.testing.expectEqualStrings("plugins", dir);
+}
+
+test "buildPluginPath trailing slash" {
+    var buf: [256]u8 = undefined;
+    const path = try buildPluginPath(&buf, "/plugins/", "my-plugin");
+    try std.testing.expect(std.mem.startsWith(u8, path, "/plugins/my-plugin"));
+    try std.testing.expect(std.mem.endsWith(u8, path, PLUGIN_EXTENSION));
+}
+
+test "buildManifestPath trailing slash" {
+    var buf: [256]u8 = undefined;
+    const path = try buildManifestPath(&buf, "/plugins/", "my-plugin");
+    try std.testing.expectEqualStrings("/plugins/my-plugin/plugin.json", path);
+}
+
+test "PluginRegistry empty" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), registry.count());
+    try std.testing.expectEqual(@as(usize, 0), registry.activeCount());
+    try std.testing.expect(registry.get("anything") == null);
+}
+
+test "PluginRegistry enable non-disabled plugin" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .manifest = .{ .name = "p", .version = "1.0.0" },
+        .state = .active,
+    });
+
+    // enablePlugin should return false for already-active plugin
+    try std.testing.expect(!registry.enablePlugin("p"));
+}
+
+test "PluginRegistry multiple plugins active count" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .manifest = .{ .name = "a", .version = "1.0.0" },
+        .state = .active,
+    });
+    try registry.register(.{
+        .manifest = .{ .name = "b", .version = "1.0.0" },
+        .state = .active,
+    });
+    try registry.register(.{
+        .manifest = .{ .name = "c", .version = "1.0.0" },
+        .state = .disabled,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), registry.count());
+    try std.testing.expectEqual(@as(usize, 2), registry.activeCount());
+}
+
+test "loadFromManifest invalid version" {
+    const allocator = std.testing.allocator;
+    const m = manifest_mod.PluginManifest{ .name = "test", .version = "bad" };
+    try std.testing.expectError(error.ManifestInvalid, loadFromManifest(allocator, m));
+}
+
+test "loadFromManifest sets api plugin_name" {
+    const allocator = std.testing.allocator;
+    const m = manifest_mod.PluginManifest{ .name = "my-plug", .version = "1.0.0" };
+    var entry = try loadFromManifest(allocator, m);
+    defer entry.api.?.deinit();
+
+    try std.testing.expectEqualStrings("my-plug", entry.api.?.plugin_name);
+}
+
+test "serializePluginList multiple plugins" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .manifest = .{ .name = "p1", .version = "1.0.0" },
+        .state = .active,
+    });
+    try registry.register(.{
+        .manifest = .{ .name = "p2", .version = "2.0.0" },
+        .state = .disabled,
+    });
+
+    var buf: [1024]u8 = undefined;
+    const json = try serializePluginList(&buf, &registry);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"count\":2") != null);
+}
+
+test "PluginRegistry disable then enable round trip" {
+    const allocator = std.testing.allocator;
+    var registry = PluginRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .manifest = .{ .name = "rt", .version = "1.0.0" },
+        .state = .active,
+    });
+
+    try std.testing.expect(registry.disablePlugin("rt"));
+    const disabled = registry.get("rt").?;
+    try std.testing.expectEqual(api_mod.PluginState.disabled, disabled.state);
+
+    try std.testing.expect(registry.enablePlugin("rt"));
+    const enabled = registry.get("rt").?;
+    try std.testing.expectEqual(api_mod.PluginState.active, enabled.state);
+}
+
+test "LoadError variants" {
+    // Verify the error set contains expected variants
+    const err: LoadError = error.PluginNotFound;
+    try std.testing.expect(err == error.PluginNotFound);
+}

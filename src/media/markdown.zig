@@ -238,3 +238,268 @@ test "RenderTarget labels" {
     try std.testing.expectEqualStrings("slack", RenderTarget.slack.label());
     try std.testing.expectEqualStrings("plain", RenderTarget.plain.label());
 }
+
+// --- Additional Tests ---
+
+test "stripMarkdown italic underscores" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("_italic_ text", &buf);
+    try std.testing.expectEqualStrings("italic text", result);
+}
+
+test "stripMarkdown double underscores" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("__bold__ text", &buf);
+    try std.testing.expectEqualStrings("bold text", result);
+}
+
+test "stripMarkdown empty" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("", &buf);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "stripMarkdown multiple headings" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("## Second\n### Third", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Second") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Third") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "#") == null);
+}
+
+test "stripMarkdown inline code" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("use `code` here", &buf);
+    try std.testing.expectEqualStrings("use code here", result);
+}
+
+test "stripMarkdown blockquote mid-text" {
+    var buf: [1024]u8 = undefined;
+    // > at beginning of text
+    const result = stripMarkdown("> quoted line", &buf);
+    try std.testing.expectEqualStrings("quoted line", result);
+}
+
+test "escapeForTelegram plain text unchanged" {
+    var buf: [1024]u8 = undefined;
+    const result = escapeForTelegram("hello world", &buf);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "escapeForTelegram all special chars" {
+    var buf: [1024]u8 = undefined;
+    const result = escapeForTelegram("~>#+=-|{}.!", &buf);
+    try std.testing.expectEqualStrings("\\~\\>\\#\\+\\=\\-\\|\\{\\}\\.\\!", result);
+}
+
+test "escapeForTelegram parentheses" {
+    var buf: [1024]u8 = undefined;
+    const result = escapeForTelegram("(test)", &buf);
+    try std.testing.expectEqualStrings("\\(test\\)", result);
+}
+
+test "render telegram escapes" {
+    var buf: [1024]u8 = undefined;
+    const result = render("hello_world", &buf, .telegram);
+    try std.testing.expectEqualStrings("hello\\_world", result);
+}
+
+test "render slack passthrough" {
+    var buf: [1024]u8 = undefined;
+    const result = render("**bold** text", &buf, .slack);
+    try std.testing.expectEqualStrings("**bold** text", result);
+}
+
+test "hasFormatting with numbers and punctuation" {
+    try std.testing.expect(!hasFormatting("12345"));
+    try std.testing.expect(!hasFormatting("hello, world!"));
+    try std.testing.expect(!hasFormatting("no formatting (really)"));
+}
+
+test "detectCodeFences double backtick not a fence" {
+    try std.testing.expect(!detectCodeFences("`` not a fence ``"));
+}
+
+test "stripMarkdown preserves link text discards url" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("See [docs](https://example.com) for more", &buf);
+    try std.testing.expectEqualStrings("See docs for more", result);
+}
+
+// ===== New tests added for comprehensive coverage =====
+
+test "RenderTarget all labels non-empty" {
+    const targets = [_]RenderTarget{ .telegram, .discord, .slack, .plain };
+    for (targets) |t| {
+        try std.testing.expect(t.label().len > 0);
+    }
+}
+
+test "hasFormatting single star" {
+    try std.testing.expect(hasFormatting("*"));
+}
+
+test "hasFormatting single underscore" {
+    try std.testing.expect(hasFormatting("_"));
+}
+
+test "hasFormatting single backtick" {
+    try std.testing.expect(hasFormatting("`"));
+}
+
+test "hasFormatting single hash" {
+    try std.testing.expect(hasFormatting("#"));
+}
+
+test "hasFormatting single bracket" {
+    try std.testing.expect(hasFormatting("["));
+}
+
+test "hasFormatting single greater than" {
+    try std.testing.expect(hasFormatting(">"));
+}
+
+test "hasFormatting with mixed content" {
+    try std.testing.expect(hasFormatting("Hello *world*!"));
+    try std.testing.expect(hasFormatting("Check [this] out"));
+}
+
+test "hasFormatting digits and punctuation only" {
+    try std.testing.expect(!hasFormatting("123.456"));
+    try std.testing.expect(!hasFormatting("hello, world."));
+    try std.testing.expect(!hasFormatting("@mention"));
+}
+
+test "detectCodeFences at start of text" {
+    try std.testing.expect(detectCodeFences("```\ncode\n```"));
+}
+
+test "detectCodeFences at end of text" {
+    try std.testing.expect(detectCodeFences("text before ```"));
+}
+
+test "detectCodeFences empty string" {
+    try std.testing.expect(!detectCodeFences(""));
+}
+
+test "stripMarkdown h3 heading" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("### Third Level", &buf);
+    try std.testing.expectEqualStrings("Third Level", result);
+}
+
+test "stripMarkdown mixed formatting" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("**bold** and _italic_ and `code`", &buf);
+    try std.testing.expectEqualStrings("bold and italic and code", result);
+}
+
+test "stripMarkdown multiple links" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("[a](http://a.com) and [b](http://b.com)", &buf);
+    try std.testing.expectEqualStrings("a and b", result);
+}
+
+test "stripMarkdown blockquote at newline" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("text\n> quoted", &buf);
+    try std.testing.expectEqualStrings("text\nquoted", result);
+}
+
+test "stripMarkdown heading at newline" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("text\n# Heading", &buf);
+    try std.testing.expectEqualStrings("text\nHeading", result);
+}
+
+test "stripMarkdown code fence with language" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("```javascript\nconsole.log('hi');\n```", &buf);
+    try std.testing.expectEqualStrings("console.log('hi');\n", result);
+}
+
+test "stripMarkdown single asterisk not bold" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("a*b", &buf);
+    // Single * is treated as italic marker, stripped
+    try std.testing.expectEqualStrings("ab", result);
+}
+
+test "escapeForTelegram empty string" {
+    var buf: [1024]u8 = undefined;
+    const result = escapeForTelegram("", &buf);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "escapeForTelegram numbers unchanged" {
+    var buf: [1024]u8 = undefined;
+    const result = escapeForTelegram("12345", &buf);
+    try std.testing.expectEqualStrings("12345", result);
+}
+
+test "escapeForTelegram dot escape" {
+    var buf: [1024]u8 = undefined;
+    const result = escapeForTelegram("v1.0", &buf);
+    try std.testing.expectEqualStrings("v1\\.0", result);
+}
+
+test "escapeForTelegram exclamation escape" {
+    var buf: [1024]u8 = undefined;
+    const result = escapeForTelegram("Hello!", &buf);
+    try std.testing.expectEqualStrings("Hello\\!", result);
+}
+
+test "render plain removes formatting" {
+    var buf: [1024]u8 = undefined;
+    const result = render("# Heading\n**bold** and `code`", &buf, .plain);
+    try std.testing.expect(std.mem.indexOf(u8, result, "#") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Heading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "code") != null);
+}
+
+test "render discord preserves all markdown" {
+    var buf: [1024]u8 = undefined;
+    const input = "# Title\n**bold** _italic_ `code` [link](url)";
+    const result = render(input, &buf, .discord);
+    try std.testing.expectEqualStrings(input, result);
+}
+
+test "render slack preserves all markdown" {
+    var buf: [1024]u8 = undefined;
+    const input = "# Title\n**bold** _italic_ `code` [link](url)";
+    const result = render(input, &buf, .slack);
+    try std.testing.expectEqualStrings(input, result);
+}
+
+test "render telegram escapes all special chars" {
+    var buf: [1024]u8 = undefined;
+    const result = render("Hello!", &buf, .telegram);
+    try std.testing.expectEqualStrings("Hello\\!", result);
+}
+
+test "render plain empty string" {
+    var buf: [1024]u8 = undefined;
+    const result = render("", &buf, .plain);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "render discord empty string" {
+    var buf: [1024]u8 = undefined;
+    const result = render("", &buf, .discord);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "render telegram empty string" {
+    var buf: [1024]u8 = undefined;
+    const result = render("", &buf, .telegram);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "stripMarkdown plain text with numbers" {
+    var buf: [1024]u8 = undefined;
+    const result = stripMarkdown("Version 2.0 released", &buf);
+    try std.testing.expectEqualStrings("Version 2.0 released", result);
+}

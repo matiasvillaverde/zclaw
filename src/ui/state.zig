@@ -356,3 +356,118 @@ test "View all paths" {
         try std.testing.expectEqual(v, View.fromPath(p));
     }
 }
+
+// --- Additional Tests ---
+
+test "View all labels non-empty" {
+    for (std.meta.tags(View)) |v| {
+        try std.testing.expect(v.label().len > 0);
+    }
+}
+
+test "View fromPath unknown returns dashboard" {
+    try std.testing.expectEqual(View.dashboard, View.fromPath("/nonexistent"));
+    try std.testing.expectEqual(View.dashboard, View.fromPath(""));
+}
+
+test "View specific labels" {
+    try std.testing.expectEqualStrings("Chat", View.chat.label());
+    try std.testing.expectEqualStrings("Channels", View.channels.label());
+    try std.testing.expectEqualStrings("Sessions", View.sessions.label());
+    try std.testing.expectEqualStrings("Memory", View.memory.label());
+    try std.testing.expectEqualStrings("Config", View.config.label());
+    try std.testing.expectEqualStrings("Agents", View.agents.label());
+    try std.testing.expectEqualStrings("Logs", View.logs.label());
+}
+
+test "ConnectionState all labels non-empty" {
+    for (std.meta.tags(ConnectionState)) |cs| {
+        try std.testing.expect(cs.label().len > 0);
+    }
+}
+
+test "ConnectionState authenticating not online" {
+    try std.testing.expect(!ConnectionState.authenticating.isOnline());
+}
+
+test "ConnectionState authenticating label" {
+    try std.testing.expectEqualStrings("Authenticating...", ConnectionState.authenticating.label());
+}
+
+test "ConnectionState connecting label" {
+    try std.testing.expectEqualStrings("Connecting...", ConnectionState.connecting.label());
+}
+
+test "ChatRole system_msg label" {
+    try std.testing.expectEqualStrings("system", ChatRole.system_msg.label());
+}
+
+test "ChatMessage defaults" {
+    const msg = ChatMessage{ .role = .assistant, .content = "test" };
+    try std.testing.expectEqual(@as(i64, 0), msg.timestamp_ms);
+    try std.testing.expect(!msg.is_streaming);
+}
+
+test "ChatMessage streaming" {
+    const msg = ChatMessage{ .role = .user, .content = "hello", .is_streaming = true };
+    try std.testing.expect(msg.is_streaming);
+}
+
+test "ChannelInfo defaults" {
+    const ch = ChannelInfo{ .name = "test", .channel_type = "web", .status = "idle" };
+    try std.testing.expect(!ch.is_connected);
+}
+
+test "AgentInfo defaults" {
+    const agent = AgentInfo{ .name = "default", .model = "gpt-4" };
+    try std.testing.expect(!agent.is_active);
+}
+
+test "AppState default gateway_url" {
+    const state = AppState{};
+    try std.testing.expectEqualStrings("ws://localhost:18789", state.gateway_url);
+}
+
+test "AppState default theme" {
+    const state = AppState{};
+    try std.testing.expectEqual(Theme.system, state.theme);
+}
+
+test "AppState default version" {
+    const state = AppState{};
+    try std.testing.expectEqualStrings("0.1.0", state.version);
+}
+
+test "AppState setDisconnected resets counts" {
+    var state = AppState{};
+    state.updateCounts(5, 10, 3);
+    state.setDisconnected();
+    try std.testing.expectEqual(@as(u32, 0), state.channel_count);
+    try std.testing.expectEqual(@as(u32, 0), state.session_count);
+    // agent_count is NOT reset by setDisconnected
+}
+
+test "AppState navigateTo all views" {
+    var state = AppState{};
+    const views = [_]View{ .dashboard, .chat, .channels, .sessions, .memory, .config, .agents, .logs };
+    for (views) |v| {
+        state.navigateTo(v);
+        try std.testing.expectEqual(v, state.current_view);
+    }
+}
+
+test "serializeState theme and version" {
+    const state = AppState{};
+    var buf: [1024]u8 = undefined;
+    const json = try serializeState(&buf, &state);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"theme\":\"System\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"version\":\"0.1.0\"") != null);
+}
+
+test "serializeState disconnected" {
+    const state = AppState{};
+    var buf: [1024]u8 = undefined;
+    const json = try serializeState(&buf, &state);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"connection\":\"Disconnected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sidebar\":true") != null);
+}

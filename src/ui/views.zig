@@ -286,3 +286,131 @@ test "formatUptime zero" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("0s", try formatUptime(&buf, 0));
 }
+
+// --- Additional Tests ---
+
+test "DashboardData custom values" {
+    const data = DashboardData{
+        .gateway_status = "running",
+        .uptime_seconds = 100,
+        .channel_count = 5,
+        .active_sessions = 10,
+        .agent_count = 3,
+        .messages_today = 99,
+    };
+    try std.testing.expectEqualStrings("running", data.gateway_status);
+    try std.testing.expectEqual(@as(u32, 99), data.messages_today);
+}
+
+test "serializeDashboard defaults" {
+    const data = DashboardData{};
+    var buf: [512]u8 = undefined;
+    const json = try serializeDashboard(&buf, &data);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"gateway\":\"not_running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"uptime\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"channels\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sessions\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"agents\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"messages_today\":0") != null);
+}
+
+test "ChannelListItem struct" {
+    const item = ChannelListItem{ .name = "web", .channel_type = "webchat", .status = "active" };
+    try std.testing.expectEqualStrings("web", item.name);
+    try std.testing.expectEqualStrings("webchat", item.channel_type);
+}
+
+test "serializeChannelList single item" {
+    const channels = [_]ChannelListItem{
+        .{ .name = "slack", .channel_type = "slack", .status = "connected" },
+    };
+    var buf: [1024]u8 = undefined;
+    const json = try serializeChannelList(&buf, &channels);
+    try std.testing.expect(std.mem.startsWith(u8, json, "["));
+    try std.testing.expect(std.mem.endsWith(u8, json, "]"));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"slack\"") != null);
+}
+
+test "SessionListItem defaults" {
+    const item = SessionListItem{ .key = "k", .agent = "a", .channel = "c" };
+    try std.testing.expectEqual(@as(u32, 0), item.message_count);
+    try std.testing.expectEqualStrings("", item.last_active);
+}
+
+test "serializeSessionList multiple items" {
+    const sessions = [_]SessionListItem{
+        .{ .key = "k1", .agent = "a1", .channel = "c1", .message_count = 5 },
+        .{ .key = "k2", .agent = "a2", .channel = "c2", .message_count = 10 },
+    };
+    var buf: [2048]u8 = undefined;
+    const json = try serializeSessionList(&buf, &sessions);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"key\":\"k1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"key\":\"k2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"messages\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"messages\":10") != null);
+}
+
+test "MemoryResult defaults" {
+    const r = MemoryResult{ .chunk_text = "text", .source = "src" };
+    try std.testing.expectEqual(@as(f32, 0), r.score);
+}
+
+test "serializeMemoryResults multiple" {
+    const results = [_]MemoryResult{
+        .{ .chunk_text = "chunk1", .source = "doc1", .score = 0.9 },
+        .{ .chunk_text = "chunk2", .source = "doc2", .score = 0.8 },
+    };
+    var buf: [2048]u8 = undefined;
+    const json = try serializeMemoryResults(&buf, &results);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"text\":\"chunk1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"text\":\"chunk2\"") != null);
+}
+
+test "NavItem struct" {
+    const item = NavItem{ .view = .chat, .icon = "msg", .badge = 5 };
+    try std.testing.expectEqual(state.View.chat, item.view);
+    try std.testing.expectEqualStrings("msg", item.icon);
+    try std.testing.expectEqual(@as(u32, 5), item.badge);
+}
+
+test "NavItem default badge" {
+    const item = NavItem{ .view = .dashboard, .icon = "home" };
+    try std.testing.expectEqual(@as(u32, 0), item.badge);
+}
+
+test "NAV_ITEMS last is logs" {
+    try std.testing.expectEqual(state.View.logs, NAV_ITEMS[NAV_ITEMS.len - 1].view);
+    try std.testing.expectEqualStrings("terminal", NAV_ITEMS[NAV_ITEMS.len - 1].icon);
+}
+
+test "serializeNavItems dashboard active" {
+    const app = state.AppState{ .current_view = .dashboard };
+    var buf: [2048]u8 = undefined;
+    const json = try serializeNavItems(&buf, &app);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"label\":\"Dashboard\"") != null);
+}
+
+test "formatUptime exactly 60 seconds" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("1m 0s", try formatUptime(&buf, 60));
+}
+
+test "formatUptime exactly 1 hour" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("1h 0m", try formatUptime(&buf, 3600));
+}
+
+test "formatUptime exactly 1 day" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("1d 0h", try formatUptime(&buf, 86400));
+}
+
+test "formatUptime boundary 59 seconds" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("59s", try formatUptime(&buf, 59));
+}
+
+test "formatUptime boundary 3599 seconds" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("59m 59s", try formatUptime(&buf, 3599));
+}

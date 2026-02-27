@@ -333,3 +333,113 @@ test "PluginApi multiple of same type" {
     try std.testing.expectEqual(@as(usize, 3), api.countByType(.tool));
     try std.testing.expectEqual(@as(usize, 0), api.countByType(.rpc_method));
 }
+
+// --- Additional Tests ---
+
+test "HookType all labels non-empty" {
+    for (std.meta.tags(HookType)) |ht| {
+        try std.testing.expect(ht.label().len > 0);
+    }
+}
+
+test "HookType on_response label" {
+    try std.testing.expectEqualStrings("on_response", HookType.on_response.label());
+}
+
+test "HookType on_connect label" {
+    try std.testing.expectEqualStrings("on_connect", HookType.on_connect.label());
+}
+
+test "HookType on_disconnect label" {
+    try std.testing.expectEqualStrings("on_disconnect", HookType.on_disconnect.label());
+}
+
+test "RegistrationType all labels non-empty" {
+    for (std.meta.tags(RegistrationType)) |rt| {
+        try std.testing.expect(rt.label().len > 0);
+    }
+}
+
+test "RegistrationType http_route label" {
+    try std.testing.expectEqualStrings("http_route", RegistrationType.http_route.label());
+}
+
+test "RegistrationType service label" {
+    try std.testing.expectEqualStrings("service", RegistrationType.service.label());
+}
+
+test "Registration struct defaults" {
+    const reg = Registration{
+        .reg_type = .tool,
+        .name = "my_tool",
+    };
+    try std.testing.expectEqualStrings("", reg.description);
+    try std.testing.expectEqualStrings("", reg.plugin_name);
+}
+
+test "PluginState all labels non-empty" {
+    for (std.meta.tags(PluginState)) |ps| {
+        try std.testing.expect(ps.label().len > 0);
+    }
+}
+
+test "PluginState loading not running" {
+    try std.testing.expect(!PluginState.loading.isRunning());
+}
+
+test "PluginState loading label" {
+    try std.testing.expectEqualStrings("loading", PluginState.loading.label());
+}
+
+test "PluginEntry disabled" {
+    const entry = PluginEntry{
+        .manifest = .{ .name = "disabled-plugin" },
+        .state = .disabled,
+    };
+    try std.testing.expect(!entry.isActive());
+    try std.testing.expectEqual(@as(usize, 0), entry.registrationCount());
+}
+
+test "PluginApi registerHook uses label" {
+    const allocator = std.testing.allocator;
+    var api = PluginApi.init(allocator, "hook-plugin");
+    defer api.deinit();
+
+    try api.registerHook(.on_startup);
+    try std.testing.expectEqualStrings("on_startup", api.registrations.items[0].name);
+    try std.testing.expectEqual(RegistrationType.hook, api.registrations.items[0].reg_type);
+}
+
+test "PluginApi getByType returns all items" {
+    const allocator = std.testing.allocator;
+    var api = PluginApi.init(allocator, "p");
+    defer api.deinit();
+
+    try api.registerTool("t1", "d");
+    try api.registerRpcMethod("m1", "d");
+
+    const all = api.getByType(.tool);
+    try std.testing.expectEqual(@as(usize, 2), all.len);
+}
+
+test "serializePluginInfo error state" {
+    const entry = PluginEntry{
+        .manifest = .{ .name = "broken", .version = "0.1.0" },
+        .state = .error_state,
+        .load_error = "symbol not found",
+    };
+    var buf: [512]u8 = undefined;
+    const json = try serializePluginInfo(&buf, &entry);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"state\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"broken\"") != null);
+}
+
+test "PluginApi countByType no matches" {
+    const allocator = std.testing.allocator;
+    var api = PluginApi.init(allocator, "empty");
+    defer api.deinit();
+
+    try api.registerTool("t1", "d");
+    try std.testing.expectEqual(@as(usize, 0), api.countByType(.service));
+    try std.testing.expectEqual(@as(usize, 0), api.countByType(.hook));
+}

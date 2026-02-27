@@ -1483,3 +1483,223 @@ test "CliServices default" {
     const svc = CliServices{};
     try std.testing.expect(svc.config == null);
 }
+
+// --- Additional Tests ---
+
+test "Command all labels non-empty" {
+    for (std.meta.tags(Command)) |cmd| {
+        try std.testing.expect(cmd.label().len > 0);
+    }
+}
+
+test "Command all descriptions non-empty" {
+    for (std.meta.tags(Command)) |cmd| {
+        try std.testing.expect(cmd.description().len > 0);
+    }
+}
+
+test "Command fromString aliases" {
+    // Version aliases
+    try std.testing.expectEqual(Command.version, Command.fromString("version").?);
+    try std.testing.expectEqual(Command.version, Command.fromString("--version").?);
+    try std.testing.expectEqual(Command.version, Command.fromString("-v").?);
+
+    // Help aliases
+    try std.testing.expectEqual(Command.help, Command.fromString("help").?);
+    try std.testing.expectEqual(Command.help, Command.fromString("--help").?);
+    try std.testing.expectEqual(Command.help, Command.fromString("-h").?);
+}
+
+test "Command fromString all commands" {
+    try std.testing.expectEqual(Command.agent, Command.fromString("agent").?);
+    try std.testing.expectEqual(Command.channels, Command.fromString("channels").?);
+    try std.testing.expectEqual(Command.models, Command.fromString("models").?);
+    try std.testing.expectEqual(Command.config, Command.fromString("config").?);
+    try std.testing.expectEqual(Command.memory, Command.fromString("memory").?);
+    try std.testing.expectEqual(Command.sessions, Command.fromString("sessions").?);
+    try std.testing.expectEqual(Command.status, Command.fromString("status").?);
+    try std.testing.expectEqual(Command.setup, Command.fromString("setup").?);
+    try std.testing.expectEqual(Command.onboard, Command.fromString("onboard").?);
+}
+
+test "SubCommand fromString all" {
+    try std.testing.expectEqual(SubCommand.stop, SubCommand.fromString("stop").?);
+    try std.testing.expectEqual(SubCommand.restart, SubCommand.fromString("restart").?);
+    try std.testing.expectEqual(SubCommand.list, SubCommand.fromString("list").?);
+    try std.testing.expectEqual(SubCommand.login, SubCommand.fromString("login").?);
+    try std.testing.expectEqual(SubCommand.logout, SubCommand.fromString("logout").?);
+    try std.testing.expectEqual(SubCommand.index, SubCommand.fromString("index").?);
+    try std.testing.expectEqual(SubCommand.cleanup, SubCommand.fromString("cleanup").?);
+    try std.testing.expectEqual(SubCommand.preview, SubCommand.fromString("preview").?);
+    try std.testing.expectEqual(SubCommand.delete, SubCommand.fromString("delete").?);
+    try std.testing.expectEqual(SubCommand.status_sub, SubCommand.fromString("status").?);
+    try std.testing.expectEqual(SubCommand.help_sub, SubCommand.fromString("help").?);
+    try std.testing.expectEqual(SubCommand.help_sub, SubCommand.fromString("--help").?);
+    try std.testing.expectEqual(SubCommand.help_sub, SubCommand.fromString("-h").?);
+}
+
+test "SubCommand fromString empty" {
+    try std.testing.expect(SubCommand.fromString("") == null);
+}
+
+test "CommandResult defaults" {
+    const result = CommandResult{};
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(result.message == null);
+}
+
+test "CommandResult with values" {
+    const result = CommandResult{ .exit_code = 1, .message = "failed" };
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("failed", result.message.?);
+}
+
+test "dispatch version json" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var ctx = makeCtx(&fbs, .json);
+    const args = [_][]const u8{"version"};
+    const result = try dispatch(&ctx, &args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"version\"") != null);
+}
+
+test "dispatch agent no message plain" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var ctx = makeCtx(&fbs, .plain);
+    const args = [_][]const u8{"agent"};
+    const result = try dispatch(&ctx, &args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "Agent Command") != null);
+}
+
+test "dispatch agent with message" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var ctx = makeCtx(&fbs, .plain);
+    const args = [_][]const u8{ "agent", "--message", "hello world" };
+    const result = try dispatch(&ctx, &args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "hello world") != null);
+}
+
+test "dispatch agent with message json" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var ctx = makeCtx(&fbs, .json);
+    const args = [_][]const u8{ "agent", "--message", "test" };
+    const result = try dispatch(&ctx, &args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"message\":\"test\"") != null);
+}
+
+test "dispatch agent with custom agent name" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var ctx = makeCtx(&fbs, .plain);
+    const args = [_][]const u8{ "agent", "--message", "hi", "--agent", "custom" };
+    const result = try dispatch(&ctx, &args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "custom") != null);
+}
+
+test "dispatch agent with -m shorthand" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var ctx = makeCtx(&fbs, .plain);
+    const args = [_][]const u8{ "agent", "-m", "short" };
+    const result = try dispatch(&ctx, &args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "short") != null);
+}
+
+test "dispatch agent no message json" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var ctx = makeCtx(&fbs, .json);
+    const args = [_][]const u8{"agent"};
+    const result = try dispatch(&ctx, &args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "\"error\"") != null);
+}
+
+test "dispatch gateway help sub" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var ctx = makeCtx(&fbs, .plain);
+    const args = [_][]const u8{ "gateway", "help" };
+    const result = try dispatch(&ctx, &args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "Gateway Commands") != null);
+}
+
+test "dispatch channels login json" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var ctx = makeCtx(&fbs, .plain);
+    const args = [_][]const u8{ "channels", "login", "whatsapp" };
+    const result = try dispatch(&ctx, &args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "whatsapp") != null);
+}
+
+test "findArgValue multiple flags" {
+    const args = [_][]const u8{ "--port", "8080", "--host", "localhost", "--env", "prod" };
+    try std.testing.expectEqualStrings("prod", findArgValue(&args, "--env").?);
+}
+
+test "findArgValue empty args" {
+    const args = [_][]const u8{};
+    try std.testing.expect(findArgValue(&args, "--port") == null);
+}
+
+test "filterGlobalFlags no flags" {
+    const args = [_][]const u8{ "gateway", "run" };
+    const filtered = filterGlobalFlags(&args);
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+}
+
+test "config set invalid port" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var config = config_schema.defaultConfig();
+    const original_port = config.gateway.port;
+    var svc = CliServices{ .config = &config };
+    var ctx = makeCtxWithServices(&fbs, .plain, &svc);
+    configSetValue(&ctx, "gateway.port", "not_a_number");
+    // Port should remain unchanged
+    try std.testing.expectEqual(original_port, config.gateway.port);
+}
+
+test "config set invalid log level" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var config = config_schema.defaultConfig();
+    const original_level = config.logging.level;
+    var svc = CliServices{ .config = &config };
+    var ctx = makeCtxWithServices(&fbs, .plain, &svc);
+    configSetValue(&ctx, "logging.level", "invalid_level");
+    // Level should remain unchanged
+    try std.testing.expectEqual(original_level, config.logging.level);
+}
+
+test "config get session.mainKey" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var config = config_schema.defaultConfig();
+    var svc = CliServices{ .config = &config };
+    var ctx = makeCtxWithServices(&fbs, .plain, &svc);
+    const val = configGetValue(&ctx, "session.mainKey");
+    try std.testing.expect(val.len > 0);
+}
+
+test "portToString" {
+    const result = portToString(9090);
+    try std.testing.expectEqualStrings("9090", result);
+}
+
+test "portToString default port" {
+    const result = portToString(18789);
+    try std.testing.expectEqualStrings("18789", result);
+}

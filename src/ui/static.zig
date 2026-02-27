@@ -434,3 +434,99 @@ test "buildResponseHeader 304" {
     const header = try buildResponseHeader(&buf, 304, .html, 0);
     try std.testing.expect(std.mem.indexOf(u8, header, "304 Not Modified") != null);
 }
+
+// --- Additional Tests ---
+
+test "ContentType fromExtension json" {
+    try std.testing.expectEqual(ContentType.json, ContentType.fromExtension(".json"));
+}
+
+test "ContentType fromExtension png" {
+    try std.testing.expectEqual(ContentType.png, ContentType.fromExtension(".png"));
+}
+
+test "ContentType fromExtension svg" {
+    try std.testing.expectEqual(ContentType.svg, ContentType.fromExtension(".svg"));
+}
+
+test "ContentType fromExtension ico" {
+    try std.testing.expectEqual(ContentType.ico, ContentType.fromExtension(".ico"));
+}
+
+test "ContentType fromExtension unknown" {
+    try std.testing.expectEqual(ContentType.plain, ContentType.fromExtension(".xyz"));
+    try std.testing.expectEqual(ContentType.plain, ContentType.fromExtension(""));
+}
+
+test "ContentType mimeType json" {
+    try std.testing.expectEqualStrings("application/json", ContentType.json.mimeType());
+}
+
+test "ContentType mimeType png" {
+    try std.testing.expectEqualStrings("image/png", ContentType.png.mimeType());
+}
+
+test "ContentType mimeType svg" {
+    try std.testing.expectEqualStrings("image/svg+xml", ContentType.svg.mimeType());
+}
+
+test "ContentType mimeType ico" {
+    try std.testing.expectEqualStrings("image/x-icon", ContentType.ico.mimeType());
+}
+
+test "ContentType mimeType plain" {
+    try std.testing.expectEqualStrings("text/plain", ContentType.plain.mimeType());
+}
+
+test "findFile index.html" {
+    const file = findFile("/index.html").?;
+    try std.testing.expectEqual(ContentType.html, file.content_type);
+    try std.testing.expect(file.content.len > 0);
+}
+
+test "findFile returns null for partial match" {
+    try std.testing.expect(findFile("/static") == null);
+    try std.testing.expect(findFile("/static/app") == null);
+}
+
+test "getExtension nested path" {
+    try std.testing.expectEqualStrings(".js", getExtension("/a/b/c/d.js"));
+}
+
+test "getExtension empty string" {
+    try std.testing.expectEqualStrings("", getExtension(""));
+}
+
+test "getExtension multiple dots" {
+    try std.testing.expectEqualStrings(".gz", getExtension("/archive.tar.gz"));
+}
+
+test "buildResponseHeader unknown status" {
+    var buf: [512]u8 = undefined;
+    const header = try buildResponseHeader(&buf, 999, .plain, 0);
+    try std.testing.expect(std.mem.indexOf(u8, header, "999 Unknown") != null);
+}
+
+test "buildResponseHeader contains cache control" {
+    var buf: [512]u8 = undefined;
+    const header = try buildResponseHeader(&buf, 200, .css, 100);
+    try std.testing.expect(std.mem.indexOf(u8, header, "Cache-Control: no-cache") != null);
+}
+
+test "buildResponseHeader contains correct content type" {
+    var buf: [512]u8 = undefined;
+    const header = try buildResponseHeader(&buf, 200, .javascript, 50);
+    try std.testing.expect(std.mem.indexOf(u8, header, "application/javascript") != null);
+}
+
+test "STATIC_FILES paths are unique" {
+    for (0..STATIC_FILES.len) |i| {
+        for (i + 1..STATIC_FILES.len) |j| {
+            try std.testing.expect(!std.mem.eql(u8, STATIC_FILES[i].path, STATIC_FILES[j].path));
+        }
+    }
+}
+
+test "APP_JS contains escapeHtml" {
+    try std.testing.expect(std.mem.indexOf(u8, APP_JS, "escapeHtml") != null);
+}

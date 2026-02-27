@@ -218,3 +218,87 @@ test "PluginManifest defaults" {
     try std.testing.expectEqualStrings("zclaw_plugin_init", m.entry_point);
     try std.testing.expectEqualStrings("0.1.0", m.min_zclaw_version);
 }
+
+// --- Additional Tests ---
+
+test "Capability all labels non-empty" {
+    for (std.meta.tags(Capability)) |cap| {
+        try std.testing.expect(cap.label().len > 0);
+    }
+}
+
+test "Capability http_handlers label" {
+    try std.testing.expectEqualStrings("http_handlers", Capability.http_handlers.label());
+}
+
+test "Capability cli_commands label" {
+    try std.testing.expectEqualStrings("cli_commands", Capability.cli_commands.label());
+}
+
+test "Capability services label" {
+    try std.testing.expectEqualStrings("services", Capability.services.label());
+}
+
+test "Capability fromString all valid" {
+    try std.testing.expectEqual(Capability.rpc_methods, Capability.fromString("rpc_methods").?);
+    try std.testing.expectEqual(Capability.http_handlers, Capability.fromString("http_handlers").?);
+    try std.testing.expectEqual(Capability.cli_commands, Capability.fromString("cli_commands").?);
+    try std.testing.expectEqual(Capability.services, Capability.fromString("services").?);
+}
+
+test "Capability fromString empty" {
+    try std.testing.expect(Capability.fromString("") == null);
+}
+
+test "parseManifest with all fields" {
+    const json = "{\"name\":\"full\",\"version\":\"2.3.4\",\"description\":\"Full plugin\",\"author\":\"dev\",\"entry_point\":\"my_init\",\"min_zclaw_version\":\"1.0.0\"}";
+    const m = parseManifest(json).?;
+    try std.testing.expectEqualStrings("full", m.name);
+    try std.testing.expectEqualStrings("2.3.4", m.version);
+    try std.testing.expectEqualStrings("Full plugin", m.description);
+    try std.testing.expectEqualStrings("dev", m.author);
+    try std.testing.expectEqualStrings("my_init", m.entry_point);
+    try std.testing.expectEqualStrings("1.0.0", m.min_zclaw_version);
+}
+
+test "parseManifest empty json" {
+    try std.testing.expect(parseManifest("") == null);
+}
+
+test "parseManifest invalid json" {
+    try std.testing.expect(parseManifest("not json") == null);
+}
+
+test "serializeManifest round trip" {
+    const m = PluginManifest{
+        .name = "roundtrip",
+        .version = "1.2.3",
+        .description = "test",
+        .author = "zclaw",
+    };
+    var buf: [512]u8 = undefined;
+    const json = try serializeManifest(&buf, &m);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"roundtrip\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"version\":\"1.2.3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\":\"test\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"author\":\"zclaw\"") != null);
+}
+
+test "isValidVersion various formats" {
+    try std.testing.expect(isValidVersion("0.0.0"));
+    try std.testing.expect(isValidVersion("99.99.99"));
+    try std.testing.expect(!isValidVersion(".1.0"));
+    try std.testing.expect(!isValidVersion("1.0."));
+    try std.testing.expect(!isValidVersion("1.0.0.0"));
+    try std.testing.expect(!isValidVersion("1.0.0-beta"));
+}
+
+test "validateManifest all valid" {
+    const m = PluginManifest{ .name = "valid", .version = "0.1.0" };
+    try validateManifest(&m);
+}
+
+test "PluginManifest capabilities default empty" {
+    const m = PluginManifest{ .name = "p" };
+    try std.testing.expectEqual(@as(usize, 0), m.capabilities.len);
+}

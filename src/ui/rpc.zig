@@ -297,3 +297,141 @@ test "writeJsonEscaped" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\\\"world\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\\n") != null);
 }
+
+// --- Additional Tests ---
+
+test "FrameType all labels non-empty" {
+    for (std.meta.tags(FrameType)) |ft| {
+        try std.testing.expect(ft.label().len > 0);
+    }
+}
+
+test "buildRequest no params" {
+    var buf: [512]u8 = undefined;
+    const frame = try buildRequest(&buf, "99", "ping", null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"params\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"id\":\"99\"") != null);
+}
+
+test "buildConnectRequest protocol version" {
+    var buf: [512]u8 = undefined;
+    const frame = try buildConnectRequest(&buf, "1", null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"protocol\":3") != null);
+}
+
+test "buildChatRequest escapes newlines" {
+    var buf: [1024]u8 = undefined;
+    const frame = try buildChatRequest(&buf, "5", "line1\nline2", "default");
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\\n") != null);
+}
+
+test "buildChatRequest escapes tabs" {
+    var buf: [1024]u8 = undefined;
+    const frame = try buildChatRequest(&buf, "6", "col1\tcol2", "default");
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\\t") != null);
+}
+
+test "parseFrame empty string" {
+    try std.testing.expect(parseFrame("") == null);
+}
+
+test "parseFrame malformed json" {
+    try std.testing.expect(parseFrame("{broken") == null);
+}
+
+test "parseFrame response with payload_start" {
+    const json = "{\"type\":\"res\",\"id\":\"2\",\"ok\":true,\"payload\":{\"data\":1}}";
+    const frame = parseFrame(json).?;
+    try std.testing.expect(frame.payload_start != null);
+}
+
+test "parseFrame req with no id" {
+    const json = "{\"type\":\"req\",\"method\":\"test\"}";
+    const frame = parseFrame(json).?;
+    try std.testing.expectEqual(FrameType.req, frame.frame_type);
+    try std.testing.expect(frame.id == null);
+    try std.testing.expectEqualStrings("test", frame.method.?);
+}
+
+test "parseFrame event no payload" {
+    const json = "{\"type\":\"event\",\"event\":\"ping\"}";
+    const frame = parseFrame(json).?;
+    try std.testing.expectEqual(FrameType.event, frame.frame_type);
+    try std.testing.expect(frame.payload_start == null);
+}
+
+test "extractStreamDelta empty" {
+    try std.testing.expect(extractStreamDelta("{}") == null);
+}
+
+test "extractErrorMessage missing" {
+    try std.testing.expect(extractErrorMessage("{}") == null);
+}
+
+test "extractErrorCode missing" {
+    try std.testing.expect(extractErrorCode("{}") == null);
+}
+
+test "extractErrorMessage present" {
+    const json = "{\"message\":\"not found\"}";
+    try std.testing.expectEqualStrings("not found", extractErrorMessage(json).?);
+}
+
+test "extractErrorCode present" {
+    const json = "{\"code\":\"invalid_auth\"}";
+    try std.testing.expectEqualStrings("invalid_auth", extractErrorCode(json).?);
+}
+
+test "nextRequestId increments" {
+    resetRequestCounter();
+    var buf1: [32]u8 = undefined;
+    _ = nextRequestId(&buf1);
+    var buf2: [32]u8 = undefined;
+    _ = nextRequestId(&buf2);
+    var buf3: [32]u8 = undefined;
+    const id3 = nextRequestId(&buf3);
+    try std.testing.expectEqualStrings("ui-3", id3);
+}
+
+test "resetRequestCounter" {
+    resetRequestCounter();
+    var buf: [32]u8 = undefined;
+    const id = nextRequestId(&buf);
+    try std.testing.expectEqualStrings("ui-1", id);
+    resetRequestCounter();
+    var buf2: [32]u8 = undefined;
+    const id2 = nextRequestId(&buf2);
+    try std.testing.expectEqualStrings("ui-1", id2);
+}
+
+test "writeJsonEscaped backslash" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "path\\to\\file");
+    const written = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\\\\") != null);
+}
+
+test "writeJsonEscaped carriage return" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "line\r");
+    const written = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\\r") != null);
+}
+
+test "writeJsonEscaped plain text unchanged" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeJsonEscaped(fbs.writer(), "simple text");
+    try std.testing.expectEqualStrings("simple text", fbs.getWritten());
+}
+
+test "ParsedFrame defaults" {
+    const frame = ParsedFrame{ .frame_type = .req };
+    try std.testing.expect(frame.ok);
+    try std.testing.expect(frame.id == null);
+    try std.testing.expect(frame.method == null);
+    try std.testing.expect(frame.event_name == null);
+    try std.testing.expect(frame.payload_start == null);
+}
