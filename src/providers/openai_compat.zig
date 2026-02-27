@@ -72,6 +72,34 @@ pub const XAI = CompatConfig{
     .supports_tools = true,
 };
 
+pub const FIREWORKS = CompatConfig{
+    .provider_name = "fireworks",
+    .base_url = "https://api.fireworks.ai/inference",
+    .supports_streaming = true,
+    .supports_tools = true,
+};
+
+pub const CEREBRAS = CompatConfig{
+    .provider_name = "cerebras",
+    .base_url = "https://api.cerebras.ai",
+    .supports_streaming = true,
+    .supports_tools = true,
+};
+
+pub const PERPLEXITY = CompatConfig{
+    .provider_name = "perplexity",
+    .base_url = "https://api.perplexity.ai",
+    .supports_streaming = true,
+    .supports_tools = false,
+};
+
+pub const MOONSHOT = CompatConfig{
+    .provider_name = "moonshot",
+    .base_url = "https://api.moonshot.cn",
+    .supports_streaming = true,
+    .supports_tools = true,
+};
+
 /// Lookup a preset by name.
 pub fn getPreset(name: []const u8) ?CompatConfig {
     const map = std.StaticStringMap(CompatConfig).initComptime(.{
@@ -82,6 +110,10 @@ pub fn getPreset(name: []const u8) ?CompatConfig {
         .{ "deepseek", DEEPSEEK },
         .{ "mistral", MISTRAL },
         .{ "xai", XAI },
+        .{ "fireworks", FIREWORKS },
+        .{ "cerebras", CEREBRAS },
+        .{ "perplexity", PERPLEXITY },
+        .{ "moonshot", MOONSHOT },
     });
     return map.get(name);
 }
@@ -215,6 +247,10 @@ test "getPreset known providers" {
     try std.testing.expect(getPreset("deepseek") != null);
     try std.testing.expect(getPreset("mistral") != null);
     try std.testing.expect(getPreset("xai") != null);
+    try std.testing.expect(getPreset("fireworks") != null);
+    try std.testing.expect(getPreset("cerebras") != null);
+    try std.testing.expect(getPreset("perplexity") != null);
+    try std.testing.expect(getPreset("moonshot") != null);
     try std.testing.expect(getPreset("unknown") == null);
 }
 
@@ -723,8 +759,45 @@ test "All presets have non-empty base_url" {
 }
 
 test "All presets have non-empty provider_name" {
-    const presets = [_]CompatConfig{ GROQ, OLLAMA, OPENROUTER, TOGETHER, DEEPSEEK, MISTRAL, XAI };
+    const presets = [_]CompatConfig{ GROQ, OLLAMA, OPENROUTER, TOGETHER, DEEPSEEK, MISTRAL, XAI, FIREWORKS, CEREBRAS, PERPLEXITY, MOONSHOT };
     for (presets) |p| {
         try std.testing.expect(p.provider_name.len > 0);
+    }
+}
+
+// --- New preset tests ---
+
+test "FIREWORKS preset" {
+    try std.testing.expectEqualStrings("fireworks", FIREWORKS.provider_name);
+    try std.testing.expectEqualStrings("https://api.fireworks.ai/inference", FIREWORKS.base_url);
+    try std.testing.expect(FIREWORKS.supports_streaming);
+    try std.testing.expect(FIREWORKS.supports_tools);
+}
+
+test "CEREBRAS preset" {
+    try std.testing.expectEqualStrings("cerebras", CEREBRAS.provider_name);
+    try std.testing.expectEqualStrings("https://api.cerebras.ai", CEREBRAS.base_url);
+    try std.testing.expect(CEREBRAS.supports_streaming);
+    try std.testing.expect(CEREBRAS.supports_tools);
+}
+
+test "PERPLEXITY preset" {
+    try std.testing.expectEqualStrings("perplexity", PERPLEXITY.provider_name);
+    try std.testing.expectEqualStrings("https://api.perplexity.ai", PERPLEXITY.base_url);
+    try std.testing.expect(PERPLEXITY.supports_streaming);
+    try std.testing.expect(!PERPLEXITY.supports_tools); // Perplexity doesn't support tools
+}
+
+test "MOONSHOT preset" {
+    try std.testing.expectEqualStrings("moonshot", MOONSHOT.provider_name);
+    try std.testing.expectEqualStrings("https://api.moonshot.cn", MOONSHOT.base_url);
+    try std.testing.expect(MOONSHOT.supports_streaming);
+    try std.testing.expect(MOONSHOT.supports_tools);
+}
+
+test "All presets have non-empty base_url including new" {
+    const presets = [_]CompatConfig{ FIREWORKS, CEREBRAS, PERPLEXITY, MOONSHOT };
+    for (presets) |p| {
+        try std.testing.expect(p.base_url.len > 0);
     }
 }
