@@ -622,3 +622,117 @@ test "buildFailoverKey empty strings" {
     const key = try buildFailoverKey(&buf, "", "");
     try std.testing.expectEqualStrings(":", key);
 }
+
+// --- Additional failover tests ---
+
+test "FailoverState recordFailure increments count" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 3, 30_000);
+    defer state.deinit();
+
+    try state.recordFailure("anthropic:claude", .rate_limit);
+    try std.testing.expect(state.cooldowns.contains("anthropic:claude"));
+
+    try state.recordFailure("anthropic:claude", .rate_limit);
+    const entry = state.cooldowns.get("anthropic:claude").?;
+    try std.testing.expectEqual(@as(u32, 2), entry.failures);
+}
+
+test "FailoverState isAvailable after cooldown" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 3, 1); // 1ms cooldown
+    defer state.deinit();
+
+    try state.recordFailure("provider:model", .overloaded);
+
+    // After cooldown period (practically instant with 1ms)
+    std.Thread.sleep(2_000_000); // 2ms
+    const in_cooldown = state.isInCooldown("provider:model");
+    try std.testing.expect(!in_cooldown);
+}
+
+test "FailoverState multiple providers tracked independently" {
+    const allocator = std.testing.allocator;
+    var state = FailoverState.init(allocator, 3, 30_000);
+    defer state.deinit();
+
+    try state.recordFailure("anthropic:claude", .rate_limit);
+    try state.recordFailure("openai:gpt4", .auth);
+
+    try std.testing.expectEqual(@as(u32, 1), state.cooldowns.get("anthropic:claude").?.failures);
+    try std.testing.expectEqual(@as(u32, 1), state.cooldowns.get("openai:gpt4").?.failures);
+    try std.testing.expectEqual(FailoverReason.rate_limit, state.cooldowns.get("anthropic:claude").?.reason);
+    try std.testing.expectEqual(FailoverReason.auth, state.cooldowns.get("openai:gpt4").?.reason);
+}
+
+test "FailoverReason transient reasons" {
+    try std.testing.expect(FailoverReason.rate_limit.isTransient());
+    try std.testing.expect(FailoverReason.overloaded.isTransient());
+    try std.testing.expect(FailoverReason.timeout.isTransient());
+    try std.testing.expect(!FailoverReason.auth.isTransient());
+    try std.testing.expect(!FailoverReason.format.isTransient());
+}
+
+test "FailoverReason failover-worthy reasons" {
+    try std.testing.expect(FailoverReason.rate_limit.shouldFailover());
+    try std.testing.expect(FailoverReason.overloaded.shouldFailover());
+    try std.testing.expect(FailoverReason.auth.shouldFailover());
+    try std.testing.expect(!FailoverReason.format.shouldFailover());
+}
+
+test "ModelResolution agent default used when no session or user override" {
+    const result = ModelResolution.resolve(null, null, "agent-model", null);
+    try std.testing.expectEqualStrings("agent-model", result);
+}
+
+test "ModelResolution global default used as last resort" {
+    const result = ModelResolution.resolve(null, null, null, "global-model");
+    try std.testing.expectEqualStrings("global-model", result);
+}
+
+test "AuthRotation single key wraps on rotate" {
+    const allocator = std.testing.allocator;
+    const keys = [_][]const u8{"only-key"};
+    var rotation = try AuthRotation.init(allocator, &keys);
+    defer rotation.deinit();
+
+    try std.testing.expectEqualStrings("only-key", rotation.currentKey().?);
+    rotation.rotate();
+    // Still on the same key after rotation (wraps around)
+    try std.testing.expectEqualStrings("only-key", rotation.currentKey().?);
+}
+
+test "AuthRotation three keys cycle" {
+    const allocator = std.testing.allocator;
+    const keys = [_][]const u8{ "k1", "k2", "k3" };
+    var rotation = try AuthRotation.init(allocator, &keys);
+    defer rotation.deinit();
+
+    try std.testing.expectEqualStrings("k1", rotation.currentKey().?);
+    rotation.rotate();
+    try std.testing.expectEqualStrings("k2", rotation.currentKey().?);
+    rotation.rotate();
+    try std.testing.expectEqualStrings("k3", rotation.currentKey().?);
+    rotation.rotate();
+    try std.testing.expectEqualStrings("k1", rotation.currentKey().?); // wraps
+}
+
+test "AuthRotation resetCurrent clears failure count" {
+    const allocator = std.testing.allocator;
+    const keys = [_][]const u8{ "k1", "k2" };
+    var rotation = try AuthRotation.init(allocator, &keys);
+    defer rotation.deinit();
+
+    rotation.rotate(); // k1 failure = 1
+    try std.testing.expect(!rotation.allExhausted(2));
+
+    rotation.resetCurrent();
+    // After reset, current key's failure count is 0 again
+    try std.testing.expect(!rotation.allExhausted(1));
+}
+
+test "buildFailoverKey format" {
+    var buf: [256]u8 = undefined;
+    const key = try buildFailoverKey(&buf, "anthropic", "claude-3-5-sonnet");
+    try std.testing.expectEqualStrings("anthropic:claude-3-5-sonnet", key);
+}

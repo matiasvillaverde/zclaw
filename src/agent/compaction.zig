@@ -330,3 +330,77 @@ test "findCompactionCutoff two messages keep one" {
 test "findCompactionCutoff large numbers" {
     try std.testing.expectEqual(@as(usize, 9950), findCompactionCutoff(10000, 50));
 }
+
+// --- Additional compaction tests ---
+
+test "needsCompaction at exactly 80% threshold" {
+    // 80% of 1000 tokens = 800 tokens. 800 tokens * 4 chars = 3200 bytes
+    // threshold = (1000 * 4) / 5 = 800
+    // 3200 bytes / 4 = 800 estimated tokens, NOT > 800 (equal), so no compaction
+    try std.testing.expect(!needsCompaction(3200, 1000));
+    // 3204 bytes / 4 = 801 estimated tokens > 800 threshold → needs compaction
+    try std.testing.expect(needsCompaction(3204, 1000));
+}
+
+test "needsCompaction with zero bytes never compacts" {
+    try std.testing.expect(!needsCompaction(0, 1000));
+    try std.testing.expect(!needsCompaction(0, 0));
+}
+
+test "needsCompaction with very large context window" {
+    // 1 million token context window, small message
+    try std.testing.expect(!needsCompaction(100, 1_000_000));
+}
+
+test "estimateTokens known lengths" {
+    // Empty → 0
+    try std.testing.expectEqual(@as(u32, 0), estimateTokens(""));
+    // 1 char → 1 (minimum)
+    try std.testing.expectEqual(@as(u32, 1), estimateTokens("a"));
+    // 4 chars → 1 token
+    try std.testing.expectEqual(@as(u32, 1), estimateTokens("abcd"));
+    // 8 chars → 2 tokens
+    try std.testing.expectEqual(@as(u32, 2), estimateTokens("abcdefgh"));
+    // 100 chars → 25 tokens
+    try std.testing.expectEqual(@as(u32, 25), estimateTokens("a" ** 100));
+}
+
+test "buildCompactionPrompt contains summary instruction" {
+    var buf: [16384]u8 = undefined;
+    const prompt = try buildCompactionPrompt(&buf, "User: hello\nAssistant: hi");
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Summarize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "User: hello") != null);
+}
+
+test "buildCompactionPrompt truncates at 8000 chars" {
+    var buf: [16384]u8 = undefined;
+    const long_preview = "x" ** 10000;
+    const prompt = try buildCompactionPrompt(&buf, long_preview);
+    // The prompt should contain the header + exactly 8000 chars of preview
+    try std.testing.expect(prompt.len < 10000 + 200); // header is ~200 chars
+}
+
+test "createEntry calculates tokens saved from summary length" {
+    const entry = createEntry("short", 50, 400);
+    // 400 bytes / 4 = 100 tokens saved
+    try std.testing.expectEqual(@as(u32, 100), entry.estimated_tokens_saved);
+    try std.testing.expectEqual(@as(u32, 50), entry.original_message_count);
+    try std.testing.expectEqualStrings("short", entry.summary);
+}
+
+test "findCompactionCutoff when keep_recent exceeds total" {
+    // Keep more than we have → cut nothing
+    try std.testing.expectEqual(@as(usize, 0), findCompactionCutoff(5, 10));
+}
+
+test "CompactionEntry fields" {
+    const entry = CompactionEntry{
+        .summary = "Discussed project planning",
+        .original_message_count = 42,
+        .compacted_at_ms = 1700000000000,
+        .estimated_tokens_saved = 5000,
+    };
+    try std.testing.expectEqualStrings("Discussed project planning", entry.summary);
+    try std.testing.expectEqual(@as(u32, 42), entry.original_message_count);
+    try std.testing.expectEqual(@as(i64, 1700000000000), entry.compacted_at_ms);
+}

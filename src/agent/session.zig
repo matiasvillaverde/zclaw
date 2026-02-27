@@ -790,3 +790,75 @@ test "JsonlReader hasHeader false when first line is message" {
     try std.testing.expect(!reader.hasHeader());
     try std.testing.expectEqual(@as(usize, 1), reader.messageCount());
 }
+
+// --- Additional session tests ---
+
+test "buildSessionKey with three parts produces colon-separated key" {
+    var buf: [256]u8 = undefined;
+    const parts = [_][]const u8{ "telegram", "dm", "user-123" };
+    const key = try buildSessionKey(&buf, "agent-1", &parts);
+    try std.testing.expectEqualStrings("agent:agent-1:telegram:dm:user-123", key);
+}
+
+test "buildSessionKey with no parts returns agent prefix only" {
+    var buf: [256]u8 = undefined;
+    const parts = [_][]const u8{};
+    const key = try buildSessionKey(&buf, "main", &parts);
+    try std.testing.expectEqualStrings("agent:main", key);
+}
+
+test "buildSessionKey returns NoSpaceLeft on small buffer" {
+    var buf: [5]u8 = undefined;
+    const parts = [_][]const u8{"channel"};
+    const result = buildSessionKey(&buf, "agent-1", &parts);
+    try std.testing.expectError(error.NoSpaceLeft, result);
+}
+
+test "Role fromString all variants" {
+    try std.testing.expectEqual(Role.user, Role.fromString("user").?);
+    try std.testing.expectEqual(Role.assistant, Role.fromString("assistant").?);
+    try std.testing.expectEqual(Role.tool_result, Role.fromString("toolResult").?);
+}
+
+test "Role fromString unknown returns null" {
+    try std.testing.expect(Role.fromString("unknown") == null);
+    try std.testing.expect(Role.fromString("") == null);
+    try std.testing.expect(Role.fromString("User") == null);
+}
+
+test "Role label matches fromString round-trip" {
+    // user label → fromString should work
+    try std.testing.expectEqual(Role.user, Role.fromString(Role.user.label()).?);
+    try std.testing.expectEqual(Role.assistant, Role.fromString(Role.assistant.label()).?);
+}
+
+test "SessionEntry default optional fields are null" {
+    const entry = SessionEntry{ .session_id = "sess-1" };
+    try std.testing.expectEqualStrings("sess-1", entry.session_id);
+    try std.testing.expectEqual(@as(i64, 0), entry.updated_at);
+    try std.testing.expect(entry.session_file == null);
+    try std.testing.expect(entry.model == null);
+}
+
+test "SessionLineType detection for all types" {
+    try std.testing.expectEqual(SessionLineType.session, detectLineType("{\"type\":\"session\"}").?);
+    try std.testing.expectEqual(SessionLineType.message, detectLineType("{\"type\":\"message\"}").?);
+    try std.testing.expectEqual(SessionLineType.compaction, detectLineType("{\"type\":\"compaction\"}").?);
+    try std.testing.expectEqual(SessionLineType.usage, detectLineType("{\"type\":\"usage\"}").?);
+}
+
+test "SessionLineType detection unknown type returns null" {
+    try std.testing.expect(detectLineType("{\"type\":\"unknown_thing\"}") == null);
+    try std.testing.expect(detectLineType("not json at all") == null);
+    try std.testing.expect(detectLineType("") == null);
+}
+
+test "SessionUsage totalTokens calculation" {
+    const usage = SessionUsage{ .input_tokens = 100, .output_tokens = 50 };
+    try std.testing.expectEqual(@as(u64, 150), usage.totalTokens());
+}
+
+test "SessionUsage zero tokens default" {
+    const usage = SessionUsage{};
+    try std.testing.expectEqual(@as(u64, 0), usage.totalTokens());
+}

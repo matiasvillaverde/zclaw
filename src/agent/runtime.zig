@@ -1975,3 +1975,319 @@ test "buildMessagesJson tool_result Anthropic" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "tc_1") != null);
 }
+
+// --- buildMessagesJson Gemini tests ---
+
+test "buildMessagesJson Gemini user message" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]HistoryMessage{
+        .{ .role = .user, .content = "Hello Gemini" },
+    };
+    const json = try buildMessagesJson(allocator, &msgs, .google_genai);
+    defer allocator.free(json);
+
+    try std.testing.expect(json[0] == '[');
+    try std.testing.expect(json[json.len - 1] == ']');
+    try std.testing.expect(std.mem.indexOf(u8, json, "Hello Gemini") != null);
+}
+
+test "buildMessagesJson Gemini assistant message" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]HistoryMessage{
+        .{ .role = .assistant, .content = "Model response" },
+    };
+    const json = try buildMessagesJson(allocator, &msgs, .google_genai);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "Model response") != null);
+}
+
+test "buildMessagesJson Gemini multi-role conversation" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]HistoryMessage{
+        .{ .role = .user, .content = "What is 2+2?" },
+        .{ .role = .assistant, .content = "4" },
+        .{ .role = .user, .content = "And 3+3?" },
+    };
+    const json = try buildMessagesJson(allocator, &msgs, .google_genai);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "What is 2+2?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "And 3+3?") != null);
+}
+
+test "buildMessagesJson Gemini tool_result sent as user" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]HistoryMessage{
+        .{ .role = .tool_result, .content = "tool output", .tool_call_id = "tc1" },
+    };
+    const json = try buildMessagesJson(allocator, &msgs, .google_genai);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "tool output") != null);
+}
+
+// --- Event callback tracking tests ---
+
+test "AgentRuntime event callback tracks start and complete events" {
+    const allocator = std.testing.allocator;
+    const S = struct {
+        var event_count: u32 = 0;
+        var last_event_type: RunEventType = .start;
+        fn cb(event: RunEvent) void {
+            event_count += 1;
+            last_event_type = event.event_type;
+        }
+    };
+    S.event_count = 0;
+
+    var rt = AgentRuntime.init(allocator, .{ .agent_id = "cb-test" });
+    defer rt.deinit();
+    rt.event_callback = S.cb;
+
+    rt.start();
+    try std.testing.expectEqual(@as(u32, 1), S.event_count);
+    try std.testing.expectEqual(RunEventType.start, S.last_event_type);
+
+    rt.complete("done");
+    try std.testing.expectEqual(@as(u32, 2), S.event_count);
+    try std.testing.expectEqual(RunEventType.complete, S.last_event_type);
+}
+
+test "AgentRuntime event callback tracks abort event" {
+    const allocator = std.testing.allocator;
+    const S = struct {
+        var got_abort: bool = false;
+        fn cb(event: RunEvent) void {
+            if (event.event_type == .abort) got_abort = true;
+        }
+    };
+    S.got_abort = false;
+
+    var rt = AgentRuntime.init(allocator, .{});
+    defer rt.deinit();
+    rt.event_callback = S.cb;
+
+    rt.start();
+    rt.abort();
+    try std.testing.expect(S.got_abort);
+}
+
+test "AgentRuntime event callback tracks max_turns error" {
+    const allocator = std.testing.allocator;
+    const S = struct {
+        var got_error: bool = false;
+        fn cb(event: RunEvent) void {
+            if (event.event_type == .@"error") got_error = true;
+        }
+    };
+    S.got_error = false;
+
+    var rt = AgentRuntime.init(allocator, .{ .max_turns = 1 });
+    defer rt.deinit();
+    rt.event_callback = S.cb;
+
+    rt.start();
+    _ = rt.nextTurn(); // turn 1
+    _ = rt.nextTurn(); // exceeds — should emit error event
+    try std.testing.expect(S.got_error);
+}
+
+// --- Token accumulation across multiple inferences ---
+
+test "AgentRuntime token accumulation across two inference calls" {
+    const allocator = std.testing.allocator;
+
+    const sse1 =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2}}\n\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"t\"}}\n\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n";
+
+    const sse2 =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20}}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Done\"}}\n\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n";
+
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = sse1 },
+        .{ .status = 200, .body = sse2 },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(allocator, mock.transport());
+    var dispatch = ProviderDispatch.initAnthropic(&http, "sk-test", null);
+
+    var rt = AgentRuntime.init(allocator, .{ .api_key = "sk-test", .max_turns = 5 });
+    defer rt.deinit();
+
+    try rt.addUserMessage("hello");
+    rt.start();
+
+    // Turn 1
+    _ = rt.nextTurn();
+    var r1 = try rt.runInference(&dispatch);
+    defer freeRunResult(allocator, &r1);
+    try std.testing.expectEqual(@as(u64, 10), rt.total_input_tokens);
+    try std.testing.expectEqual(@as(u64, 2), rt.total_output_tokens);
+
+    // Submit tool result and turn 2
+    rt.state = .waiting_tool;
+    const trs = [_]ToolResultInput{.{ .tool_call_id = "c1", .content = "ok" }};
+    try rt.submitToolResults(&trs);
+    _ = rt.nextTurn();
+    var r2 = try rt.runInference(&dispatch);
+    defer freeRunResult(allocator, &r2);
+
+    // Tokens should accumulate
+    try std.testing.expectEqual(@as(u64, 30), rt.total_input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), rt.total_output_tokens);
+}
+
+// --- submitToolResults with multiple results ---
+
+test "AgentRuntime submitToolResults with three results" {
+    const allocator = std.testing.allocator;
+    var rt = AgentRuntime.init(allocator, .{});
+    defer rt.deinit();
+
+    rt.start();
+    rt.state = .waiting_tool;
+
+    const results = [_]ToolResultInput{
+        .{ .tool_call_id = "c1", .content = "output1" },
+        .{ .tool_call_id = "c2", .content = "output2" },
+        .{ .tool_call_id = "c3", .content = "output3" },
+    };
+    try rt.submitToolResults(&results);
+
+    try std.testing.expectEqual(@as(usize, 3), rt.messageCount());
+    try std.testing.expectEqual(Role.tool_result, rt.history.items[0].role);
+    try std.testing.expectEqual(Role.tool_result, rt.history.items[2].role);
+    try std.testing.expectEqualStrings("output3", rt.history.items[2].content);
+    try std.testing.expectEqual(RunState.running, rt.state);
+}
+
+// --- runLoop with OpenAI provider ---
+
+test "runLoop OpenAI text-only response" {
+    const allocator = std.testing.allocator;
+    const mock_sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"OpenAI response\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = mock_sse },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(allocator, mock.transport());
+    var dispatch = ProviderDispatch.initOpenAI(&http, "sk-test", null);
+
+    var rt = AgentRuntime.init(allocator, .{
+        .model = "gpt-4",
+        .api_key = "sk-test",
+    });
+    defer rt.deinit();
+    try rt.addUserMessage("Hello");
+
+    var result = try runLoop(allocator, &rt, &dispatch, null);
+    defer freeRunResult(allocator, &result);
+
+    try std.testing.expectEqualStrings("OpenAI response", result.text.?);
+    try std.testing.expectEqual(RunState.completed, rt.state);
+}
+
+// --- runLoop max_turns exceeded ---
+
+test "runLoop max_turns exceeded returns last result" {
+    const allocator = std.testing.allocator;
+
+    // Every turn returns a tool call, consuming the single allowed turn
+    const tool_sse =
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"t\"}}\n\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n";
+
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = tool_sse },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(allocator, mock.transport());
+    var dispatch = ProviderDispatch.initAnthropic(&http, "sk-test", null);
+
+    var registry = tool_registry.ToolRegistry.init(allocator);
+    defer registry.deinit();
+
+    const handler = struct {
+        fn handle(_: []const u8, buf: []u8) tool_registry.ToolResult {
+            const msg = "ok";
+            @memcpy(buf[0..msg.len], msg);
+            return .{ .success = true, .output = buf[0..msg.len] };
+        }
+    }.handle;
+    try registry.register(.{ .name = "t" }, handler);
+
+    var rt = AgentRuntime.init(allocator, .{
+        .api_key = "sk-test",
+        .max_turns = 1,
+    });
+    defer rt.deinit();
+    try rt.addUserMessage("test");
+
+    var result = try runLoop(allocator, &rt, &dispatch, &registry);
+    defer freeRunResult(allocator, &result);
+
+    // Should return whatever the last result was (tool call result)
+    try std.testing.expect(result.hasToolCalls());
+}
+
+// --- ProviderDispatch Gemini ---
+
+test "ProviderDispatch.initGemini" {
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    const dispatch = ProviderDispatch.initGemini(&http, "AIzaSy-test", null);
+    try std.testing.expectEqual(types.ApiType.google_genai, dispatch.api_type);
+    try std.testing.expect(dispatch.gemini_client != null);
+    try std.testing.expect(dispatch.anthropic_client == null);
+    try std.testing.expect(dispatch.openai_client == null);
+}
+
+test "ProviderDispatch.initGemini custom base_url" {
+    const responses = [_]http_client.MockTransport.MockResponse{};
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    const dispatch = ProviderDispatch.initGemini(&http, "key", "https://custom.gemini.api");
+    try std.testing.expectEqualStrings("https://custom.gemini.api", dispatch.gemini_client.?.base_url);
+}
+
+test "ProviderDispatch.sendMessage Gemini" {
+    const mock_response = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Gemini says hi\"}]}}]}";
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = mock_response },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var http = http_client.HttpClient.init(std.testing.allocator, mock.transport());
+    var dispatch = ProviderDispatch.initGemini(&http, "key", null);
+
+    var resp = try dispatch.sendMessage(.{
+        .model = "gemini-2.0-flash",
+        .api_key = "key",
+        .stream = false,
+    }, "[]", null);
+    defer resp.deinit();
+
+    try std.testing.expect(resp.isSuccess());
+    try std.testing.expectEqual(types.ApiType.google_genai, resp.api_type);
+}
