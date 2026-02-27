@@ -234,6 +234,113 @@ pub fn freeResults(allocator: std.mem.Allocator, results: []search.SearchResult)
     allocator.free(results);
 }
 
+// --- Persistent Memory Manager ---
+//
+// Wraps SqliteStorage to provide the same interface as MemoryManager
+// but with SQLite-backed persistence. Optionally generates embeddings.
+
+const storage_mod = @import("storage.zig");
+const embeddings = @import("embeddings.zig");
+
+pub const PersistentMemoryManager = struct {
+    allocator: std.mem.Allocator,
+    storage: *storage_mod.SqliteStorage,
+    embedding_client: ?*embeddings.EmbeddingClient,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        storage: *storage_mod.SqliteStorage,
+        embedding_client: ?*embeddings.EmbeddingClient,
+    ) PersistentMemoryManager {
+        return .{
+            .allocator = allocator,
+            .storage = storage,
+            .embedding_client = embedding_client,
+        };
+    }
+
+    /// Index a document: chunk content, store in SQLite, optionally embed.
+    pub fn indexDocument(self: *PersistentMemoryManager, path: []const u8, content: []const u8) !u64 {
+        // Remove existing document at same path
+        try self.storage.deleteByPath(path);
+
+        // Chunk the content
+        const text_chunks = try chunker.chunkText(
+            self.allocator,
+            content,
+            chunker.DEFAULT_CHUNK_SIZE,
+            chunker.DEFAULT_OVERLAP,
+        );
+        defer chunker.freeChunks(self.allocator, text_chunks);
+
+        // Store document in SQLite
+        const content_hash = std.hash.Wyhash.hash(0, content);
+        const doc_id = try self.storage.insertDocument(path, content_hash, @intCast(text_chunks.len));
+
+        // Store chunks
+        for (text_chunks) |chunk| {
+            try self.storage.insertChunk(doc_id, chunk.text, chunk.index);
+        }
+
+        return @intCast(@as(u64, @bitCast(doc_id)));
+    }
+
+    /// Search chunks using SQLite LIKE query, return as SearchResults.
+    pub fn keywordSearch(
+        self: *PersistentMemoryManager,
+        allocator: std.mem.Allocator,
+        query: []const u8,
+        max_results: u32,
+    ) ![]search.SearchResult {
+        const rows = try self.storage.searchChunks(allocator, query, max_results);
+        if (rows.len == 0) return &.{};
+        defer storage_mod.freeSearchRows(allocator, rows);
+
+        // Convert SearchRows to SearchResults
+        var results = std.ArrayListUnmanaged(search.SearchResult){};
+        for (rows) |row| {
+            const score = computeTextScore(row.text, query);
+            try results.append(allocator, .{
+                .chunk_id = @intCast(@as(u64, @bitCast(row.chunk_id))),
+                .text = try allocator.dupe(u8, row.text),
+                .score = if (score > 0.0) score else 0.5, // SQLite LIKE matched, give base score
+                .text_score = score,
+                .source_file = if (row.source_file) |sf| try allocator.dupe(u8, sf) else null,
+                .chunk_index = row.chunk_index,
+            });
+        }
+
+        return results.toOwnedSlice(allocator);
+    }
+
+    /// Get document count from SQLite.
+    pub fn documentCount(self: *PersistentMemoryManager) usize {
+        const count = self.storage.documentCount() catch return 0;
+        return @intCast(@as(u64, @bitCast(count)));
+    }
+
+    /// Get chunk count from SQLite.
+    pub fn chunkCount(self: *PersistentMemoryManager) usize {
+        const count = self.storage.chunkCount() catch return 0;
+        return @intCast(@as(u64, @bitCast(count)));
+    }
+
+    /// Check if a document needs reindexing.
+    pub fn needsReindex(self: *PersistentMemoryManager, path: []const u8, content: []const u8) bool {
+        const content_hash = std.hash.Wyhash.hash(0, content);
+        return self.storage.needsReindex(path, content_hash) catch true;
+    }
+};
+
+/// Free persistent search results (text and source_file are owned).
+pub fn freePersistentResults(allocator: std.mem.Allocator, results: []search.SearchResult) void {
+    for (results) |result| {
+        allocator.free(result.text);
+        if (result.source_file) |sf| allocator.free(sf);
+    }
+    allocator.free(results);
+}
+
 // --- Tests ---
 
 test "MemoryManager init and deinit" {
@@ -473,4 +580,133 @@ test "MemoryManager keywordSearch results have source file" {
 
     try std.testing.expect(results.len >= 1);
     try std.testing.expectEqualStrings("source.md", results[0].source_file.?);
+}
+
+// --- PersistentMemoryManager Tests ---
+
+test "PersistentMemoryManager init" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    try std.testing.expectEqual(@as(usize, 0), mgr.documentCount());
+    try std.testing.expectEqual(@as(usize, 0), mgr.chunkCount());
+}
+
+test "PersistentMemoryManager indexDocument" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    const doc_id = try mgr.indexDocument("test.md", "Hello world. This is a test document.");
+    try std.testing.expect(doc_id > 0);
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+    try std.testing.expect(mgr.chunkCount() >= 1);
+}
+
+test "PersistentMemoryManager indexDocument replaces existing" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    _ = try mgr.indexDocument("test.md", "Version 1");
+    _ = try mgr.indexDocument("test.md", "Version 2");
+    try std.testing.expectEqual(@as(usize, 1), mgr.documentCount());
+}
+
+test "PersistentMemoryManager keywordSearch" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    _ = try mgr.indexDocument("readme.md", "Zig is a systems programming language.");
+    _ = try mgr.indexDocument("notes.md", "TypeScript is popular for web development.");
+
+    const results = try mgr.keywordSearch(allocator, "Zig", 10);
+    defer freePersistentResults(allocator, results);
+
+    try std.testing.expect(results.len >= 1);
+    try std.testing.expect(results[0].score > 0.0);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].text, "Zig") != null);
+}
+
+test "PersistentMemoryManager keywordSearch no match" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    _ = try mgr.indexDocument("test.md", "Hello world");
+
+    const results = try mgr.keywordSearch(allocator, "nonexistent", 10);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "PersistentMemoryManager needsReindex" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+
+    // Not indexed yet
+    try std.testing.expect(mgr.needsReindex("test.md", "content"));
+
+    _ = try mgr.indexDocument("test.md", "content");
+
+    // Same content
+    try std.testing.expect(!mgr.needsReindex("test.md", "content"));
+
+    // Changed content
+    try std.testing.expect(mgr.needsReindex("test.md", "new content"));
+}
+
+test "PersistentMemoryManager search has source file" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    _ = try mgr.indexDocument("source.md", "Zig is awesome");
+
+    const results = try mgr.keywordSearch(allocator, "Zig", 5);
+    defer freePersistentResults(allocator, results);
+
+    try std.testing.expect(results.len >= 1);
+    try std.testing.expectEqualStrings("source.md", results[0].source_file.?);
+}
+
+test "PersistentMemoryManager multiple documents" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    var mgr = PersistentMemoryManager.init(allocator, &storage, null);
+    _ = try mgr.indexDocument("a.md", "Content A");
+    _ = try mgr.indexDocument("b.md", "Content B");
+    _ = try mgr.indexDocument("c.md", "Content C");
+
+    try std.testing.expectEqual(@as(usize, 3), mgr.documentCount());
+}
+
+test "PersistentMemoryManager persists across lookups" {
+    const allocator = std.testing.allocator;
+    var storage = try storage_mod.SqliteStorage.openMemory();
+    defer storage.close();
+
+    // Index with one manager instance
+    var mgr1 = PersistentMemoryManager.init(allocator, &storage, null);
+    _ = try mgr1.indexDocument("persistent.md", "This data should persist in SQLite.");
+
+    // Create a second manager pointing to same storage
+    var mgr2 = PersistentMemoryManager.init(allocator, &storage, null);
+    try std.testing.expectEqual(@as(usize, 1), mgr2.documentCount());
+
+    const results = try mgr2.keywordSearch(allocator, "persist", 10);
+    defer freePersistentResults(allocator, results);
+    try std.testing.expect(results.len >= 1);
 }
