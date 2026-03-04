@@ -70,6 +70,10 @@ Telegram access controls:
   - optionally enables generic file/shell builtins
 - `ZCLAW_TELEGRAM_MAX_TURNS` (default `6`)
   - must be greater than `1` for tool round-trips
+- `ZCLAW_TELEGRAM_DRAFT_STREAMING` (default `true`)
+  - enables Telegram `sendMessageDraft` heartbeat updates while the model is generating
+- `ZCLAW_TELEGRAM_DRAFT_INTERVAL_MS` (default `900`, clamped `300..5000`)
+  - cadence for draft updates
 
 Camper tool bridge (when enabled):
 - `camper_snapshot`, `camper_video`, `camper_audio`

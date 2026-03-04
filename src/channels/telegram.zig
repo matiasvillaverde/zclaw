@@ -48,6 +48,32 @@ pub fn buildSendMessageBody(buf: []u8, chat_id: []const u8, text: []const u8, pa
     return fbs.getWritten();
 }
 
+/// Build request body for sendMessageDraft.
+pub fn buildSendMessageDraftBody(
+    buf: []u8,
+    chat_id: []const u8,
+    draft_id: i64,
+    text: []const u8,
+    parse_mode: ?[]const u8,
+) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const writer = fbs.writer();
+    try writer.writeAll("{\"chat_id\":\"");
+    try writer.writeAll(chat_id);
+    try writer.writeAll("\",\"draft_id\":");
+    try std.fmt.format(writer, "{d}", .{draft_id});
+    try writer.writeAll(",\"text\":\"");
+    try writeJsonEscaped(writer, text);
+    try writer.writeAll("\"");
+    if (parse_mode) |pm| {
+        try writer.writeAll(",\"parse_mode\":\"");
+        try writer.writeAll(pm);
+        try writer.writeAll("\"");
+    }
+    try writer.writeAll("}");
+    return fbs.getWritten();
+}
+
 pub fn buildGetUpdatesBody(buf: []u8, offset: ?i64, timeout: u32) ![]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const writer = fbs.writer();
@@ -200,6 +226,20 @@ test "buildSendMessageBody with parse_mode" {
     var buf: [4096]u8 = undefined;
     const body = try buildSendMessageBody(&buf, "12345", "**bold**", "Markdown");
     try std.testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\":\"Markdown\"") != null);
+}
+
+test "buildSendMessageDraftBody" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageDraftBody(&buf, "515081572", 1, "partial reply", null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"chat_id\":\"515081572\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"draft_id\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"partial reply\"") != null);
+}
+
+test "buildSendMessageDraftBody with parse_mode" {
+    var buf: [4096]u8 = undefined;
+    const body = try buildSendMessageDraftBody(&buf, "515081572", 2, "<b>partial</b>", "HTML");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\":\"HTML\"") != null);
 }
 
 test "buildGetUpdatesBody" {
@@ -357,6 +397,32 @@ pub const TelegramChannel = struct {
 
         var body_buf: [4096]u8 = undefined;
         const body = try buildSendMessageBody(&body_buf, msg.chat_id, msg.content, msg.parse_mode);
+
+        const headers = [_]http_client.Header{
+            .{ .name = "content-type", .value = "application/json" },
+        };
+
+        var resp = try self.client.post(url, &headers, body);
+        defer resp.deinit();
+
+        if (resp.status != 200) {
+            return error.SendFailed;
+        }
+    }
+
+    /// Send an ephemeral draft message for streaming UX.
+    pub fn sendMessageDraft(
+        self: *TelegramChannel,
+        chat_id: []const u8,
+        draft_id: i64,
+        text: []const u8,
+        parse_mode: ?[]const u8,
+    ) !void {
+        var url_buf: [512]u8 = undefined;
+        const url = try buildApiUrl(&url_buf, self.config, "sendMessageDraft");
+
+        var body_buf: [4096]u8 = undefined;
+        const body = try buildSendMessageDraftBody(&body_buf, chat_id, draft_id, text, parse_mode);
 
         const headers = [_]http_client.Header{
             .{ .name = "content-type", .value = "application/json" },
@@ -598,6 +664,23 @@ test "TelegramChannel sendText failure" {
     try std.testing.expectError(TelegramChannel.SendError.SendFailed, result);
 }
 
+test "TelegramChannel sendMessageDraft" {
+    const allocator = std.testing.allocator;
+    const responses = [_]http_client.MockTransport.MockResponse{
+        .{ .status = 200, .body = "{\"ok\":true,\"result\":true}" },
+    };
+    var mock = http_client.MockTransport.init(&responses);
+    var client = http_client.HttpClient.init(allocator, mock.transport());
+    var channel = TelegramChannel.init(allocator, .{ .bot_token = "tok" }, &client);
+
+    try channel.sendMessageDraft("515081572", 777, "stream update", null);
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_url.?, "sendMessageDraft") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "\"chat_id\":\"515081572\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "\"draft_id\":777") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "\"text\":\"stream update\"") != null);
+}
+
 test "TelegramChannel pollUpdates with message" {
     const allocator = std.testing.allocator;
     const update_json = "{\"ok\":true,\"result\":[{\"update_id\":100,\"message\":{\"text\":\"hello bot\",\"chat\":{\"id\":999,\"type\":\"private\"},\"from\":{\"id\":42,\"first_name\":\"User\"}}}]}";
@@ -721,6 +804,12 @@ test "buildApiUrl for editMessageText" {
     var buf: [512]u8 = undefined;
     const url = try buildApiUrl(&buf, .{ .bot_token = "tok" }, "editMessageText");
     try std.testing.expectEqualStrings("https://api.telegram.org/bottok/editMessageText", url);
+}
+
+test "buildApiUrl for sendMessageDraft" {
+    var buf: [512]u8 = undefined;
+    const url = try buildApiUrl(&buf, .{ .bot_token = "tok" }, "sendMessageDraft");
+    try std.testing.expectEqualStrings("https://api.telegram.org/bottok/sendMessageDraft", url);
 }
 
 test "buildApiUrl for setWebhook" {
