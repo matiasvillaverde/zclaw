@@ -412,6 +412,7 @@ const DEFAULT_TELEGRAM_SYSTEM_PROMPT: [:0]const u8 =
     \\Be concise, mention concrete outputs and file paths, and avoid unsafe shell instructions.
 ;
 const DEFAULT_TELEGRAM_DRAFT_INTERVAL_MS: u32 = 900;
+const TELEGRAM_DRAFT_MAX_CONSECUTIVE_ERRORS: u32 = 3;
 const TELEGRAM_DRAFT_MESSAGES = [_][]const u8{
     "zclaw is thinking.",
     "zclaw is thinking..",
@@ -446,12 +447,22 @@ fn telegramDraftThreadFn(
     var channel = telegram.TelegramChannel.init(std.heap.page_allocator, .{ .bot_token = bot_token }, &client);
 
     var idx: usize = 0;
+    var consecutive_errors: u32 = 0;
     while (!stop_flag.load(.acquire)) {
         const draft = TELEGRAM_DRAFT_MESSAGES[idx % TELEGRAM_DRAFT_MESSAGES.len];
         channel.sendMessageDraft(chat_id, draft_id, draft, null) catch |err| {
-            std.debug.print("telegram: sendMessageDraft failed: {}\n", .{err});
-            return;
+            consecutive_errors += 1;
+            std.debug.print("telegram: sendMessageDraft failed (count={d}): {}\n", .{ consecutive_errors, err });
+            if (consecutive_errors >= TELEGRAM_DRAFT_MAX_CONSECUTIVE_ERRORS) {
+                return;
+            }
+            // Backoff on transient draft failures but keep main response path alive.
+            const factor = @as(u32, 1) << @intCast(@min(consecutive_errors, 3));
+            const backoff_ms = clampU32(interval_ms * factor, interval_ms, 5000);
+            std.Thread.sleep(@as(u64, backoff_ms) * std.time.ns_per_ms);
+            continue;
         };
+        consecutive_errors = 0;
         idx += 1;
         std.Thread.sleep(@as(u64, interval_ms) * std.time.ns_per_ms);
     }

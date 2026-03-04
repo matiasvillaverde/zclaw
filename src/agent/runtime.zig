@@ -282,7 +282,7 @@ pub const ProviderResult = struct {
                 switch (evt.event_type) {
                     .text_delta => {
                         if (evt.text) |t| {
-                            try text_parts.appendSlice(allocator, t);
+                            try appendJsonUnescaped(&text_parts, allocator, t);
                         }
                     },
                     .tool_call_start => {
@@ -298,12 +298,12 @@ pub const ProviderResult = struct {
                         current_tool_id = if (evt.tool_call_id) |id| try allocator.dupe(u8, id) else null;
                         current_tool_name = if (evt.tool_name) |name| try allocator.dupe(u8, name) else null;
                         if (evt.tool_input_delta) |delta| {
-                            try current_tool_input.appendSlice(allocator, delta);
+                            try appendJsonUnescaped(&current_tool_input, allocator, delta);
                         }
                     },
                     .tool_call_delta => {
                         if (evt.tool_input_delta) |delta| {
-                            try current_tool_input.appendSlice(allocator, delta);
+                            try appendJsonUnescaped(&current_tool_input, allocator, delta);
                         }
                     },
                     .tool_call_end => {},
@@ -347,6 +347,122 @@ pub const ProviderResult = struct {
         };
     }
 };
+
+fn hexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => 10 + (c - 'a'),
+        'A'...'F' => 10 + (c - 'A'),
+        else => null,
+    };
+}
+
+fn parseHex4(s: []const u8, start: usize) ?u16 {
+    if (start + 4 > s.len) return null;
+    const h0 = hexNibble(s[start]) orelse return null;
+    const h1 = hexNibble(s[start + 1]) orelse return null;
+    const h2 = hexNibble(s[start + 2]) orelse return null;
+    const h3 = hexNibble(s[start + 3]) orelse return null;
+    return (@as(u16, h0) << 12) | (@as(u16, h1) << 8) | (@as(u16, h2) << 4) | @as(u16, h3);
+}
+
+fn appendCodepointUtf8(dst: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &buf) catch {
+        try dst.appendSlice(allocator, "\xEF\xBF\xBD");
+        return;
+    };
+    try dst.appendSlice(allocator, buf[0..n]);
+}
+
+/// Unescape JSON string payloads from SSE deltas.
+/// This normalizes text like "\\n\\n" into actual newlines before rendering.
+fn appendJsonUnescaped(dst: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] != '\\') {
+            try dst.append(allocator, s[i]);
+            i += 1;
+            continue;
+        }
+
+        if (i + 1 >= s.len) {
+            try dst.append(allocator, '\\');
+            break;
+        }
+
+        const esc = s[i + 1];
+        switch (esc) {
+            '"' => {
+                try dst.append(allocator, '"');
+                i += 2;
+            },
+            '\\' => {
+                try dst.append(allocator, '\\');
+                i += 2;
+            },
+            '/' => {
+                try dst.append(allocator, '/');
+                i += 2;
+            },
+            'b' => {
+                try dst.append(allocator, 0x08);
+                i += 2;
+            },
+            'f' => {
+                try dst.append(allocator, 0x0c);
+                i += 2;
+            },
+            'n' => {
+                try dst.append(allocator, '\n');
+                i += 2;
+            },
+            'r' => {
+                try dst.append(allocator, '\r');
+                i += 2;
+            },
+            't' => {
+                try dst.append(allocator, '\t');
+                i += 2;
+            },
+            'u' => {
+                const first = parseHex4(s, i + 2) orelse {
+                    try dst.append(allocator, '\\');
+                    i += 1;
+                    continue;
+                };
+
+                // Handle surrogate pairs when present.
+                if (first >= 0xD800 and first <= 0xDBFF and
+                    i + 12 <= s.len and s[i + 6] == '\\' and s[i + 7] == 'u')
+                {
+                    if (parseHex4(s, i + 8)) |second| {
+                        if (second >= 0xDC00 and second <= 0xDFFF) {
+                            const high: u32 = first - 0xD800;
+                            const low: u32 = second - 0xDC00;
+                            const cp: u21 = @intCast(0x10000 + ((high << 10) | low));
+                            try appendCodepointUtf8(dst, allocator, cp);
+                            i += 12;
+                            continue;
+                        }
+                    }
+                }
+
+                if (first >= 0xD800 and first <= 0xDFFF) {
+                    try dst.appendSlice(allocator, "\xEF\xBF\xBD");
+                } else {
+                    try appendCodepointUtf8(dst, allocator, @intCast(first));
+                }
+                i += 6;
+            },
+            else => {
+                // Unknown escape: preserve escaped char as-is.
+                try dst.append(allocator, esc);
+                i += 2;
+            },
+        }
+    }
+}
 
 /// Build messages JSON array from history.
 /// Returns allocated string in the format: [{"role":"user","content":"..."}, ...]
@@ -1203,6 +1319,26 @@ test "ProviderResult.parseRunResult text only (OpenAI)" {
     try std.testing.expectEqual(types.StopReason.end_turn, result.stop_reason.?);
 }
 
+test "ProviderResult.parseRunResult unescapes escaped newlines in text" {
+    const allocator = std.testing.allocator;
+    const body =
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Line 1\\n\\nLine 2\"}}\n\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+
+    const result_obj = ProviderResult{
+        .status = 200,
+        .body = body,
+        .api_type = .anthropic_messages,
+    };
+
+    var result = try result_obj.parseRunResult(allocator);
+    defer freeRunResult(allocator, &result);
+
+    try std.testing.expectEqualStrings("Line 1\n\nLine 2", result.text.?);
+}
+
 test "ProviderResult.parseRunResult with tool calls (Anthropic)" {
     const allocator = std.testing.allocator;
     const body =
@@ -1226,6 +1362,7 @@ test "ProviderResult.parseRunResult with tool calls (Anthropic)" {
     try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
     try std.testing.expectEqualStrings("call_abc", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"cmd\":\"ls\"}", result.tool_calls[0].input_json);
     try std.testing.expectEqual(types.StopReason.tool_use, result.stop_reason.?);
 }
 
@@ -1250,6 +1387,26 @@ test "ProviderResult.parseRunResult with tool calls (OpenAI)" {
     try std.testing.expectEqualStrings("call_xyz", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("read", result.tool_calls[0].name);
     try std.testing.expectEqual(types.StopReason.tool_use, result.stop_reason.?);
+}
+
+test "ProviderResult.parseRunResult unescapes OpenAI tool arguments" {
+    const allocator = std.testing.allocator;
+    const body =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_a1\",\"type\":\"function\",\"function\":{\"name\":\"camper_snapshot\",\"arguments\":\"{\\\"send_telegram\\\":true,\\\"note\\\":\\\"a\\n b\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+
+    const result_obj = ProviderResult{
+        .status = 200,
+        .body = body,
+        .api_type = .openai_completions,
+    };
+
+    var result = try result_obj.parseRunResult(allocator);
+    defer freeRunResult(allocator, &result);
+
+    try std.testing.expect(result.hasToolCalls());
+    try std.testing.expectEqualStrings("{\"send_telegram\":true,\"note\":\"a\n b\"}", result.tool_calls[0].input_json);
 }
 
 // --- buildMessagesJson Tests ---
@@ -1339,6 +1496,24 @@ test "buildMessagesJson empty" {
     defer allocator.free(json);
 
     try std.testing.expectEqualStrings("[]", json);
+}
+
+test "appendJsonUnescaped handles common escapes" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+
+    try appendJsonUnescaped(&out, allocator, "a\\n\\tb\\\"c\\\\d");
+    try std.testing.expectEqualStrings("a\n\tb\"c\\d", out.items);
+}
+
+test "appendJsonUnescaped handles unicode escape" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+
+    try appendJsonUnescaped(&out, allocator, "caf\\u00E9");
+    try std.testing.expectEqualStrings("caf\xC3\xA9", out.items);
 }
 
 // --- RunResult Tests ---
