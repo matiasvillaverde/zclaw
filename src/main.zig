@@ -411,6 +411,51 @@ const DEFAULT_TELEGRAM_SYSTEM_PROMPT: [:0]const u8 =
     \\When a user asks to share/send media, set send_telegram=true.
     \\Be concise, mention concrete outputs and file paths, and avoid unsafe shell instructions.
 ;
+const DEFAULT_TELEGRAM_DRAFT_INTERVAL_MS: u32 = 900;
+const TELEGRAM_DRAFT_MESSAGES = [_][]const u8{
+    "zclaw is thinking.",
+    "zclaw is thinking..",
+    "zclaw is thinking...",
+};
+
+fn clampU32(value: u32, min: u32, max: u32) u32 {
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+}
+
+fn startTelegramDraftThread(
+    bot_token: []const u8,
+    chat_id: []const u8,
+    draft_id: i64,
+    stop_flag: *std.atomic.Value(bool),
+    interval_ms: u32,
+) !std.Thread {
+    return std.Thread.spawn(.{}, telegramDraftThreadFn, .{ bot_token, chat_id, draft_id, stop_flag, interval_ms });
+}
+
+fn telegramDraftThreadFn(
+    bot_token: []const u8,
+    chat_id: []const u8,
+    draft_id: i64,
+    stop_flag: *std.atomic.Value(bool),
+    interval_ms: u32,
+) void {
+    var transport_instance = http_client.StdHttpTransport.init(std.heap.page_allocator);
+    var client = http_client.HttpClient.init(std.heap.page_allocator, transport_instance.transport());
+    var channel = telegram.TelegramChannel.init(std.heap.page_allocator, .{ .bot_token = bot_token }, &client);
+
+    var idx: usize = 0;
+    while (!stop_flag.load(.acquire)) {
+        const draft = TELEGRAM_DRAFT_MESSAGES[idx % TELEGRAM_DRAFT_MESSAGES.len];
+        channel.sendMessageDraft(chat_id, draft_id, draft, null) catch |err| {
+            std.debug.print("telegram: sendMessageDraft failed: {}\n", .{err});
+            return;
+        };
+        idx += 1;
+        std.Thread.sleep(@as(u64, interval_ms) * std.time.ns_per_ms);
+    }
+}
 
 fn agentMessageHandler(chat_id: []const u8, sender_id: []const u8, text: []const u8) ?[]const u8 {
     std.debug.print("telegram: incoming chat_id={s} sender_id={s}\n", .{ chat_id, sender_id });
@@ -459,6 +504,16 @@ fn agentMessageHandler(chat_id: []const u8, sender_id: []const u8, text: []const
         "OPENCLAW_TELEGRAM_MAX_TURNS",
         6,
     );
+    const draft_stream_enabled = readBoolEnv(
+        "ZCLAW_TELEGRAM_DRAFT_STREAMING",
+        "OPENCLAW_TELEGRAM_DRAFT_STREAMING",
+        true,
+    );
+    const draft_interval_ms = clampU32(readU32Env(
+        "ZCLAW_TELEGRAM_DRAFT_INTERVAL_MS",
+        "OPENCLAW_TELEGRAM_DRAFT_INTERVAL_MS",
+        DEFAULT_TELEGRAM_DRAFT_INTERVAL_MS,
+    ), 300, 5000);
 
     // Use a scoped arena so each message handler run gets enough memory and
     // is fully reclaimed before returning.
@@ -522,6 +577,28 @@ fn agentMessageHandler(chat_id: []const u8, sender_id: []const u8, text: []const
         std.debug.print("telegram: addUserMessage failed: {}\n", .{err});
         return null;
     };
+
+    const bot_token = std.posix.getenv("TELEGRAM_BOT_TOKEN");
+    const can_stream_draft = draft_stream_enabled and
+        bot_token != null and
+        std.mem.eql(u8, chat_id, sender_id); // private chats only
+
+    var draft_stop = std.atomic.Value(bool).init(false);
+    var draft_thread: ?std.Thread = null;
+    if (can_stream_draft) {
+        const now_ms = std.time.milliTimestamp();
+        const draft_id: i64 = if (now_ms > 0) now_ms else 1;
+        draft_thread = startTelegramDraftThread(bot_token.?, chat_id, draft_id, &draft_stop, draft_interval_ms) catch |err| blk: {
+            std.debug.print("telegram: failed to start draft thread: {}\n", .{err});
+            break :blk null;
+        };
+    }
+    defer {
+        if (draft_thread) |thread| {
+            draft_stop.store(true, .release);
+            thread.join();
+        }
+    }
 
     const reg_ptr: ?*const tool_registry.ToolRegistry = if (tools_enabled and tools_json != null) &reg else null;
 
