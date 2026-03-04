@@ -11,6 +11,9 @@ const discord = @import("channels/discord.zig");
 const slack = @import("channels/slack.zig");
 const http_client = @import("infra/http_client.zig");
 const runtime = @import("agent/runtime.zig");
+const tool_registry = @import("tools/registry.zig");
+const camper_tools = @import("tools/camper.zig");
+const builtin_tools = @import("tools/builtins.zig");
 
 pub const PORT: u16 = 18789;
 const TEST_PORT: u16 = 19789;
@@ -400,55 +403,171 @@ fn makeAgentHandler(allocator: std.mem.Allocator) telegram.TelegramChannel.Messa
 
 /// Static response buffer for the agent handler (used by the polling thread).
 var agent_response_buf: [8192]u8 = undefined;
+const DEFAULT_TELEGRAM_SYSTEM_PROMPT: [:0]const u8 =
+    \\You are zclaw, the camper assistant.
+    \\For camera and microphone actions always prefer camper tools:
+    \\camper_snapshot, camper_video, camper_audio, camper_detect, camper_status,
+    \\camper_list_events, camper_reload_faces, camper_tts.
+    \\When a user asks to share/send media, set send_telegram=true.
+    \\Be concise, mention concrete outputs and file paths, and avoid unsafe shell instructions.
+;
 
-fn agentMessageHandler(_: []const u8, _: []const u8, text: []const u8) ?[]const u8 {
-    // Get API key
-    const api_key = std.posix.getenv("ANTHROPIC_API_KEY") orelse
-        std.posix.getenv("OPENAI_API_KEY") orelse return null;
+fn agentMessageHandler(chat_id: []const u8, sender_id: []const u8, text: []const u8) ?[]const u8 {
+    std.debug.print("telegram: incoming chat_id={s} sender_id={s}\n", .{ chat_id, sender_id });
 
-    const is_openai = std.posix.getenv("ANTHROPIC_API_KEY") == null;
+    if (!isTelegramSenderAllowed(sender_id)) {
+        std.debug.print("telegram: denied sender_id={s}\n", .{sender_id});
+        return null;
+    }
 
-    // Use a page allocator for this thread-local work
-    var arena_buf: [64 * 1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const alloc = fba.allocator();
+    const anthropic_key = std.posix.getenv("ANTHROPIC_API_KEY");
+    const openai_key = std.posix.getenv("OPENAI_API_KEY");
+    if (anthropic_key == null and openai_key == null) return null;
+
+    // Optional overrides for Telegram gateway behavior.
+    const provider_override = std.posix.getenv("ZCLAW_TELEGRAM_PROVIDER") orelse
+        std.posix.getenv("OPENCLAW_TELEGRAM_PROVIDER");
+    const model_override = std.posix.getenv("ZCLAW_TELEGRAM_MODEL") orelse
+        std.posix.getenv("OPENCLAW_TELEGRAM_MODEL");
+
+    var is_openai = anthropic_key == null;
+    if (provider_override) |provider| {
+        if (std.ascii.eqlIgnoreCase(provider, "openai") and openai_key != null) {
+            is_openai = true;
+        } else if (std.ascii.eqlIgnoreCase(provider, "anthropic") and anthropic_key != null) {
+            is_openai = false;
+        }
+    }
+
+    const api_key = if (is_openai)
+        (openai_key orelse anthropic_key orelse return null)
+    else
+        (anthropic_key orelse openai_key orelse return null);
+
+    const tools_enabled = readBoolEnv(
+        "ZCLAW_TELEGRAM_TOOLS_ENABLED",
+        "OPENCLAW_TELEGRAM_TOOLS_ENABLED",
+        true,
+    );
+    const builtins_enabled = readBoolEnv(
+        "ZCLAW_TELEGRAM_ENABLE_BUILTINS",
+        "OPENCLAW_TELEGRAM_ENABLE_BUILTINS",
+        false,
+    );
+    const max_turns = readU32Env(
+        "ZCLAW_TELEGRAM_MAX_TURNS",
+        "OPENCLAW_TELEGRAM_MAX_TURNS",
+        6,
+    );
+
+    // Use a scoped arena so each message handler run gets enough memory and
+    // is fully reclaimed before returning.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     // Create HTTP transport and client
     var transport_instance = http_client.StdHttpTransport.init(alloc);
     var client = http_client.HttpClient.init(alloc, transport_instance.transport());
 
     // Create provider
-    const model = if (is_openai) "gpt-4o" else "claude-sonnet-4-20250514";
+    const model = model_override orelse if (is_openai) "gpt-4o" else "claude-sonnet-4-20250514";
     var provider = if (is_openai)
         runtime.ProviderDispatch.initOpenAI(&client, api_key, null)
     else
         runtime.ProviderDispatch.initAnthropic(&client, api_key, null);
+
+    var reg = tool_registry.ToolRegistry.init(alloc);
+    defer reg.deinit();
+
+    var tools_json_buf: [64 * 1024]u8 = undefined;
+    var tools_json: ?[]const u8 = null;
+
+    if (tools_enabled) {
+        camper_tools.registerCamperTools(&reg) catch |err| {
+            std.debug.print("telegram: failed to register camper tools: {}\n", .{err});
+        };
+        if (builtins_enabled) {
+            builtin_tools.registerBuiltins(&reg) catch |err| {
+                std.debug.print("telegram: failed to register builtin tools: {}\n", .{err});
+            };
+        }
+        if (reg.count() > 0) {
+            const schema: tool_registry.ToolRegistry.ProviderSchema = if (is_openai) .openai else .anthropic;
+            tools_json = reg.buildToolsJsonFor(&tools_json_buf, schema) catch |err| blk: {
+                std.debug.print("telegram: failed to build tools json: {}\n", .{err});
+                break :blk null;
+            };
+        }
+    }
+
+    const system_prompt = std.posix.getenv("ZCLAW_TELEGRAM_SYSTEM_PROMPT") orelse
+        std.posix.getenv("OPENCLAW_TELEGRAM_SYSTEM_PROMPT") orelse
+        if (tools_enabled) DEFAULT_TELEGRAM_SYSTEM_PROMPT else null;
 
     // Create agent runtime
     var agent_rt = runtime.AgentRuntime.init(alloc, .{
         .agent_id = "telegram",
         .model = model,
         .api_key = api_key,
-        .max_turns = 1,
-        .stream = false,
+        .system_prompt = system_prompt,
+        .max_turns = max_turns,
+        .tools_json = tools_json,
+        .stream = true,
     });
     defer agent_rt.deinit();
 
     // Add user message
-    agent_rt.addUserMessage(text) catch return null;
+    agent_rt.addUserMessage(text) catch |err| {
+        std.debug.print("telegram: addUserMessage failed: {}\n", .{err});
+        return null;
+    };
 
-    // Run one turn
-    var result = runtime.runLoop(alloc, &agent_rt, &provider, null) catch return null;
+    const reg_ptr: ?*const tool_registry.ToolRegistry = if (tools_enabled and tools_json != null) &reg else null;
+
+    // Run loop with optional tools.
+    var result = runtime.runLoop(alloc, &agent_rt, &provider, reg_ptr) catch |err| {
+        std.debug.print("telegram: runLoop failed: {}\n", .{err});
+        return null;
+    };
     defer runtime.freeRunResult(alloc, &result);
 
-    // Copy response to static buffer
     if (result.text) |resp| {
         const len = @min(resp.len, agent_response_buf.len);
         @memcpy(agent_response_buf[0..len], resp[0..len]);
+        std.debug.print("telegram: response sent bytes={d}\n", .{len});
         return agent_response_buf[0..len];
     }
 
+    std.debug.print("telegram: no assistant text returned\n", .{});
     return null;
+}
+
+fn isTelegramSenderAllowed(sender_id: []const u8) bool {
+    const allow_raw = std.posix.getenv("ZCLAW_TELEGRAM_ALLOWED_USER_IDS") orelse
+        std.posix.getenv("OPENCLAW_TELEGRAM_ALLOWED_USER_IDS") orelse
+        return true;
+
+    var it = std.mem.splitScalar(u8, allow_raw, ',');
+    while (it.next()) |item| {
+        const candidate = std.mem.trim(u8, item, " \t\r\n");
+        if (candidate.len == 0) continue;
+        if (std.mem.eql(u8, candidate, sender_id)) return true;
+    }
+    return false;
+}
+
+fn readBoolEnv(primary: []const u8, secondary: []const u8, default_value: bool) bool {
+    const raw = std.posix.getenv(primary) orelse std.posix.getenv(secondary) orelse return default_value;
+    return std.ascii.eqlIgnoreCase(raw, "1") or
+        std.ascii.eqlIgnoreCase(raw, "true") or
+        std.ascii.eqlIgnoreCase(raw, "yes") or
+        std.ascii.eqlIgnoreCase(raw, "on");
+}
+
+fn readU32Env(primary: []const u8, secondary: []const u8, default_value: u32) u32 {
+    const raw = std.posix.getenv(primary) orelse std.posix.getenv(secondary) orelse return default_value;
+    return std.fmt.parseInt(u32, raw, 10) catch default_value;
 }
 
 // --- Tests ---

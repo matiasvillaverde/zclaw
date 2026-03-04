@@ -484,6 +484,7 @@ pub const TelegramChannel = struct {
         while (!should_stop.load(.acquire)) {
             const poll_result = self.pollUpdates() catch {
                 // Transient error — sleep and retry
+                std.debug.print("telegram: pollUpdates transient error\n", .{});
                 std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
                 continue;
             };
@@ -496,7 +497,9 @@ pub const TelegramChannel = struct {
                     self.sendText(.{
                         .chat_id = msg.chat_id,
                         .content = resp_text,
-                    }) catch {};
+                    }) catch |err| {
+                        std.debug.print("telegram: sendText failed: {}\n", .{err});
+                    };
                 }
             } else {
                 // No updates — brief sleep before next poll

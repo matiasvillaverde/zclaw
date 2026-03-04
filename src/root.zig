@@ -53,6 +53,7 @@ pub const tools = struct {
     pub const tool_registry = @import("tools/registry.zig");
     pub const policy = @import("tools/policy.zig");
     pub const builtins = @import("tools/builtins.zig");
+    pub const camper = @import("tools/camper.zig");
     pub const web_fetch = @import("tools/web_fetch.zig");
     pub const web_search = @import("tools/web_search.zig");
     pub const memory_tools = @import("tools/memory_tools.zig");
@@ -165,6 +166,7 @@ test {
     _ = @import("tools/registry.zig");
     _ = @import("tools/policy.zig");
     _ = @import("tools/builtins.zig");
+    _ = @import("tools/camper.zig");
     _ = @import("tools/web_fetch.zig");
     _ = @import("tools/web_search.zig");
     _ = @import("tools/memory_tools.zig");

@@ -58,6 +58,24 @@ Set the environment variable to enable a provider. Use `--provider <name>` with 
 
 All channels route messages through the agent runtime and reply in the same thread.
 
+Telegram access controls:
+- `ZCLAW_TELEGRAM_ALLOWED_USER_IDS` (or `OPENCLAW_TELEGRAM_ALLOWED_USER_IDS`)
+  - comma-separated numeric Telegram user IDs
+  - when set, the bot only replies to listed users
+- `ZCLAW_TELEGRAM_MODEL` / `ZCLAW_TELEGRAM_PROVIDER`
+  - override Telegram runtime model/provider without code changes
+- `ZCLAW_TELEGRAM_TOOLS_ENABLED` (default `true`)
+  - enables tool calls in Telegram runtime
+- `ZCLAW_TELEGRAM_ENABLE_BUILTINS` (default `false`)
+  - optionally enables generic file/shell builtins
+- `ZCLAW_TELEGRAM_MAX_TURNS` (default `6`)
+  - must be greater than `1` for tool round-trips
+
+Camper tool bridge (when enabled):
+- `camper_snapshot`, `camper_video`, `camper_audio`
+- `camper_detect`, `camper_status`, `camper_list_events`
+- `camper_reload_faces`, `camper_tts`
+
 ## CLI
 
 ```

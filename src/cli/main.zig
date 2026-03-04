@@ -385,7 +385,8 @@ fn runAgent(ctx: *CliContext, args: []const []const u8) !CommandResult {
         .model = model,
         .api_key = api_key.?,
         .max_turns = 1,
-        .stream = false,
+        // Streaming mode provides stable event parsing across providers.
+        .stream = true,
     });
     defer agent_rt.deinit();
 

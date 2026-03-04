@@ -90,12 +90,14 @@ pub const HistoryMessage = struct {
 pub const Role = enum {
     user,
     assistant,
+    assistant_tool_call,
     tool_result,
 
     pub fn label(self: Role) []const u8 {
         return switch (self) {
             .user => "user",
             .assistant => "assistant",
+            .assistant_tool_call => "assistant_tool_call",
             .tool_result => "tool_result",
         };
     }
@@ -374,6 +376,16 @@ pub fn buildMessagesJson(
                         const json = try anthropic.buildAssistantMessage(&msg_buf, msg.content);
                         try buf.appendSlice(allocator, json);
                     },
+                    .assistant_tool_call => {
+                        var msg_buf: [32 * 1024]u8 = undefined;
+                        const json = try buildAnthropicAssistantToolCallMessage(
+                            &msg_buf,
+                            msg.tool_call_id orelse "",
+                            msg.tool_name orelse "",
+                            msg.content,
+                        );
+                        try buf.appendSlice(allocator, json);
+                    },
                     .tool_result => {
                         var msg_buf: [32 * 1024]u8 = undefined;
                         const json = try anthropic.buildToolResultMessage(&msg_buf, msg.tool_call_id orelse "", msg.content);
@@ -391,6 +403,16 @@ pub fn buildMessagesJson(
                     .assistant => {
                         var msg_buf: [32 * 1024]u8 = undefined;
                         const json = try openai.buildAssistantMessage(&msg_buf, msg.content);
+                        try buf.appendSlice(allocator, json);
+                    },
+                    .assistant_tool_call => {
+                        var msg_buf: [32 * 1024]u8 = undefined;
+                        const json = try buildOpenAiAssistantToolCallMessage(
+                            &msg_buf,
+                            msg.tool_call_id orelse "",
+                            msg.tool_name orelse "",
+                            msg.content,
+                        );
                         try buf.appendSlice(allocator, json);
                     },
                     .tool_result => {
@@ -418,6 +440,11 @@ pub fn buildMessagesJson(
                         const json = try gemini.buildModelMessage(&msg_buf, msg.content);
                         try buf.appendSlice(allocator, json);
                     },
+                    .assistant_tool_call => {
+                        var msg_buf: [32 * 1024]u8 = undefined;
+                        const json = try gemini.buildModelMessage(&msg_buf, "");
+                        try buf.appendSlice(allocator, json);
+                    },
                     .tool_result => {
                         // Gemini tool results not yet supported, send as user message
                         var msg_buf: [32 * 1024]u8 = undefined;
@@ -436,6 +463,61 @@ pub fn buildMessagesJson(
 
     try buf.append(allocator, ']');
     return try allocator.dupe(u8, buf.items);
+}
+
+fn buildAnthropicAssistantToolCallMessage(
+    buf: []u8,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    input_json: []const u8,
+) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const writer = fbs.writer();
+
+    try writer.writeAll("{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"");
+    try writeJsonEscaped(writer, tool_call_id);
+    try writer.writeAll("\",\"name\":\"");
+    try writeJsonEscaped(writer, tool_name);
+    try writer.writeAll("\",\"input\":");
+    if (input_json.len == 0) {
+        try writer.writeAll("{}");
+    } else {
+        try writer.writeAll(input_json);
+    }
+    try writer.writeAll("}]}");
+    return fbs.getWritten();
+}
+
+fn buildOpenAiAssistantToolCallMessage(
+    buf: []u8,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    input_json: []const u8,
+) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const writer = fbs.writer();
+
+    try writer.writeAll("{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"");
+    try writeJsonEscaped(writer, tool_call_id);
+    try writer.writeAll("\",\"type\":\"function\",\"function\":{\"name\":\"");
+    try writeJsonEscaped(writer, tool_name);
+    try writer.writeAll("\",\"arguments\":\"");
+    try writeJsonEscaped(writer, if (input_json.len > 0) input_json else "{}");
+    try writer.writeAll("\"}}]}");
+    return fbs.getWritten();
+}
+
+fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(c),
+        }
+    }
 }
 
 /// Free a RunResult's allocated memory
@@ -549,9 +631,9 @@ pub const AgentRuntime = struct {
         // Generate a simple run ID
         std.crypto.random.bytes(run_id[0..16]);
         _ = std.fmt.bufPrint(&run_id, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
-            run_id[0], run_id[1], run_id[2], run_id[3],
-            run_id[4], run_id[5], run_id[6], run_id[7],
-            run_id[8], run_id[9], run_id[10], run_id[11],
+            run_id[0],  run_id[1],  run_id[2],  run_id[3],
+            run_id[4],  run_id[5],  run_id[6],  run_id[7],
+            run_id[8],  run_id[9],  run_id[10], run_id[11],
             run_id[12], run_id[13], run_id[14], run_id[15],
         }) catch {};
 
@@ -594,6 +676,25 @@ pub const AgentRuntime = struct {
         try self.history.append(self.allocator, .{
             .role = .assistant,
             .content = content_copy,
+        });
+    }
+
+    /// Add an assistant tool call block to history.
+    /// content stores the raw tool input JSON payload.
+    pub fn addAssistantToolCall(
+        self: *AgentRuntime,
+        tool_call_id: []const u8,
+        tool_name: []const u8,
+        input_json: []const u8,
+    ) !void {
+        const id_copy = try self.allocator.dupe(u8, tool_call_id);
+        const name_copy = try self.allocator.dupe(u8, tool_name);
+        const input_copy = try self.allocator.dupe(u8, input_json);
+        try self.history.append(self.allocator, .{
+            .role = .assistant_tool_call,
+            .content = input_copy,
+            .tool_call_id = id_copy,
+            .tool_name = name_copy,
         });
     }
 
@@ -740,6 +841,9 @@ pub const AgentRuntime = struct {
             // Add assistant message (may have text + tool calls)
             if (result.text) |t| {
                 try self.addAssistantMessage(t);
+            }
+            for (result.tool_calls) |tc| {
+                try self.addAssistantToolCall(tc.id, tc.name, tc.input_json);
             }
             // Emit tool call events
             for (result.tool_calls) |tc| {
@@ -1183,6 +1287,50 @@ test "buildMessagesJson OpenAI" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_call_id\":\"call_1\"") != null);
 }
 
+test "buildMessagesJson Anthropic assistant tool call then tool result" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]HistoryMessage{
+        .{ .role = .user, .content = "status?" },
+        .{
+            .role = .assistant_tool_call,
+            .content = "{\"verbose\":true}",
+            .tool_call_id = "toolu_123",
+            .tool_name = "camper_status",
+        },
+        .{ .role = .tool_result, .content = "{\"ok\":true}", .tool_call_id = "toolu_123" },
+    };
+
+    const json = try buildMessagesJson(allocator, &msgs, .anthropic_messages);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"tool_use\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"toolu_123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"camper_status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_use_id\":\"toolu_123\"") != null);
+}
+
+test "buildMessagesJson OpenAI assistant tool call then tool result" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]HistoryMessage{
+        .{ .role = .user, .content = "status?" },
+        .{
+            .role = .assistant_tool_call,
+            .content = "{\"verbose\":true}",
+            .tool_call_id = "call_123",
+            .tool_name = "camper_status",
+        },
+        .{ .role = .tool_result, .content = "{\"ok\":true}", .tool_call_id = "call_123" },
+    };
+
+    const json = try buildMessagesJson(allocator, &msgs, .openai_completions);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"call_123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"camper_status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_call_id\":\"call_123\"") != null);
+}
+
 test "buildMessagesJson empty" {
     const allocator = std.testing.allocator;
     const msgs = [_]HistoryMessage{};
@@ -1291,6 +1439,11 @@ test "AgentRuntime.runInference tool call response (Anthropic)" {
     try std.testing.expectEqual(RunState.waiting_tool, runtime.state);
     try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqual(@as(usize, 2), runtime.messageCount());
+    try std.testing.expectEqual(Role.user, runtime.history.items[0].role);
+    try std.testing.expectEqual(Role.assistant_tool_call, runtime.history.items[1].role);
+    try std.testing.expectEqualStrings("call_1", runtime.history.items[1].tool_call_id.?);
+    try std.testing.expectEqualStrings("bash", runtime.history.items[1].tool_name.?);
 }
 
 test "AgentRuntime.runInference text response (OpenAI)" {
@@ -1658,6 +1811,9 @@ test "runLoop tool dispatch with registry" {
     try std.testing.expectEqual(RunState.completed, runtime.state);
     try std.testing.expectEqual(@as(u32, 2), runtime.turn);
     try std.testing.expectEqual(@as(usize, 2), mock.call_count);
+    try std.testing.expect(mock.last_body != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "\"type\":\"tool_use\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_body.?, "\"tool_use_id\":\"c1\"") != null);
 }
 
 test "runLoop unknown tool returns tool not found" {
@@ -1774,6 +1930,10 @@ test "Role all labels non-empty" {
 
 test "Role tool_result label" {
     try std.testing.expectEqualStrings("tool_result", Role.tool_result.label());
+}
+
+test "Role assistant_tool_call label" {
+    try std.testing.expectEqualStrings("assistant_tool_call", Role.assistant_tool_call.label());
 }
 
 test "RunEvent defaults" {
