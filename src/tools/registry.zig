@@ -165,7 +165,69 @@ pub const ToolRegistry = struct {
 
         return fbs.getWritten();
     }
+
+    pub const ProviderSchema = enum {
+        anthropic,
+        openai,
+    };
+
+    /// Build tool definitions JSON for a specific provider schema.
+    pub fn buildToolsJsonFor(self: *const ToolRegistry, buf: []u8, schema: ProviderSchema) ![]const u8 {
+        return switch (schema) {
+            .anthropic => self.buildToolsJson(buf),
+            .openai => self.buildOpenAiToolsJson(buf),
+        };
+    }
+
+    fn buildOpenAiToolsJson(self: *const ToolRegistry, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+
+        try writer.writeByte('[');
+        var first = true;
+        var iter = self.tools.iterator();
+        while (iter.next()) |entry| {
+            if (!entry.value_ptr.enabled) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+
+            try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"");
+            try writer.writeAll(entry.value_ptr.def.name);
+            try writer.writeByte('"');
+
+            if (entry.value_ptr.def.description.len > 0) {
+                try writer.writeAll(",\"description\":\"");
+                try writeJsonEscaped(writer, entry.value_ptr.def.description);
+                try writer.writeByte('"');
+            }
+
+            try writer.writeAll(",\"parameters\":");
+            if (entry.value_ptr.def.parameters_json) |params| {
+                try writer.writeAll(params);
+            } else {
+                try writer.writeAll("{\"type\":\"object\",\"properties\":{}}");
+            }
+
+            try writer.writeAll("}}");
+        }
+        try writer.writeByte(']');
+
+        return fbs.getWritten();
+    }
 };
+
+fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(c),
+        }
+    }
+}
 
 // --- Tests ---
 
